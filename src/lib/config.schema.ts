@@ -40,10 +40,13 @@ export const PathsSchema = z.object({
  *  Workspaces) and the decommissioning Playbook engine until they are ready.
  *  When `false`: the nav entry + homepage tile are hidden and the route is
  *  redirected home (server-side, so deep-links don't bypass it). */
+// ADR-008 — not-yet-released modules default OFF so a fresh/public install
+// hides them safely WITHOUT depending on settings.json seeding. The operator
+// opts IN by setting these true in ~/.soul-hub/settings.json.
 export const FeaturesSchema = z.object({
-	naseej: z.boolean().default(true),
-	workspaces: z.boolean().default(true),
-	playbook: z.boolean().default(true),
+	naseej: z.boolean().default(false),
+	workspaces: z.boolean().default(false),
+	playbook: z.boolean().default(false),
 });
 export type FeaturesConfig = z.infer<typeof FeaturesSchema>;
 
