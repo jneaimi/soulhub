@@ -12,6 +12,7 @@
 	"scripts": {
 		"setup": "bash scripts/bootstrap.sh",
 		"doctor": "node scripts/doctor.mjs",
+		"verify": "node scripts/verify-fresh-install.mjs",
 		"update": "node scripts/update.mjs",
 		"dev": "vite dev",
 		"build": "vite build && node scripts/build-worker.mjs",
