@@ -36,6 +36,22 @@ function resolveNvmNodeBin() {
 }
 const PINNED_NODE = process.env.PM2_NODE_BIN || resolveNvmNodeBin() || 'node';
 
+// The Cloudflare tunnel is OPTIONAL remote access. Only start it when
+// `cloudflared` is actually installed — otherwise PM2 crash-loops on
+// "Script not found: cloudflared" (a fresh install has no cloudflared).
+// Opt out explicitly with SOUL_HUB_TUNNEL=0; name the tunnel with
+// SOUL_HUB_TUNNEL_NAME (defaults to "soul-hub").
+function hasCloudflared() {
+  const dirs = (process.env.PATH || '')
+    .split(':')
+    .concat(['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin']);
+  return dirs.some((d) => {
+    try { return d && fs.existsSync(resolve(d, 'cloudflared')); } catch { return false; }
+  });
+}
+const TUNNEL_NAME = process.env.SOUL_HUB_TUNNEL_NAME || 'soul-hub';
+const TUNNEL_ENABLED = process.env.SOUL_HUB_TUNNEL !== '0' && hasCloudflared();
+
 module.exports = {
   apps: [
     {
@@ -115,21 +131,27 @@ module.exports = {
       // Don't watch files (we restart manually)
       watch: false,
     },
-    {
-      name: 'soul-hub-tunnel',
-      script: 'cloudflared',
-      args: 'tunnel run soul-hub',
-      autorestart: true,
-      max_restarts: 5,
-      min_uptime: '10s',
-      exp_backoff_restart_delay: 1000,
-      // Logs
-      log_date_format: 'YYYY-MM-DD HH:mm:ss',
-      error_file: resolve(LOG_DIR, 'tunnel-error.log'),
-      out_file: resolve(LOG_DIR, 'tunnel-out.log'),
-      merge_logs: true,
-      watch: false,
-    },
+    // Cloudflare tunnel — only included when cloudflared is installed
+    // (see TUNNEL_ENABLED above). Omitted entirely on a fresh install.
+    ...(TUNNEL_ENABLED
+      ? [
+          {
+            name: 'soul-hub-tunnel',
+            script: 'cloudflared',
+            args: `tunnel run ${TUNNEL_NAME}`,
+            autorestart: true,
+            max_restarts: 5,
+            min_uptime: '10s',
+            exp_backoff_restart_delay: 1000,
+            // Logs
+            log_date_format: 'YYYY-MM-DD HH:mm:ss',
+            error_file: resolve(LOG_DIR, 'tunnel-error.log'),
+            out_file: resolve(LOG_DIR, 'tunnel-out.log'),
+            merge_logs: true,
+            watch: false,
+          },
+        ]
+      : []),
     {
       // WhatsApp gateway runs in its own PM2 app for crash isolation —
       // a Baileys WS / decryption blowup only takes down the worker,
