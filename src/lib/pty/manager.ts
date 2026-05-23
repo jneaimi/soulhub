@@ -12,7 +12,7 @@
 import * as nodePty from 'node-pty';
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { config } from '$lib/config.js';
 import { saveMeta, loadMeta, appendLog, getLogSize, type SessionMeta } from './store.js';
 import { captureSessionToVault } from '../vault/session-bridge.js';
@@ -80,14 +80,40 @@ const SYSTEM_ENV_KEYS = ['PATH', 'HOME', 'TERM', 'LANG', 'USER', 'SHELL', 'TMPDI
  *   - 'exit' (code: number)     — process exited
  *   - 'prompt_sent' ()          — auto-prompt was injected
  */
+/** Resolve the Claude Code binary. Prefer the configured path, but if it
+ *  doesn't exist (common on a fresh install where `claude` landed somewhere
+ *  other than the recorded path), search PATH + common install locations so
+ *  the terminal auto-heals instead of hard-failing. Returns null when `claude`
+ *  can't be found anywhere. */
+function resolveClaudeBinary(configured: string): string | null {
+	if (configured && existsSync(configured)) return configured;
+	const home = process.env.HOME || '';
+	const dirs = [
+		...(process.env.PATH || '').split(':'),
+		`${home}/.local/bin`,
+		`${home}/.claude/local`,
+		'/opt/homebrew/bin',
+		'/usr/local/bin',
+		'/usr/bin',
+	];
+	for (const d of dirs) {
+		if (!d) continue;
+		const candidate = resolve(d, 'claude');
+		if (existsSync(candidate)) return candidate;
+	}
+	return null;
+}
+
 export function spawnSession(opts: PtySessionOptions): PtySession {
 	const sessionId = crypto.randomUUID().slice(0, 8);
 	const rawCwd = opts.cwd || process.env.HOME || '/';
 	const cwd = existsSync(rawCwd) ? rawCwd : (process.env.HOME || '/');
 	const cols = opts.cols || config.terminal.cols;
 	const rows = opts.rows || config.terminal.rows;
-	const claudeBinary = config.resolved.claudeBinary;
+	const configuredClaude = config.resolved.claudeBinary;
 	const isShell = opts.shell === true;
+	// Resolve lazily for Claude sessions (auto-heals a stale configured path).
+	const claudeBinary = isShell ? configuredClaude : (resolveClaudeBinary(configuredClaude) ?? configuredClaude);
 
 	// Determine binary and args
 	let spawnBinary: string;
@@ -98,11 +124,13 @@ export function spawnSession(opts: PtySessionOptions): PtySession {
 		spawnBinary = process.env.SHELL || (process.platform === 'darwin' ? '/bin/zsh' : '/bin/bash');
 		args = ['--login'];
 	} else {
-		// Claude Code — verify binary exists before attempting spawn
+		// Claude Code — verify binary exists before attempting spawn. We already
+		// searched PATH + common locations (resolveClaudeBinary); reaching here
+		// means it's genuinely not installed.
 		if (!existsSync(claudeBinary)) {
 			throw new Error(
-				`Claude Code CLI not found at: ${claudeBinary}. ` +
-				`Install it (npm i -g @anthropic-ai/claude-code) or set paths.claudeBinary in settings.json.`
+				`Claude Code CLI not found (configured: ${configuredClaude}, and not on PATH). ` +
+				`Install it (npm i -g @anthropic-ai/claude-code), or set paths.claudeBinary in settings.json to the output of \`which claude\`.`
 			);
 		}
 		spawnBinary = claudeBinary;
