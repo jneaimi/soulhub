@@ -593,6 +593,43 @@ export const SchedulerTaskSchema = z.object({
 	params: z.record(z.string(), z.unknown()).default({}),
 });
 
+/** Core system tasks every install gets for free — health monitoring + vault
+ *  self-healing. Defined in CODE (not just settings.example.json) so they exist
+ *  even when settings.json predates them or omits a scheduler block. Merged into
+ *  the user's tasks by id in `applyAdditiveSchemaDefaults` (config.ts): a
+ *  settings entry with the same id WINS, so the operator can retune or disable
+ *  any of them. All three degrade gracefully when no notification channel is
+ *  configured (they simply don't send). No timezone → scheduler-local time. */
+export const CORE_SCHEDULER_TASKS: z.infer<typeof SchedulerTaskSchema>[] = [
+	{
+		id: 'heartbeat',
+		type: 'heartbeat',
+		cron: '*/30 * * * *',
+		enabled: true,
+		noOverlap: true,
+		description: 'System heartbeat — health checks, agent follow-ups, scheduled commitments.',
+		params: {},
+	},
+	{
+		id: 'vault-hygiene',
+		type: 'vault-hygiene',
+		cron: '*/30 * * * *',
+		enabled: true,
+		noOverlap: true,
+		description: 'Vault hygiene self-healing — orphans, stale inbox, governance (ADR-010).',
+		params: {},
+	},
+	{
+		id: 'hygiene-digest-daily',
+		type: 'hygiene-digest',
+		cron: '0 8 * * *',
+		enabled: true,
+		noOverlap: true,
+		description: 'Once-daily batched vault-health digest (silent on clean days).',
+		params: {},
+	},
+];
+
 export const SchedulerSchema = z.object({
 	enabled: z.boolean().default(true),
 	/** When the process boots, any `started` row whose age exceeds this
@@ -600,7 +637,7 @@ export const SchedulerSchema = z.object({
 	 *  doesn't stay jammed after a crash. Default 30 min covers every
 	 *  expected task; raise it if a long migration runs as a task. */
 	staleRunMaxRuntimeMs: z.number().int().min(60_000).default(30 * 60 * 1000),
-	tasks: z.array(SchedulerTaskSchema).default([]),
+	tasks: z.array(SchedulerTaskSchema).default(CORE_SCHEDULER_TASKS),
 });
 
 /** Operator-notification routing. `operatorChannels` is the set of channels

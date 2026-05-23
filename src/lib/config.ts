@@ -122,6 +122,17 @@ function applyAdditiveSchemaDefaults(cfg: SoulHubConfig): SoulHubConfig {
 	}
 	cfg.routes = mergedRoutes as typeof cfg.routes;
 
+	// Core system scheduler tasks (health monitoring + vault hygiene) are
+	// code-defined so every install has them even when settings.json predates
+	// them or lists its own tasks. Merge by id: a settings task with the same
+	// id wins (operator can retune/disable), code fills any gaps.
+	const userTaskIds = new Set(cfg.scheduler.tasks.map((t) => t.id));
+	for (const coreTask of defaults.scheduler.tasks) {
+		if (!userTaskIds.has(coreTask.id)) {
+			cfg.scheduler.tasks.push(coreTask);
+		}
+	}
+
 	return cfg;
 }
 
