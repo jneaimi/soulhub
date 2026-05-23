@@ -27,7 +27,13 @@ COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // ""')
 # Pattern detection — done in python3 because bash regex doesn't have
 # negative lookahead (needed for the exempt-subdir carve-out) and bash
 # string handling around quotes is treacherous.
-RESULT=$(python3 - "$COMMAND" <<'PYEOF'
+#
+# The heredoc is wrapped in a function because bash 3.2 (macOS's default
+# /bin/bash) mis-parses a here-document nested inside $(...) command
+# substitution — it would fail to parse the whole hook, fail closed, and
+# block EVERY Bash command. Calling a function inside $() sidesteps it.
+detect_vault_write() {
+python3 - "$1" <<'PYEOF'
 import sys
 import re
 
@@ -95,7 +101,9 @@ for pat, label in BROAD_PATTERNS:
 
 print('ok')
 PYEOF
-)
+}
+
+RESULT=$(detect_vault_write "$COMMAND")
 
 if [[ "$RESULT" == "ok" || -z "$RESULT" ]]; then
   exit 0
