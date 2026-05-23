@@ -94,6 +94,29 @@ else
   warn "install/public/README.md missing — public README NOT overlaid"
 fi
 
+# Point the public package.json at the public repo (the private repo URL would
+# 404 for strangers) and give it a description that matches the shipped surface.
+step "Rewriting package.json metadata for the public repo"
+PKG="$TARGET/package.json"
+if [ -f "$PKG" ]; then
+  python3 - "$PKG" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d.setdefault("repository", {})["url"] = "https://github.com/jneaimi/soulhub.git"
+d["homepage"] = "https://github.com/jneaimi/soulhub"
+d["bugs"] = {"url": "https://github.com/jneaimi/soulhub/issues"}
+d["description"] = ("A local-first, single-user ambient AI command center — chat "
+                    "(WhatsApp/Telegram), a unified inbox, a governed knowledge "
+                    "vault, terminal, scheduler, and pipelines, powered by Claude Code")
+json.dump(d, open(p, "w"), indent="\t")
+open(p, "a").write("\n")
+PY
+  ok "repository → soulhub, description → public surface"
+else
+  warn "package.json missing in export — metadata not rewritten"
+fi
+
 step "Running export gate"
 if bash "$ROOT/scripts/probes/export-gate.sh" "$TARGET"; then
   ok "export gate PASSED"

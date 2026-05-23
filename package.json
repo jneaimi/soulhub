@@ -1,17 +1,18 @@
 {
 	"name": "soul-hub",
 	"version": "2.0.0",
-	"description": "AI-human collaboration command center — project management, pipeline orchestration, and a knowledge vault, powered by Claude Code",
+	"description": "A local-first, single-user ambient AI command center \u2014 chat (WhatsApp/Telegram), a unified inbox, a governed knowledge vault, terminal, scheduler, and pipelines, powered by Claude Code",
 	"license": "MIT",
 	"author": "Jasem Al Neaimi",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/jneaimi/soul-hub.git"
+		"url": "https://github.com/jneaimi/soulhub.git"
 	},
 	"type": "module",
 	"scripts": {
 		"setup": "bash scripts/bootstrap.sh",
 		"doctor": "node scripts/doctor.mjs",
+		"update": "node scripts/update.mjs",
 		"dev": "vite dev",
 		"build": "vite build && node scripts/build-worker.mjs",
 		"build:worker": "node scripts/build-worker.mjs",
@@ -92,5 +93,9 @@
 		"unist-util-visit": "^5.1.0",
 		"yaml": "^2.8.3",
 		"zod": "^4.4.2"
+	},
+	"homepage": "https://github.com/jneaimi/soulhub",
+	"bugs": {
+		"url": "https://github.com/jneaimi/soulhub/issues"
 	}
 }
