@@ -12,7 +12,7 @@
   "paths": {
     "devDir": "~/dev",
     "vaultDir": "~/vault",
-    "catalogDir": "~/dev/soul-hub/catalog",
+    "catalogDir": "",
     "claudeBinary": "~/.local/bin/claude"
   },
   "server": {

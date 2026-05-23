@@ -113,15 +113,26 @@ export const POST: RequestHandler = async ({ request }) => {
 	// action === 'spawn'
 	const { prompt, cwd, cols, rows, continueSession, resumeSessionId, shell } = body;
 
-	const session = spawnSession({
-		prompt: (prompt || '').trim() || undefined,
-		cwd: cwd || undefined,
-		cols,
-		rows,
-		continueSession: !!continueSession,
-		resumeSessionId: resumeSessionId || undefined,
-		shell: !!shell,
-	});
+	// spawnSession throws when the Claude binary is missing (or node-pty can't
+	// spawn). Surface that as a legible 422 instead of a bare 500 — the message
+	// tells the user to install Claude Code or fix paths.claudeBinary.
+	let session: ReturnType<typeof spawnSession>;
+	try {
+		session = spawnSession({
+			prompt: (prompt || '').trim() || undefined,
+			cwd: cwd || undefined,
+			cols,
+			rows,
+			continueSession: !!continueSession,
+			resumeSessionId: resumeSessionId || undefined,
+			shell: !!shell,
+		});
+	} catch (err) {
+		return json(
+			{ error: err instanceof Error ? err.message : 'Failed to start terminal session' },
+			{ status: 422 },
+		);
+	}
 
 	const sessionId = session.id;
 	const enc = new TextEncoder();

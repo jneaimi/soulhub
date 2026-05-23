@@ -29,7 +29,11 @@ export const InterfaceSchema = z.object({
 export const PathsSchema = z.object({
 	devDir: z.string().default('~/dev'),
 	vaultDir: z.string().default('~/vault'),
-	catalogDir: z.string().default('~/dev/soul-hub/catalog'),
+	// Empty → derived at runtime as <repo>/catalog (see buildResolved in
+	// config.ts). The catalog ships inside the repo, so its location follows
+	// wherever the repo lives — never a hardcoded author path. Set explicitly
+	// to override.
+	catalogDir: z.string().default(''),
 	claudeBinary: z.string().default('~/.local/bin/claude'),
 });
 

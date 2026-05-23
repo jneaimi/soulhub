@@ -140,7 +140,11 @@ function buildResolved(parsed: SoulHubConfig) {
 	return {
 		devDir: expandPath(parsed.paths.devDir),
 		vaultDir: expandPath(parsed.paths.vaultDir),
-		catalogDir: expandPath(parsed.paths.catalogDir),
+		// Empty catalogDir → derive from the running repo (<cwd>/catalog), so it
+		// follows the repo wherever it lives instead of a hardcoded author path.
+		catalogDir: parsed.paths.catalogDir
+			? expandPath(parsed.paths.catalogDir)
+			: resolve(process.cwd(), 'catalog'),
 		claudeBinary: expandPath(parsed.paths.claudeBinary),
 	};
 }
