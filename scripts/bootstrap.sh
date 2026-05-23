@@ -359,6 +359,18 @@ else
   warn "soul CLI installer reported issues — run: bash install/cli/install.sh"
 fi
 
+# ── 8d. Starter agents ───────────────────────────────────────────
+# Seeds one agent per dispatch backend (assistant/researcher/summarizer +
+# the ai-sdk drafter) so a fresh install has something to dispatch. Only
+# seeds a lane that has no agents yet — an operator with their own agents is
+# left untouched. Soft-fail.
+step "Seeding starter agents"
+if bash "$REPO_ROOT/install/agents/install.sh" --quiet; then
+  ok "starter agents ready (open /agents, or dispatch from chat)"
+else
+  warn "starter-agent installer reported issues — run: bash install/agents/install.sh"
+fi
+
 # ── 9. Optional: TikTok transcription deps (ADR-024) ────────────
 step "Optional: TikTok transcription deps"
 if command -v yt-dlp >/dev/null 2>&1 \

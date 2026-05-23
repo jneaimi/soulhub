@@ -118,6 +118,22 @@ const soulBin = join(HOME, '.local', 'bin', 'soul');
 if (exists(soulBin)) ok('~/.local/bin/soul', lstatSync(soulBin).isSymbolicLink() ? 'symlinked' : 'copied');
 else wa('soul CLI not installed', 'run: bash install/cli/install.sh --symlink');
 
+// ── 3b. Starter agents ────────────────────────────────────────────
+section('agents');
+const laneA = process.env.SOUL_HUB_LANE_A_DIR || join(CLAUDE_HOME, 'agents');
+const laneB = process.env.SOUL_HUB_LANE_B_DIR || join(DATA_DIR, 'agents');
+function countAgents(dir, ext) {
+  if (!exists(dir)) return [];
+  try { return readdirSync(dir).filter((f) => f.endsWith(ext)); } catch { return []; }
+}
+const aAgents = countAgents(laneA, '.md');
+const bAgents = countAgents(laneB, '.yaml');
+const total = aAgents.length + bAgents.length;
+if (total === 0) wa('no agents installed', 'run: bash install/agents/install.sh — chat/agent dispatch has nothing to run');
+else {
+  ok(`${total} agent(s)`, `Lane A: ${aAgents.map((f) => f.replace('.md', '')).join(', ') || '—'}; Lane B: ${bAgents.map((f) => f.replace('.yaml', '')).join(', ') || '—'}`);
+}
+
 // ── 4. DB migration state ─────────────────────────────────────────
 // Each DB self-migrates on first feature use (lazy singleton + user_version).
 // This check is passive: absent = "pending until you use the feature".
