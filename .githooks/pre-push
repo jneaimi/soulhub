@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+#
+# pre-push — ratcheting svelte-check baseline gate (ADR-005).
+#
+# Enable once per clone (tracked hooks dir):
+#     git config core.hooksPath .githooks
+#
+# Bypass in a genuine emergency with: git push --no-verify
+#
+set -uo pipefail
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+# ADR-055 — no author-domain defaults in shipped code (fast grep guard).
+"$ROOT/scripts/probes/no-owner-domain-defaults.sh" || exit $?
+
+exec "$ROOT/scripts/typecheck-gate.sh"

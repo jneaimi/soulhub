@@ -1,0 +1,50 @@
+.naseej-pullquote {
+    font-family: var(--font-display);
+    margin: 1.5em 0;
+    color: var(--text);
+}
+
+.naseej-pullquote[lang="en"] { padding-left: 16pt; }
+.naseej-pullquote[lang="ar"] { padding-right: 16pt; }
+
+.naseej-pullquote--rule-leading[lang="en"] { border-left: 3px solid var(--accent); }
+.naseej-pullquote--rule-leading[lang="ar"] { border-right: 3px solid var(--accent); }
+
+.naseej-pullquote--large-quote[lang="en"] { padding-left: 28pt; position: relative; }
+.naseej-pullquote--large-quote[lang="ar"] { padding-right: 28pt; position: relative; }
+
+.naseej-pullquote--large-quote[lang="en"]::before {
+    content: "\201C";
+    position: absolute;
+    left: 0;
+    top: -8pt;
+    font-size: 36pt;
+    color: var(--accent);
+    line-height: 1;
+    font-family: Georgia, serif;
+}
+.naseej-pullquote--large-quote[lang="ar"]::before {
+    content: "\201C";
+    position: absolute;
+    right: 0;
+    top: -8pt;
+    font-size: 36pt;
+    color: var(--accent);
+    line-height: 1;
+    font-family: Georgia, serif;
+}
+
+.naseej-pullquote__text {
+    font-size: 14pt;
+    line-height: 1.45;
+    font-style: italic;
+    margin: 0;
+}
+.naseej-pullquote[lang="ar"] .naseej-pullquote__text { font-style: normal; }
+
+.naseej-pullquote__attr {
+    margin-top: 0.6em;
+    font-size: 10pt;
+    font-style: normal;
+    color: var(--text-secondary);
+}

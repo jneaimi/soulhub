@@ -1,0 +1,28 @@
+name: my-chain
+description: Describe what this chain orchestrates
+type: chain
+
+inputs:
+  - name: example_input
+    type: text
+    description: An example input passed to nodes
+    required: true
+
+nodes:
+  - id: first-node
+    pipeline: pipeline-name-here
+    inputs:
+      input_field: $inputs.example_input
+
+  - id: second-node
+    pipeline: another-pipeline
+    depends_on: [first-node]
+    inputs:
+      data: $nodes.first-node.output
+
+on_failure:
+  strategy: halt-branch
+
+# Vault: Each node's pipeline outputs are auto-captured to vault.
+# Run summaries for the chain and each node pipeline are saved
+# to projects/{pipeline}/outputs/ — see CONTRACTS.md § 6.

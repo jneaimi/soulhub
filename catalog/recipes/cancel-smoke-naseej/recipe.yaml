@@ -1,0 +1,38 @@
+name: cancel-smoke-naseej
+version: 1.0.0
+project: naseej
+description: |
+  Cancellation smoke (ADR-005 CP3 falsifier #5). Drives inspector with NO
+  goal_condition and a heavy enumeration task so the dispatcher runs long
+  enough for an external POST /api/recipes/runs/<id>/cancel to land.
+
+  Usage:
+    uuid=$(uuidgen | tr 'A-Z' 'a-z')
+    curl -X POST http://localhost:2400/api/recipes/run \
+      -H 'Content-Type: application/json' \
+      -d "{\"recipe\":\"cancel-smoke-naseej\",\"run_id\":\"$uuid\"}" &
+    sleep 5
+    curl -X POST http://localhost:2400/api/recipes/runs/$uuid/cancel
+
+  Expected: the foreground curl returns status 'failed' with the verify
+  step at agent_status 'cancelled' and exit_code 1.
+
+  Re-authored for ADR-023 CP5: `agent:` step type replaced with
+  `component: agent-dispatch@1.0.0`. Budget fields flattened into inputs.
+
+steps:
+  - id: enumerate
+    component: agent-dispatch@1.0.0
+    inputs:
+      agent: inspector
+      task: |
+        List EVERY .md file under projects/naseej/ recursively. For each one,
+        output its path then a single-sentence description of its purpose
+        based on the filename. Do NOT use Read — only Glob and your inference.
+        Do not stop early. Do not call any other tool. This is a deliberate
+        throughput test, not a real audit.
+      timeout_sec: 300
+      max_turns: 8
+      max_usd: 0.30
+      # Intentionally no goal_condition — without an early-exit trigger
+      # the agent runs out the budget, giving the cancel signal a window.

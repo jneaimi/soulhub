@@ -1,0 +1,71 @@
+name: Bug Investigation
+type: playbook
+description: Systematic bug investigation with parallel angles and sequential fix
+
+inputs:
+  - id: bug_description
+    type: text
+    description: Description of the bug, including steps to reproduce
+    required: true
+  - id: affected_area
+    type: text
+    description: Files or modules suspected to be involved
+    required: true
+
+roles:
+  - id: reproducer
+    provider: claude
+    model: sonnet
+    agent: roles/reproducer.md
+  - id: tracer
+    provider: claude
+    model: sonnet
+    agent: roles/tracer.md
+  - id: fixer
+    provider: claude
+    model: sonnet
+    agent: roles/fixer.md
+
+phases:
+  - id: investigate
+    type: parallel
+    assignments:
+      - role: reproducer
+        task: "Try to reproduce this bug and identify exact conditions: $inputs.bug_description. Look in: $inputs.affected_area"
+        output: reproduction-report.md
+      - role: tracer
+        task: "Trace the code path and identify the root cause of: $inputs.bug_description. Focus on: $inputs.affected_area"
+        output: trace-report.md
+
+  - id: diagnose
+    type: sequential
+    depends_on: [investigate]
+    assignments:
+      - role: fixer
+        task: "Based on the reproduction and trace reports, diagnose the root cause and propose a fix"
+        input:
+          - $phases.investigate.reproduction-report
+          - $phases.investigate.trace-report
+        output: diagnosis.md
+
+  - id: approval
+    type: gate
+    depends_on: [diagnose]
+    prompt: "Review the diagnosis and approve the proposed fix"
+    assignments:
+      - role: fixer
+        task: "Summarize the proposed fix for approval"
+        input: $phases.diagnose.diagnosis
+        output: fix-summary.md
+
+output:
+  type: composite
+  vault_capture: true
+  items:
+    - type: knowledge
+      file: diagnosis.md
+      vault_zone: knowledge/debugging
+    - type: artifact
+      file: fix-summary.md
+  on_complete:
+    notify: true

@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""soul-hub-governance ADR-003 (P3) — contract-aware change chokepoint.
+
+The build-time layer of the falsifier-backed-contract model. Generalizes
+ADR-048's vault pre-commit backstop: it operates on the WHOLE staged changeset
+(the only surface where "migrations ship with the rename" is decidable — a
+PreToolUse hook sees one edit at a time and can't tell if the falsifier is
+updated elsewhere in the same change).
+
+Two rules, reading the ADR-002 compiled cache (offline, no server, no falsifier
+execution — falsifiers are runtime/slow and cannot run at commit):
+
+  1. DEFAULT (WARN, never blocks): if a commit stages a contract's files but NOT
+     the file that defines its falsifier (`src/lib/scheduler/handlers/<id>.ts`
+     for task falsifiers, when present in this repo), warn — the falsifier may
+     have gone stale relative to the thing it guards.
+
+  2. buildCheck (REFUSE, opt-in per contract): a `diff-regex` assertion run
+     against the ADDED lines of the staged diff of the contract's files. A match
+     (when mustNotMatch) blocks the commit — e.g. re-introducing a retired
+     Telegram-push instruction (the exact ADR-005 regression).
+
+Escape: `git commit --no-verify` (skips all hooks) or `CONTRACT_SKIP=1 git commit`.
+Fail-open: a missing/cold cache or any internal error allows the commit (the
+runtime falsifier remains the independent backstop — defense in depth).
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+if os.environ.get("CONTRACT_SKIP") == "1":
+    sys.exit(0)
+
+SOUL_HUB_HOME = os.environ.get("SOUL_HUB_HOME") or os.path.join(os.path.expanduser("~"), ".soul-hub")
+CACHE = Path(SOUL_HUB_HOME) / "data" / "contracts" / "registry.json"
+
+
+def fail_open(_msg=None):
+    sys.exit(0)
+
+
+def glob_to_regex(glob: str) -> "re.Pattern":
+    """Mirror src/lib/contracts/glob.ts: ** = any incl /, * = any except /, ? = one except /."""
+    out = []
+    i = 0
+    while i < len(glob):
+        c = glob[i]
+        if c == "*":
+            if i + 1 < len(glob) and glob[i + 1] == "*":
+                out.append(".*")
+                i += 1
+                if i + 1 < len(glob) and glob[i + 1] == "/":
+                    i += 1
+            else:
+                out.append("[^/]*")
+        elif c == "?":
+            out.append("[^/]")
+        elif c in ".+^${}()|[]\\":
+            out.append("\\" + c)
+        else:
+            out.append(c)
+        i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+
+def git(*args):
+    return subprocess.run(["git", *args], capture_output=True, text=True, check=True)
+
+
+def main():
+    if not CACHE.exists():
+        fail_open()
+    try:
+        reg = json.loads(CACHE.read_text())
+        contracts = reg.get("contracts", [])
+    except Exception:
+        fail_open()
+
+    try:
+        repo_root = Path(git("rev-parse", "--show-toplevel").stdout.strip())
+        staged_rel = [p for p in git("diff", "--cached", "--name-only", "--diff-filter=ACM", "-z").stdout.split("\0") if p]
+    except Exception:
+        fail_open()
+
+    if not staged_rel:
+        sys.exit(0)
+
+    staged_abs = {str((repo_root / p).resolve()): p for p in staged_rel}
+    staged_rel_set = set(staged_rel)
+
+    warnings = []
+    refusals = []
+
+    for c in contracts:
+        cid = c.get("id", "?")
+        globs = [glob_to_regex(g) for g in c.get("globsAbs", [])]
+        touched_abs = [a for a in staged_abs if any(rx.match(a) for rx in globs)]
+        if not touched_abs:
+            continue
+
+        # Rule 1 — default falsifier-touched WARN (only when the handler file
+        # exists in THIS repo; skipped elsewhere where it can't be checked).
+        fals = c.get("falsifier", "")
+        if fals and "/" not in fals and " " not in fals:
+            handler_rel = f"src/lib/scheduler/handlers/{fals}.ts"
+            if (repo_root / handler_rel).exists() and handler_rel not in staged_rel_set:
+                warnings.append(
+                    f"  • {cid}: staged its files but NOT its falsifier ({handler_rel}). "
+                    f"Migrations ship with the rename — update the falsifier if the invariant changed."
+                )
+
+        # Rule 2 — opt-in buildCheck REFUSE.
+        bc = c.get("buildCheck")
+        if bc and bc.get("type") == "diff-regex":
+            touched_rel = [staged_abs[a] for a in touched_abs]
+            try:
+                diff = git("diff", "--cached", "-U0", "--", *touched_rel).stdout
+            except Exception:
+                diff = ""
+            added = [ln[1:] for ln in diff.splitlines() if ln.startswith("+") and not ln.startswith("+++")]
+            pat = re.compile(bc["pattern"], re.IGNORECASE)
+            hit = any(pat.search(ln) for ln in added)
+            must_not_match = bc.get("mustNotMatch", True)
+            if hit == bool(must_not_match):
+                refusals.append(f"  ✗ {cid}: {bc.get('message', 'buildCheck failed')}")
+
+    if warnings:
+        sys.stderr.write("[contract-chokepoint] WARN (ADR-003 — not blocking):\n" + "\n".join(warnings) + "\n")
+
+    if refusals:
+        sys.stderr.write(
+            "\n[contract-chokepoint] REFUSED (ADR-003 P3) — this commit violates a contract's build-time check:\n"
+            + "\n".join(refusals)
+            + "\n\nFix the change, or override deliberately with `git commit --no-verify`.\n"
+        )
+        sys.exit(1)
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        # Fail-open on anything unexpected — the runtime falsifier backstops.
+        sys.exit(0)

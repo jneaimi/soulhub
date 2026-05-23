@@ -1,0 +1,40 @@
+{
+  "_comment": "Merge this `hooks.PreToolUse` block into ~/.claude/settings.json. ADR-046 P1 (Write/Edit/NotebookEdit) + P2 (Bash); ADR-003 soul-cli chokepoint (Bash). Each hook is its own matcher entry so the install-chokepoint.sh merge logic (which dedupes by first-command-in-entry) registers all three independently.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/vault-write-guard.sh",
+            "timeout": 5,
+            "statusMessage": "Vault-write chokepoint (ADR-046)..."
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/vault-write-guard-bash.sh",
+            "timeout": 5,
+            "statusMessage": "Vault-write chokepoint Bash (ADR-046 Pass 2)..."
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/soul-cli-guard.sh",
+            "timeout": 5,
+            "statusMessage": "soul-cli chokepoint (ADR-003 Phase 3b)..."
+          }
+        ]
+      }
+    ]
+  }
+}

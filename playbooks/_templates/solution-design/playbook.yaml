@@ -1,0 +1,66 @@
+name: Solution Design
+type: playbook
+description: Multi-agent solution architecture from problem statement
+
+inputs:
+  - id: problem_statement
+    type: text
+    description: Describe the problem to solve
+    required: true
+  - id: project_name
+    type: string
+    description: Name for the output project
+    required: true
+
+roles:
+  - id: architect
+    provider: claude
+    model: sonnet
+    agent: roles/architect.md
+  - id: researcher
+    provider: claude
+    model: sonnet
+    agent: roles/researcher.md
+
+phases:
+  - id: understand
+    type: parallel
+    assignments:
+      - role: researcher
+        task: "Research existing solutions and prior art for: $inputs.problem_statement"
+        output: research.md
+      - role: architect
+        task: "Decompose the following problem into components: $inputs.problem_statement"
+        output: decomposition.md
+
+  - id: design
+    type: sequential
+    depends_on: [understand]
+    assignments:
+      - role: architect
+        task: "Design a solution architecture based on the research and decomposition"
+        input:
+          - $phases.understand.research
+          - $phases.understand.decomposition
+        output: architecture.md
+
+  - id: review
+    type: gate
+    depends_on: [design]
+    assignments:
+      - role: architect
+        task: "Summarize the architecture for human review"
+        input: $phases.design.architecture
+        output: summary.md
+
+output:
+  type: composite
+  vault_capture: true
+  items:
+    - type: knowledge
+      file: architecture.md
+      vault_zone: knowledge/decisions
+    - type: artifact
+      file: summary.md
+  on_complete:
+    notify: true

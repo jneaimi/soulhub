@@ -1,0 +1,67 @@
+{%- set rows = input.rows or [] -%}
+{%- set max_intensity = input.max_intensity | default(5) -%}
+{%- set col_a_label = input.column_a_label | default('العمود أ') -%}
+{%- set col_b_label = input.column_b_label | default('العمود ب') -%}
+{%- set row_count = rows | length -%}
+{%- set chart_top = 30 -%}
+{%- set row_height = 40 -%}
+{%- set legend_height = 50 -%}
+{%- set svg_height = chart_top + (row_count * row_height) + legend_height -%}
+{%- set label_x = 580 -%}
+{%- set col_a_center = 280 -%}
+{%- set col_b_center = 100 -%}
+{%- set dot_spacing = 20 -%}
+{%- set dot_radius = 5 -%}
+{%- set color_a = '#F59E0B' -%}
+{%- set color_b = '#FB923C' -%}
+{%- set color_empty_stroke = '#A1A1AA' -%}
+<section class="naseej-section naseej-comparison-dot-matrix naseej-comparison-dot-matrix--rtl" lang="ar" dir="rtl">
+{%- if input.title %}
+    <h3 style="margin: 0 0 0.4em 0; font-size: 14pt; line-height: 1.3;">{{ input.title }}</h3>
+{%- endif %}
+{%- if input.eyebrow %}
+    <div style="font-size: 9pt; letter-spacing: 0.08em; color: var(--accent); font-weight: 700; margin-bottom: 0.6em;">{{ input.eyebrow }}</div>
+{%- endif %}
+    <figure style="margin: 0; page-break-inside: avoid;" role="group" aria-label="مصفوفة كثافة الإشارة">
+        <svg viewBox="0 0 600 {{ svg_height }}" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMinYMin meet" style="width: 100%; height: auto; display: block;">
+            <text x="{{ label_x }}" y="22" font-size="9" fill="#71717A" letter-spacing="0.06em" font-weight="600" text-anchor="end">{{ input.row_header_label | default('عنصر') }}</text>
+            <text x="{{ col_a_center }}" y="22" font-size="9" fill="#71717A" letter-spacing="0.06em" font-weight="600" text-anchor="middle">{{ col_a_label }}</text>
+            <text x="{{ col_b_center }}" y="22" font-size="9" fill="#71717A" letter-spacing="0.06em" font-weight="600" text-anchor="middle">{{ col_b_label }}</text>
+            <line x1="20" y1="{{ chart_top }}" x2="580" y2="{{ chart_top }}" stroke="#A1A1AA" stroke-width="0.6"/>
+{%- for row in rows %}
+{%- set y = chart_top + 12 + loop.index0 * row_height -%}
+{%- set text_y = y + 4 -%}
+            <text x="{{ label_x }}" y="{{ text_y }}" font-size="10" fill="#18181B" text-anchor="end">{{ row.label }}</text>
+{%- set a_start = col_a_center - ((max_intensity - 1) * dot_spacing / 2) | int -%}
+{%- for n in range(max_intensity) %}
+{%- set cx = a_start + n * dot_spacing -%}
+{%- if n < (row.a | int) %}
+            <circle cx="{{ cx }}" cy="{{ y }}" r="{{ dot_radius }}" fill="{{ color_a }}"/>
+{%- else %}
+            <circle cx="{{ cx }}" cy="{{ y }}" r="{{ dot_radius }}" fill="none" stroke="{{ color_empty_stroke }}" stroke-width="0.6"/>
+{%- endif %}
+{%- endfor %}
+{%- set b_start = col_b_center - ((max_intensity - 1) * dot_spacing / 2) | int -%}
+{%- for n in range(max_intensity) %}
+{%- set cx = b_start + n * dot_spacing -%}
+{%- if n < (row.b | int) %}
+            <circle cx="{{ cx }}" cy="{{ y }}" r="{{ dot_radius }}" fill="{{ color_b }}"/>
+{%- else %}
+            <circle cx="{{ cx }}" cy="{{ y }}" r="{{ dot_radius }}" fill="none" stroke="{{ color_empty_stroke }}" stroke-width="0.6"/>
+{%- endif %}
+{%- endfor %}
+{%- endfor %}
+{%- set legend_y = chart_top + (row_count * row_height) + 18 -%}
+            <line x1="20" y1="{{ legend_y - 10 }}" x2="580" y2="{{ legend_y - 10 }}" stroke="#E4E4E7" stroke-width="0.4"/>
+            <circle cx="570" cy="{{ legend_y }}" r="4" fill="{{ color_a }}"/>
+            <text x="560" y="{{ legend_y + 4 }}" font-size="9" fill="#3F3F46" text-anchor="end">{{ col_a_label }} (0–{{ max_intensity }})</text>
+            <circle cx="310" cy="{{ legend_y }}" r="4" fill="{{ color_b }}"/>
+            <text x="300" y="{{ legend_y + 4 }}" font-size="9" fill="#3F3F46" text-anchor="end">{{ col_b_label }} (0–{{ max_intensity }})</text>
+            <circle cx="150" cy="{{ legend_y }}" r="4" fill="none" stroke="{{ color_empty_stroke }}" stroke-width="0.6"/>
+            <text x="140" y="{{ legend_y + 4 }}" font-size="9" fill="#3F3F46" text-anchor="end">تحت العتبة</text>
+        </svg>
+{%- if input.caption %}
+        <figcaption style="font-size: 8.5pt; color: var(--text-secondary); font-style: italic; margin-top: 0.3em; line-height: 1.45;">{{ input.caption }}</figcaption>
+{%- endif %}
+    </figure>
+</section>

@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-20T12:31:22.554Z",
+  "brands": {
+    "jneaimi": {
+      "slug": "jneaimi",
+      "name": "Jasem Al Neaimi",
+      "colors": [
+        "accent",
+        "accent_2",
+        "accent_on",
+        "border",
+        "border_strong",
+        "code_bg",
+        "code_fg",
+        "page_bg",
+        "tag_bg",
+        "tag_fg",
+        "text",
+        "text_secondary",
+        "text_tertiary"
+      ],
+      "languages": [
+        "ar",
+        "en"
+      ],
+      "has_logo": true,
+      "brand_path": "catalog/brands/jneaimi/brand.yaml"
+    }
+  }
+}

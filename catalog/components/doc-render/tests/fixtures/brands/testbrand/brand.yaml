@@ -1,0 +1,9 @@
+# Test fixture brand (ADR-031 CP1) — resolved by slug `testbrand` against the
+# fixtures brands dir (catalog_root.parent/brands when catalog_root points at
+# tests/fixtures/components).
+name: Test Brand
+colors:
+  accent: "#7A1F68"
+  accent_2: "#1FA37A"
+identity:
+  author_name: Test Author

@@ -1,0 +1,94 @@
+name: Code Review
+type: playbook
+description: Multi-perspective code review with automated pre-analysis
+
+prerequisites:
+  - name: claude
+    check: "which claude"
+    install: "Install Claude Code CLI: https://docs.anthropic.com/en/docs/claude-code"
+    required: true
+  - name: python3
+    check: "which python3"
+    install: "brew install python3 (macOS) or apt install python3 (Linux)"
+    required: true
+
+hooks:
+  pre_run:
+    - id: scan-target
+      run: "python3 hooks/scan-target.py $inputs.target_files"
+      output: scan-result.json
+    - id: analyze-logic
+      run: "python3 hooks/analyze-logic.py $inputs.target_files"
+      output: logic-analysis.json
+    - id: analyze-security
+      run: "python3 hooks/analyze-security.py $inputs.target_files"
+      output: security-analysis.json
+    - id: analyze-perf
+      run: "python3 hooks/analyze-perf.py $inputs.target_files"
+      output: perf-analysis.json
+
+timeout_strategy: auto
+
+inputs:
+  - id: target_files
+    type: text
+    description: Files or directories to review (absolute path or relative to project)
+    required: true
+  - id: focus_areas
+    type: text
+    description: Specific areas of concern (optional)
+    required: false
+    default: ""
+
+roles:
+  - id: logic-reviewer
+    provider: claude
+    model: sonnet
+    agent: roles/logic-reviewer.md
+    skills: [code-review]
+  - id: security-auditor
+    provider: claude
+    model: sonnet
+    agent: roles/security-auditor.md
+    skills: [security-review]
+  - id: perf-analyst
+    provider: claude
+    model: sonnet
+    agent: roles/perf-analyst.md
+    skills: [performance-review]
+
+phases:
+  - id: review
+    type: parallel
+    assignments:
+      - role: logic-reviewer
+        task: "Read the logic analysis report at hooks/output/logic-report.md. Review each finding — confirm real issues, dismiss false positives. Spot-check 2-3 complex files for issues the tool missed. Write your expert review for: $inputs.target_files"
+        input: hooks/output/logic-report.md
+        output: logic-review.md
+      - role: security-auditor
+        task: "Read the security scan report at hooks/output/security-report.md. Assess each finding's real risk. If 0 automated findings, do a focused 3-minute spot-check only. Write your security review for: $inputs.target_files"
+        input: hooks/output/security-report.md
+        output: security-review.md
+      - role: perf-analyst
+        task: "Read the performance analysis at hooks/output/perf-report.md. Assess actual impact of each finding. Spot-check hot paths. Write your performance review for: $inputs.target_files"
+        input: hooks/output/perf-report.md
+        output: perf-review.md
+
+  - id: consolidate
+    type: sequential
+    depends_on: [review]
+    assignments:
+      - role: logic-reviewer
+        task: "Consolidate the three review reports into a single prioritized action list. Read the review files for the full findings."
+        input:
+          - $phases.review.logic-review
+          - $phases.review.security-review
+          - $phases.review.perf-review
+        output: consolidated-review.md
+
+output:
+  type: artifact
+  file: consolidated-review.md
+  vault_capture: true
+  on_complete:
+    notify: true

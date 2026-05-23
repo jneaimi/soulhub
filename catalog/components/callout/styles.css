@@ -1,0 +1,31 @@
+.naseej-callout {
+    font-family: var(--font-primary);
+    padding: 10pt 14pt;
+    margin: 0.9em 0;
+    border-radius: 3pt;
+    color: var(--text);
+    border: 0 solid transparent;
+}
+
+.naseej-callout[lang="en"] { border-left-width: 3px; }
+.naseej-callout[lang="ar"] { border-right-width: 3px; }
+
+.naseej-callout__title {
+    font-weight: 700;
+    margin-bottom: 0.3em;
+    font-size: 11pt;
+}
+
+.naseej-callout__body { font-size: 10.5pt; line-height: 1.55; }
+
+.naseej-callout--info    { background: var(--callout-info-bg);   border-color: var(--callout-info-accent); }
+.naseej-callout--warn    { background: var(--callout-warn-bg);   border-color: var(--callout-warn-accent); }
+.naseej-callout--danger  { background: var(--callout-danger-bg); border-color: var(--callout-danger-accent); }
+.naseej-callout--tip     { background: var(--callout-tip-bg);    border-color: var(--callout-tip-accent); }
+.naseej-callout--neutral { background: var(--tag-bg);            border-color: var(--accent); }
+
+.naseej-callout--info    .naseej-callout__title { color: var(--callout-info-accent); }
+.naseej-callout--warn    .naseej-callout__title { color: var(--callout-warn-accent); }
+.naseej-callout--danger  .naseej-callout__title { color: var(--callout-danger-accent); }
+.naseej-callout--tip     .naseej-callout__title { color: var(--callout-tip-accent); }
+.naseej-callout--neutral .naseej-callout__title { color: var(--accent); }

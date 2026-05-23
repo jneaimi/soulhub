@@ -1,0 +1,48 @@
+name: keyword-tracker
+description: Track keywords across sources and generate a summary report
+version: 1.0.0
+
+env:
+  - name: API_KEY
+    description: API key for data source
+    required: false
+
+inputs:
+  - name: date_range
+    type: text
+    description: Date range to scan (e.g. "7d", "30d")
+    default: "7d"
+    required: false
+
+shared_config:
+  - name: Keywords
+    file: config/keywords.json
+    description: Keywords to track across sources
+    columns:
+      - name: keyword
+        type: text
+        label: Keyword
+        placeholder: "e.g. AI agents"
+        required: true
+      - name: category
+        type: select
+        label: Category
+        options: [tech, business, culture]
+        required: true
+
+steps:
+  - id: fetch
+    block: data-fetcher
+    config:
+      max_results: 10
+    output: output/fetch-result.json
+    timeout: 120
+
+  - id: report
+    block: report-maker
+    depends_on: [fetch]
+    output: output/report.md
+    timeout: 60
+
+on_failure:
+  strategy: halt

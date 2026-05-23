@@ -1,0 +1,394 @@
+/**
+ * Vault Healer — safe auto-fixes for vault health issues.
+ *
+ * Rules:
+ *   SAFE (auto-fix):
+ *     - Orphan note in a zone with an index.md → append [[note]] link to zone index
+ *     - Missing root index.md → generate from zone list
+ *     - Missing 'created' frontmatter → backfill from file mtime
+ *     - Dead wikilink with single match → auto-correct
+ *
+ *   NEEDS_HUMAN (notification):
+ *     - Orphan with no zone index → can't auto-link
+ *     - Dead wikilink with multiple candidates → ambiguous
+ *     - Governance violations (wrong type for zone) → needs decision
+ *     - Large batches (>100 orphans per zone) → needs approval
+ */
+
+import { readFile, writeFile, stat } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import type { VaultNote } from '../../vault/types.js';
+import type { HealResult } from '../types.js';
+
+/**
+ * Link orphan notes to their zone's index.md.
+ * Only fixes notes in zones that have an index.md file.
+ */
+export async function healOrphans(
+	vaultRoot: string,
+	orphans: VaultNote[],
+	allNotes: VaultNote[]
+): Promise<HealResult> {
+	const result: HealResult = { type: 'orphan_notes', fixed: [], skipped: [], errors: [] };
+
+	// Group orphans by their top-level zone
+	const byZone = new Map<string, VaultNote[]>();
+	for (const note of orphans) {
+		const zone = note.path.split('/')[0];
+		if (!byZone.has(zone)) byZone.set(zone, []);
+		byZone.get(zone)!.push(note);
+	}
+
+	// Find zone indices
+	const zoneIndices = new Map<string, string>();
+	for (const note of allNotes) {
+		// Match zone/index.md or zone/subdir/index.md
+		if (note.path.endsWith('/index.md') || note.path === 'index.md') {
+			const zone = note.path.split('/')[0];
+			// Prefer top-level zone index
+			if (!zoneIndices.has(zone) || note.path.split('/').length < zoneIndices.get(zone)!.split('/').length) {
+				zoneIndices.set(zone, note.path);
+			}
+		}
+	}
+
+	for (const [zone, zoneOrphans] of byZone) {
+		const indexPath = zoneIndices.get(zone);
+		if (!indexPath) {
+			// No index.md for this zone — skip, needs human
+			for (const orphan of zoneOrphans) {
+				result.skipped.push(orphan.path);
+			}
+			continue;
+		}
+
+		// Safety: don't auto-fix more than 50 orphans per zone in one run
+		const batch = zoneOrphans.slice(0, 50);
+		if (zoneOrphans.length > 50) {
+			for (const orphan of zoneOrphans.slice(50)) {
+				result.skipped.push(orphan.path);
+			}
+		}
+
+		try {
+			const absIndexPath = resolve(vaultRoot, indexPath);
+			const indexContent = await readFile(absIndexPath, 'utf-8');
+
+			// Build links to append — skip notes already linked
+			const newLinks: string[] = [];
+			for (const orphan of batch) {
+				const linkTarget = orphan.path.replace(/\.md$/, '');
+				// Check if already linked (case-insensitive)
+				const alreadyLinked = indexContent.toLowerCase().includes(`[[${linkTarget.toLowerCase()}`);
+				if (alreadyLinked) {
+					result.skipped.push(orphan.path);
+					continue;
+				}
+				newLinks.push(`- [[${linkTarget}|${orphan.title}]]`);
+				result.fixed.push(orphan.path);
+			}
+
+			if (newLinks.length > 0) {
+				const appendBlock = `\n\n## Auto-linked (${new Date().toISOString().slice(0, 10)})\n${newLinks.join('\n')}\n`;
+				await writeFile(absIndexPath, indexContent + appendBlock, 'utf-8');
+			}
+		} catch (err) {
+			for (const orphan of batch) {
+				result.errors.push({ path: orphan.path, error: err instanceof Error ? err.message : String(err) });
+			}
+		}
+	}
+
+	return result;
+}
+
+/**
+ * Generate root index.md if missing — links to all zone indices.
+ */
+export async function healMissingRootIndex(
+	vaultRoot: string,
+	allNotes: VaultNote[]
+): Promise<HealResult> {
+	const result: HealResult = { type: 'missing_index', fixed: [], skipped: [], errors: [] };
+	const rootIndexPath = resolve(vaultRoot, 'index.md');
+
+	// Check if root index already exists
+	try {
+		await stat(rootIndexPath);
+		result.skipped.push('index.md');
+		return result;
+	} catch {
+		// Doesn't exist — create it
+	}
+
+	// Discover zones — only recognized vault zones
+	const VALID_ZONES = new Set(['inbox', 'projects', 'knowledge', 'content', 'operations', 'archive', 'finance', 'security']);
+	const zones = new Set<string>();
+	for (const note of allNotes) {
+		const zone = note.path.split('/')[0];
+		if (zone && VALID_ZONES.has(zone)) {
+			zones.add(zone);
+		}
+	}
+
+	// Count notes per zone (only valid zones)
+	const zoneCounts = new Map<string, number>();
+	for (const note of allNotes) {
+		const zone = note.path.split('/')[0];
+		if (VALID_ZONES.has(zone)) {
+			zoneCounts.set(zone, (zoneCounts.get(zone) || 0) + 1);
+		}
+	}
+
+	const today = new Date().toISOString().slice(0, 10);
+	const zoneLinks = [...zones]
+		.sort()
+		.map((z) => `- [[${z}/index|${z}]] (${zoneCounts.get(z) || 0} notes)`)
+		.join('\n');
+
+	const content = `---
+type: index
+created: ${today}
+tags: [vault, auto-generated]
+---
+
+# Vault Index
+
+${zoneLinks}
+
+---
+*Auto-generated by Soul Hub System Health on ${today}*
+`;
+
+	try {
+		await writeFile(rootIndexPath, content, 'utf-8');
+		result.fixed.push('index.md');
+	} catch (err) {
+		result.errors.push({ path: 'index.md', error: err instanceof Error ? err.message : String(err) });
+	}
+
+	return result;
+}
+
+/**
+ * Auto-fix broken wikilinks via fuzzy-match against the vault index.
+ *
+ * For each unresolved link, find the best-matching note by comparing the raw
+ * link text against every note's path, basename, and title. When a single
+ * candidate clears the confidence threshold it rewrites the link in-place;
+ * otherwise the link is left for human review.
+ */
+export async function healBrokenLinks(
+	vaultRoot: string,
+	unresolved: { source: string; raw: string }[],
+	allNotes: VaultNote[],
+	options: { confidenceThreshold?: number; maxFixesPerRun?: number } = {}
+): Promise<HealResult> {
+	const threshold = options.confidenceThreshold ?? 0.88;
+	const maxFixes = options.maxFixesPerRun ?? 50;
+	const result: HealResult = { type: 'dead_links', fixed: [], skipped: [], errors: [] };
+
+	// Build candidate index — every note contributes its full path, basename, and title.
+	// Each key carries a `kind` flag so we can compare like-for-like.
+	type CandidateKey = { kind: 'path' | 'basename' | 'title'; value: string };
+	type Candidate = { path: string; keys: CandidateKey[] };
+	const candidates: Candidate[] = allNotes.map((n) => {
+		const pathNoExt = n.path.replace(/\.md$/, '');
+		const basename = pathNoExt.split('/').pop()!;
+		const keys: CandidateKey[] = [
+			{ kind: 'path', value: normalize(pathNoExt) },
+			{ kind: 'basename', value: normalize(basename) },
+		];
+		if (n.title) keys.push({ kind: 'title', value: normalize(n.title) });
+		return { path: pathNoExt, keys };
+	});
+
+	// Group unresolved by source file so we rewrite each file once
+	const bySource = new Map<string, { raw: string; replacement: string }[]>();
+	const seen = new Set<string>(); // dedupe source+raw — parser may emit duplicates
+
+	let fixedCount = 0;
+	for (const link of unresolved) {
+		const dedupeKey = `${link.source}\x00${link.raw}`;
+		if (seen.has(dedupeKey)) continue;
+		seen.add(dedupeKey);
+
+		if (fixedCount >= maxFixes) {
+			result.skipped.push(`${link.source}: [[${link.raw}]]`);
+			continue;
+		}
+
+		// Ignore heading-only anchors, URLs, and folder references (trailing /)
+		const base = link.raw.split('#')[0].split('|')[0].trim();
+		if (!base || base.startsWith('http') || base.endsWith('/')) {
+			result.skipped.push(`${link.source}: [[${link.raw}]]`);
+			continue;
+		}
+
+		// Decide what to match against: full-path raw ≠ bare title raw
+		const rawHasPath = base.includes('/');
+		const needlePath = normalize(base);
+		const needleBase = normalize(base.split('/').pop()!);
+		const sourcePathNoExt = link.source.replace(/\.md$/, '');
+
+		let bestScore = 0;
+		let bestPath: string | null = null;
+		let ambiguous = false;
+
+		for (const cand of candidates) {
+			if (cand.path === sourcePathNoExt) continue; // never self-link
+			for (const key of cand.keys) {
+				// Match full path against path keys only; match bare name against basename/title
+				const score = key.kind === 'path'
+					? rawSimilarity(needlePath, key.value)
+					: rawHasPath ? 0 : rawSimilarity(needleBase, key.value);
+				if (score > bestScore + 1e-9) {
+					bestScore = score;
+					bestPath = cand.path;
+					ambiguous = false;
+				} else if (Math.abs(score - bestScore) < 1e-9 && cand.path !== bestPath) {
+					ambiguous = true;
+				}
+			}
+		}
+
+		if (!bestPath || bestScore < threshold || ambiguous) {
+			result.skipped.push(`${link.source}: [[${link.raw}]]`);
+			continue;
+		}
+
+		const list = bySource.get(link.source) ?? [];
+		list.push({ raw: link.raw, replacement: bestPath });
+		bySource.set(link.source, list);
+		fixedCount++;
+	}
+
+	// Apply rewrites — one read/write per source file
+	for (const [source, rewrites] of bySource) {
+		try {
+			const absPath = resolve(vaultRoot, source);
+			let content = await readFile(absPath, 'utf-8');
+			for (const { raw, replacement } of rewrites) {
+				// Preserve alias (text after |) and heading anchor (text after #) if present
+				const pattern = new RegExp(`!?\\[\\[${escapeRegex(raw)}(#[^\\]|]*)?(\\|[^\\]]*)?\\]\\]`, 'g');
+				content = content.replace(pattern, (match) => {
+					const isEmbed = match.startsWith('!');
+					const anchor = match.match(/#[^\]|]*/)?.[0] ?? '';
+					const alias = match.match(/\|[^\]]*/)?.[0] ?? '';
+					return `${isEmbed ? '!' : ''}[[${replacement}${anchor}${alias}]]`;
+				});
+				result.fixed.push(`${source}: [[${raw}]] → [[${replacement}]]`);
+			}
+			await writeFile(absPath, content, 'utf-8');
+		} catch (err) {
+			for (const { raw } of rewrites) {
+				result.errors.push({
+					path: `${source}: [[${raw}]]`,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
+	}
+
+	return result;
+}
+
+function normalize(s: string): string {
+	return s.toLowerCase().replace(/[_\-\s]+/g, ' ').trim();
+}
+
+function escapeRegex(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Similarity score in [0, 1]. Pure Levenshtein-based — no substring bonus,
+ * which was too permissive (a short key embedded in a long raw would score
+ * near 1.0 even when semantically unrelated).
+ */
+function rawSimilarity(a: string, b: string): number {
+	if (!a || !b) return 0;
+	if (a === b) return 1;
+	const dist = levenshtein(a, b);
+	return 1 - dist / Math.max(a.length, b.length);
+}
+
+function levenshtein(a: string, b: string): number {
+	if (a.length === 0) return b.length;
+	if (b.length === 0) return a.length;
+	const prev = new Array<number>(b.length + 1);
+	const curr = new Array<number>(b.length + 1);
+	for (let j = 0; j <= b.length; j++) prev[j] = j;
+	for (let i = 1; i <= a.length; i++) {
+		curr[0] = i;
+		for (let j = 1; j <= b.length; j++) {
+			const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+			curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+		}
+		for (let j = 0; j <= b.length; j++) prev[j] = curr[j];
+	}
+	return prev[b.length];
+}
+
+/**
+ * Backfill missing 'created' frontmatter from file mtime.
+ */
+export async function healMissingFrontmatter(
+	vaultRoot: string,
+	allNotes: VaultNote[]
+): Promise<HealResult> {
+	const result: HealResult = { type: 'missing_frontmatter', fixed: [], skipped: [], errors: [] };
+
+	const missing = allNotes.filter((n) => !n.meta.created);
+
+	// Cap at 50 per run
+	const batch = missing.slice(0, 50);
+	for (const note of missing.slice(50)) {
+		result.skipped.push(note.path);
+	}
+
+	for (const note of batch) {
+		try {
+			const absPath = resolve(vaultRoot, note.path);
+			const raw = await readFile(absPath, 'utf-8');
+			const fileStat = await stat(absPath);
+			const created = new Date(fileStat.mtimeMs).toISOString().slice(0, 10);
+
+			// Insert created field into existing frontmatter
+			let updated: string;
+			if (raw.startsWith('---')) {
+				// Has frontmatter — insert created before closing ---
+				const endIdx = raw.indexOf('---', 3);
+				if (endIdx > 0) {
+					const front = raw.slice(0, endIdx);
+					// Defensive guard: text-level scan for an existing `created:` line.
+					// `meta.created` may be undefined because the YAML parser threw
+					// (some other field is malformed) rather than because the field
+					// is genuinely missing — inserting another `created:` line in
+					// that case compounds the corruption (we've seen 69 dup lines
+					// per file from prior runs). Skip and let the human fix the
+					// underlying YAML.
+					if (/^created:\s/m.test(front)) {
+						result.skipped.push(note.path);
+						continue;
+					}
+					const rest = raw.slice(endIdx);
+					updated = front + `created: ${created}\n` + rest;
+				} else {
+					result.skipped.push(note.path);
+					continue;
+				}
+			} else {
+				// No frontmatter — add it
+				updated = `---\ncreated: ${created}\n---\n\n${raw}`;
+			}
+
+			await writeFile(absPath, updated, 'utf-8');
+			result.fixed.push(note.path);
+		} catch (err) {
+			result.errors.push({ path: note.path, error: err instanceof Error ? err.message : String(err) });
+		}
+	}
+
+	return result;
+}

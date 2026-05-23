@@ -1,0 +1,45 @@
+name: parallel-smoke
+version: 1.0.0
+project: naseej
+description: |
+  ADR-013 parallel-execution smoke test. Three independent sleep steps in
+  wave 1, one consolidating step in wave 2. Expected wall-clock with
+  parallelism: ~3s (longest leaf) + ~1s consolidate ≈ 4s.
+  Without parallelism the same would take ~3+3+3+1 = 10s.
+
+max_parallelism: 4
+
+steps:
+  - id: leaf-a
+    component: shell-exec@1.0.0
+    depends_on: []
+    inputs:
+      cmd: sh
+      args: ["-c", "sleep 3 && echo leaf-a-done"]
+      timeout_sec: 10
+
+  - id: leaf-b
+    component: shell-exec@1.0.0
+    depends_on: []
+    inputs:
+      cmd: sh
+      args: ["-c", "sleep 3 && echo leaf-b-done"]
+      timeout_sec: 10
+
+  - id: leaf-c
+    component: shell-exec@1.0.0
+    depends_on: []
+    inputs:
+      cmd: sh
+      args: ["-c", "sleep 3 && echo leaf-c-done"]
+      timeout_sec: 10
+
+  - id: consolidate
+    component: shell-exec@1.0.0
+    depends_on: [leaf-a, leaf-b, leaf-c]
+    inputs:
+      cmd: sh
+      args:
+        - "-c"
+        - "echo consolidate: a={{steps.leaf-a.outputs.stdout}} b={{steps.leaf-b.outputs.stdout}} c={{steps.leaf-c.outputs.stdout}}"
+      timeout_sec: 10

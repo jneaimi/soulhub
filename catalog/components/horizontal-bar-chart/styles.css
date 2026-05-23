@@ -1,0 +1,16 @@
+.naseej-horizontal-bar-chart { margin: 1.4em 0; }
+
+.naseej-horizontal-bar-chart__title { margin: 0 0 0.4em 0; font-size: 14pt; line-height: 1.3; color: var(--text); }
+.naseej-horizontal-bar-chart__eyebrow { font-size: 9pt; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); font-weight: 700; margin-bottom: 0.6em; }
+.naseej-horizontal-bar-chart__figure { margin: 0; }
+.naseej-horizontal-bar-chart__svg { width: 100%; height: auto; display: block; font-family: var(--font-primary, "Newsreader", Georgia, serif); }
+.naseej-horizontal-bar-chart__axis-label { font-size: 8pt; fill: var(--text-secondary); letter-spacing: 0.05em; text-transform: uppercase; }
+.naseej-horizontal-bar-chart__grid-line { stroke: var(--border); stroke-width: 0.5; }
+.naseej-horizontal-bar-chart__baseline { stroke: var(--text-secondary); stroke-width: 0.75; }
+.naseej-horizontal-bar-chart__bar { fill: var(--accent); }
+.naseej-horizontal-bar-chart__bar--high { fill: #F59E0B; }
+.naseej-horizontal-bar-chart__bar--mid { fill: #FB923C; }
+.naseej-horizontal-bar-chart__bar--low { fill: #A1A1AA; }
+.naseej-horizontal-bar-chart__label { font-size: 10pt; fill: var(--text); }
+.naseej-horizontal-bar-chart__value { font-size: 10pt; fill: var(--text); font-weight: 600; }
+.naseej-horizontal-bar-chart__caption { font-size: 8.5pt; color: var(--text-secondary); font-style: italic; margin-top: 0.3em; line-height: 1.45; }

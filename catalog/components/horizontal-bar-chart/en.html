@@ -1,0 +1,48 @@
+{%- set items = input.items or [] -%}
+{%- set values = items | map(attribute='value') | list -%}
+{%- set max_value = values | max if values else 1 -%}
+{%- set bar_count = items | length -%}
+{%- set row_height = 30 -%}
+{%- set chart_top = 32 -%}
+{%- set bottom_pad = 12 -%}
+{%- set svg_height = chart_top + (bar_count * row_height) + bottom_pad -%}
+{%- set baseline_y = chart_top + (bar_count * row_height) -%}
+{%- set bar_origin_x = 240 -%}
+{%- set bar_max_width = 290 -%}
+{%- set bar_min_width = 6 -%}
+{%- set color_high = '#F59E0B' -%}
+{%- set color_mid = '#FB923C' -%}
+{%- set color_low = '#A1A1AA' -%}
+<section class="naseej-section naseej-horizontal-bar-chart" lang="en">
+{%- if input.title %}
+    <h3 style="margin: 0 0 0.4em 0; font-size: 14pt; line-height: 1.3;">{{ input.title }}</h3>
+{%- endif %}
+{%- if input.eyebrow %}
+    <div style="font-size: 9pt; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); font-weight: 700; margin-bottom: 0.6em;">{{ input.eyebrow }}</div>
+{%- endif %}
+    <figure style="margin: 0;" role="group" aria-label="Cluster discourse density chart">
+        <svg viewBox="0 0 600 {{ svg_height }}" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMinYMin meet" style="width: 100%; height: auto; display: block;">
+{%- if input.x_axis_label %}
+            <text x="{{ bar_origin_x }}" y="13" font-size="8" fill="#71717A" letter-spacing="0.05em">{{ input.x_axis_label }}</text>
+{%- endif %}
+            <line x1="{{ bar_origin_x }}" y1="20" x2="{{ bar_origin_x }}" y2="{{ baseline_y }}" stroke="#E4E4E7" stroke-width="0.5"/>
+            <line x1="{{ bar_origin_x }}" y1="{{ baseline_y }}" x2="{{ bar_origin_x + bar_max_width + 50 }}" y2="{{ baseline_y }}" stroke="#A1A1AA" stroke-width="0.75"/>
+{%- for item in items %}
+{%- set ratio = (item.value | float) / (max_value | float) if max_value else 0 -%}
+{%- set computed = (ratio * bar_max_width) | round(0, 'common') | int -%}
+{%- set bar_width = [computed, bar_min_width] | max -%}
+{%- set y = chart_top + loop.index0 * row_height -%}
+{%- set text_y = y + 16 -%}
+{%- set value_x = bar_origin_x + bar_width + 8 -%}
+{%- set tier = item.intensity or 'mid' -%}
+{%- if tier == 'high' -%}{% set fill = color_high %}{%- elif tier == 'low' -%}{% set fill = color_low %}{%- else -%}{% set fill = color_mid %}{%- endif %}
+            <rect x="{{ bar_origin_x }}" y="{{ y }}" width="{{ bar_width }}" height="22" fill="{{ fill }}"/>
+            <text x="{{ bar_origin_x - 2 }}" y="{{ text_y }}" text-anchor="end" font-size="10" fill="#18181B">{{ item.label }}</text>
+            <text x="{{ value_x }}" y="{{ text_y }}" font-size="10" fill="#18181B" font-weight="600">{{ item.value_display }}</text>
+{%- endfor %}
+        </svg>
+{%- if input.caption %}
+        <figcaption style="font-size: 8.5pt; color: var(--text-secondary); font-style: italic; margin-top: 0.3em; line-height: 1.45;">{{ input.caption }}</figcaption>
+{%- endif %}
+    </figure>
+</section>

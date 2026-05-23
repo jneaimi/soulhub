@@ -1,0 +1,73 @@
+name: shell-smoke-naseej
+version: 1.0.0
+project: naseej
+description: |
+  ADR-006 S3 keystone smoke (closes F2). Composes every primitive ADR-006
+  introduced: `file: must_exist=true` input, four templating filters,
+  HOME + work_dir context globals, and the Tier-1 `shell-exec` component.
+  No agents, no LLM cost — pure subprocess + vault-write composition.
+
+  Flow:
+  1. Recipe-start resolves `target_file` to a known-good file path and stat-checks it.
+  2. `shell-exec` runs `wc -l` on the file, redirecting stdout into work_dir.
+  3. `vault-write` logs the result to inbox/_naseej-runs/ using filters
+     (basename, dirname, human_bytes, date_fmt) to verify they all interpolate
+     at step time.
+
+inputs:
+  - name: target_file
+    type: file
+    path: "{{HOME}}/dev/soul-hub/package.json"
+    must_exist: true
+
+  - name: today_short
+    type: string
+    default: "{{date | date_fmt:DD/MM/YYYY}}"
+
+steps:
+  - id: count-lines
+    component: shell-exec@1.0.0
+    inputs:
+      cmd: wc
+      args:
+        - -l
+        - "{{inputs.target_file}}"
+      stdout_to_file: "{{work_dir}}/wc.txt"
+      timeout_sec: 10
+
+  - id: log
+    component: vault-write@1.0.0
+    depends_on: [count-lines]
+    inputs:
+      path: "inbox/_naseej-runs/{{date}}-{{run_id}}-shell-smoke.md"
+      frontmatter:
+        type: output
+        created: "{{date}}"
+        tags: [naseej, shell-smoke, adr-006-s3, auto-generated]
+        project: naseej
+        run_id: "{{run_id}}"
+        source_agent: naseej-runner
+      body: |
+        # shell-smoke run {{run_id}}
+
+        ADR-006 S3 verification — shell-exec composed end-to-end with file
+        inputs + filters + ctx globals.
+
+        ## Inputs
+
+        - `target_file`: `{{inputs.target_file}}`
+        - `target_file | basename`: `{{inputs.target_file | basename}}`
+        - `target_file | dirname`: `{{inputs.target_file | dirname}}`
+        - Date today: `{{inputs.today_short}}`
+
+        ## shell-exec outputs
+
+        - `wc -l` exit code: `{{steps.count-lines.outputs.exit_code}}`
+        - Wall-clock: `{{steps.count-lines.outputs.duration_ms}}ms`
+        - Stdout (inline): `{{steps.count-lines.outputs.stdout}}`
+        - Stdout captured to: `{{steps.count-lines.outputs.stdout_path}}`
+        - Stdout file basename: `{{steps.count-lines.outputs.stdout_path | basename}}`
+
+        ## Context
+
+        Run id: `{{run_id}}` · work_dir: `{{work_dir | basename}}` (under `{{work_dir | dirname}}`)

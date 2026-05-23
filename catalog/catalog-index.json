@@ -1,0 +1,1910 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-21T13:38:55.009Z",
+  "components": {
+    "agent-dispatch": {
+      "name": "agent-dispatch",
+      "version": "1.0.0",
+      "kind": "subprocess",
+      "tier": 1,
+      "shape": "agentic",
+      "category": "capability",
+      "runtime": "node",
+      "description": "Dispatch a soul-hub agent by slug. Tier-1 capability per ADR-023 — the agentic primitive that collapses the legacy `agent:` step type into the component catalog. Runs the full dispatchAgent() loop including PTY+/goal convergence, artifact marker extraction, and per-step budget overrides.",
+      "when_to_use": "A step needs a soul-hub agent's skills, persona, or tools — anything that requires the iterative `/goal` convergence loop, multi-tool workflow, or a per-agent system prompt. The PTY backend is itself an interactive claude session (stateful across its own /goal turns); cross-dispatch resume is the ADR-028 Phase 2 spike. Pick this when you'd otherwise have invoked `claude` with a custom agent definition.",
+      "when_not_to_use": "A single-purpose LLM pass (use `inline-llm-pass` — cheaper, no agent setup; it now supports session/resume for sequential chains per ADR-028). A shell command (use `shell-exec`). A typed external system has a Tier-2 adapter already (prefer the adapter — e.g. `katib-build`, `vault-write`).",
+      "inputs": [
+        {
+          "name": "agent",
+          "type": "string",
+          "required": true,
+          "description": "Slug of the agent to run. Must match a file at `~/.claude/agents/<slug>.md` or `~/.soul-hub/data/agents/<slug>.yaml`."
+        },
+        {
+          "name": "task",
+          "type": "string",
+          "required": true,
+          "description": "Prompt passed to the agent. Interpolation of `{{steps.X.outputs.Y}}` template variables must be resolved by the runner before passing here."
+        },
+        {
+          "name": "context",
+          "type": "string",
+          "description": "Extra context injected into the dispatch options. Capped at 4000 chars internally (ADR-005 D6 PTY paste-stall guard). Longer strings are silently truncated."
+        },
+        {
+          "name": "goal_condition",
+          "type": "string",
+          "description": "Natural-language convergence condition forwarded to the PTY dispatcher as `/goal <condition>`. When present, the agent self-iterates until the condition is met or the budget fires. Only the `claude-pty` backend acts on this; `claude-cli-flag` and `ai-sdk` ignore it."
+        },
+        {
+          "name": "mode",
+          "type": "string",
+          "default": "production",
+          "enum": [
+            "production",
+            "test",
+            "oneshot"
+          ],
+          "description": "Dispatch backend selection. `production` routes through claude-pty with `/goal` loop. `test` uses claude-cli-flag with hard caps ($0.10 / 5 turns / 60s) — for CI smokes. `oneshot` uses claude-cli-flag with no caps, for structurally single-pass agents that need production budgets."
+        },
+        {
+          "name": "timeout_sec",
+          "type": "integer",
+          "default": 600,
+          "description": "Wall-clock budget in seconds. Absent = agent's stored budget, which falls through to PRODUCTION_DEFAULTS (600s) if unset."
+        },
+        {
+          "name": "max_turns",
+          "type": "integer",
+          "description": "Turn budget. Absent = agent's stored budget (default 25)."
+        },
+        {
+          "name": "max_usd",
+          "type": "number",
+          "description": "Dollar ceiling. Absent = agent's stored budget (default $0.50)."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output_excerpt",
+          "type": "string",
+          "description": "Last 2000 characters of the agent's final output."
+        },
+        {
+          "name": "artifact_path",
+          "type": "string",
+          "description": "Present when the agent emits the `===ARTIFACT===\\n<path>\\n===END===` marker in its output. Vault-relative path to the produced artefact."
+        },
+        {
+          "name": "agent_status",
+          "type": "string",
+          "description": "Terminal status from DispatchResult — one of `success`, `goal_achieved`, `failed`, `cancelled`, `timeout`, `error`, `budget-exceeded`."
+        },
+        {
+          "name": "num_turns",
+          "type": "integer",
+          "description": "Number of turns the agent took."
+        },
+        {
+          "name": "cost_usd",
+          "type": "number",
+          "description": "Actual dollar cost of the dispatch run."
+        },
+        {
+          "name": "exit_code",
+          "type": "integer",
+          "description": "0 on success or goal_achieved. 1 on failed, timeout, cancelled, or error."
+        }
+      ],
+      "used_by_recipes": [
+        "agent-smoke-naseej",
+        "artifact-smoke-naseej",
+        "cancel-smoke-naseej",
+        "peer-brief",
+        "per-step-mode-smoke-naseej"
+      ],
+      "example_usage": {
+        "from_recipe": "agent-smoke-naseej",
+        "step": {
+          "id": "verify",
+          "component": "agent-dispatch@1.0.0",
+          "inputs": {
+            "agent": "inspector",
+            "task": "Verify that the file projects/naseej/index.md exists in the current\nworking directory (which is the vault root). Use the Read tool once.\nReport a single line — either exactly \"VERIFIED: naseej index exists\"\nor exactly \"MISSING: naseej index not found\". Do not iterate, do not\nrun tests, do not invoke any other tools, do not write any files,\ndo not load any vault context. This is a minimum-spend dispatch smoke,\nnot a real QA pass.\n",
+            "timeout_sec": 180,
+            "max_turns": 4,
+            "max_usd": 0.1,
+            "goal_condition": "a verification line was written to stdout"
+          }
+        }
+      }
+    },
+    "approval-gate": {
+      "name": "approval-gate",
+      "version": "1.0.0",
+      "kind": "subprocess",
+      "tier": 1,
+      "shape": "gate",
+      "category": "capability",
+      "runtime": "node",
+      "description": "Pause a recipe run and require the operator to approve or reject before continuing. Uses the stdout-code-2 pause protocol — first invocation emits a pause-request and exits 2; the runner intercepts, registers the pause, awaits the operator's decision, then re-invokes the component with resume_response injected; second invocation exits 0 with decision + optional comment.",
+      "when_to_use": "A binary continue-or-abort decision before a consequential step (sending a draft, deploying, destructive ops). Operator should be in the loop with no structured data to enter — only the buttons.",
+      "when_not_to_use": "You need structured or free-form data beyond a yes/no (use `human-form`). The pipeline must run unattended — gate steps block forever without an operator. You only want a quality check, not a human approval (use `stop-slop` or `inline-llm-pass`).",
+      "inputs": [],
+      "outputs": [],
+      "used_by_recipes": [
+        "cp4-gate-smoke",
+        "gate-smoke-naseej"
+      ],
+      "example_usage": {
+        "from_recipe": "cp4-gate-smoke",
+        "step": {
+          "id": "approve",
+          "component": "approval-gate@1.0.0",
+          "inputs": {
+            "prompt": "CP4 smoke — approve the ADR-023 component-first migration?",
+            "allow_comment": true,
+            "timeout_sec": 120
+          }
+        }
+      }
+    },
+    "callout": {
+      "name": "callout",
+      "version": "0.1.0",
+      "kind": "presentation",
+      "tier": 1,
+      "shape": "default",
+      "category": "primitive",
+      "description": "Boxed message with an accent border and tinted background. Tones map to conventional UX patterns — info/warn/danger/tip for status messages; neutral for non-status highlights (subject lines, non-binding notices).",
+      "inputs": [
+        {
+          "name": "tone",
+          "type": "string",
+          "required": true,
+          "description": "info | warn | danger | tip | neutral. neutral uses tag_bg + accent, for non-status highlights."
+        },
+        {
+          "name": "title",
+          "type": "string",
+          "required": false,
+          "description": "Optional bolded first line."
+        },
+        {
+          "name": "body",
+          "type": "string",
+          "required": true,
+          "description": "The message body — plain text or minimal inline HTML."
+        }
+      ],
+      "outputs": [],
+      "template": {
+        "en": "en.html",
+        "ar": "ar.html"
+      },
+      "styles": "styles.css",
+      "tokens": [
+        "--text",
+        "--accent",
+        "--tag-bg",
+        "--callout-info-bg",
+        "--callout-info-accent",
+        "--callout-warn-bg",
+        "--callout-warn-accent",
+        "--callout-danger-bg",
+        "--callout-danger-accent",
+        "--callout-tip-bg",
+        "--callout-tip-accent"
+      ],
+      "languages": [
+        "en",
+        "ar"
+      ],
+      "sample_inputs": {
+        "tone": "info",
+        "title": "Summary",
+        "body": "A short highlighted note that draws the reader's attention to a key point."
+      },
+      "used_by_recipes": [],
+      "example_usage": null
+    },
+    "categorical-heatmap": {
+      "name": "categorical-heatmap",
+      "version": "0.1.0",
+      "kind": "presentation",
+      "tier": 1,
+      "shape": "default",
+      "category": "chart",
+      "description": "Generic row × column relevance heatmap, rendered as an HTML table of color-coded HIGH/MED/LOW cells. Columns and rows are inputs — no domain assumption.",
+      "inputs": [
+        {
+          "name": "eyebrow",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "title",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "columns",
+          "type": "array",
+          "required": true,
+          "description": "Column headers. The caller supplies them — no domain default."
+        },
+        {
+          "name": "rows",
+          "type": "array",
+          "required": true,
+          "description": "Rows to plot. Each is {label, cells: [high|med|low, ...]} aligned to columns."
+        },
+        {
+          "name": "caption",
+          "type": "string",
+          "required": false
+        }
+      ],
+      "outputs": [],
+      "template": {
+        "en": "en.html",
+        "ar": "ar.html"
+      },
+      "styles": "styles.css",
+      "tokens": [
+        "--accent",
+        "--text-secondary"
+      ],
+      "languages": [
+        "en",
+        "ar"
+      ],
+      "sample_inputs": {
+        "eyebrow": "Relevance matrix",
+        "columns": [
+          "Column 1",
+          "Column 2",
+          "Column 3",
+          "Column 4",
+          "Column 5"
+        ],
+        "rows": [
+          {
+            "label": "Row one",
+            "cells": [
+              "high",
+              "med",
+              "low",
+              "low",
+              "med"
+            ]
+          },
+          {
+            "label": "Row two",
+            "cells": [
+              "med",
+              "high",
+              "low",
+              "med",
+              "low"
+            ]
+          },
+          {
+            "label": "Row three",
+            "cells": [
+              "high",
+              "med",
+              "med",
+              "low",
+              "high"
+            ]
+          }
+        ],
+        "caption": "Relevance of each row to each column (high / med / low)."
+      },
+      "used_by_recipes": [],
+      "example_usage": null
+    },
+    "channel-send-text": {
+      "name": "channel-send-text",
+      "version": "1.0.0",
+      "kind": "subprocess",
+      "tier": 2,
+      "shape": "default",
+      "category": "channel",
+      "runtime": "node",
+      "description": "Send a text message via a channel adapter (telegram | whatsapp). Routes through POST /api/channels/send — the soul-hub adapter registry.",
+      "when_to_use": "Notify a person via Telegram or WhatsApp from a recipe — completion alert, ping, link to an artefact. Plain text or markdown (per adapter's parseMode).",
+      "when_not_to_use": "You need to send media (images, audio, files — no media support yet). You need a structured reply back from the user (use `human-form` or a gate component, not a channel). You're writing inside soul-hub app code with adapter access — call adapter.send directly.",
+      "inputs": [
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "enum": [
+            "telegram",
+            "whatsapp"
+          ],
+          "description": "Channel adapter id. Must be enabled + configured in soul-hub settings.json."
+        },
+        {
+          "name": "text",
+          "type": "string",
+          "required": true,
+          "description": "The message body. Plain text or markdown (per adapter's configured parseMode in settings.json). Long messages are chunked by the adapter."
+        },
+        {
+          "name": "api_base",
+          "type": "string",
+          "default": "http://localhost:2400",
+          "description": "Override the Soul Hub base URL."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "message_id",
+          "type": "string",
+          "description": "Adapter-assigned message id (Telegram message_id, WhatsApp serialized id). Empty string when adapter doesn't return one."
+        },
+        {
+          "name": "delivered_at",
+          "type": "string",
+          "description": "ISO timestamp captured on the soul-hub side after adapter.send resolved."
+        },
+        {
+          "name": "ok",
+          "type": "boolean",
+          "description": "Always true on exit 0 — kept for symmetry with other components and forward-compat with multi-recipient sends."
+        }
+      ],
+      "used_by_recipes": [
+        "hello-naseej",
+        "peer-brief"
+      ],
+      "example_usage": {
+        "from_recipe": "hello-naseej",
+        "step": {
+          "id": "notify",
+          "component": "channel-send-text@1.0.0",
+          "inputs": {
+            "channel": "telegram",
+            "text": "[hello-naseej] Recipe done. Score: {{steps.score.outputs.score}}/50. Note: {{steps.persist.outputs.vault_path}}"
+          }
+        }
+      }
+    },
+    "comparison-dot-matrix": {
+      "name": "comparison-dot-matrix",
+      "version": "0.1.0",
+      "kind": "presentation",
+      "tier": 1,
+      "shape": "default",
+      "category": "chart",
+      "description": "Generic two-column dot-grid matrix comparing two intensity scores across rows. Each row shows filled dots per column up to its score; below-score dots are outlined. Column + row-header labels are inputs. Domain-neutral.",
+      "inputs": [
+        {
+          "name": "eyebrow",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "title",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "row_header_label",
+          "type": "string",
+          "required": false,
+          "description": "Header for the row-label column. Defaults to 'Item'."
+        },
+        {
+          "name": "column_a_label",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "column_b_label",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "max_intensity",
+          "type": "number",
+          "required": false
+        },
+        {
+          "name": "rows",
+          "type": "array",
+          "required": true,
+          "description": "Rows to plot. Each is {label, a, b} with a/b integers 0..max_intensity."
+        },
+        {
+          "name": "caption",
+          "type": "string",
+          "required": false
+        }
+      ],
+      "outputs": [],
+      "template": {
+        "en": "en.html",
+        "ar": "ar.html"
+      },
+      "styles": "styles.css",
+      "tokens": [
+        "--accent",
+        "--text-secondary"
+      ],
+      "languages": [
+        "en",
+        "ar"
+      ],
+      "sample_inputs": {
+        "eyebrow": "Comparison",
+        "row_header_label": "Item",
+        "column_a_label": "Column A",
+        "column_b_label": "Column B",
+        "max_intensity": 5,
+        "rows": [
+          {
+            "label": "Item one",
+            "a": 5,
+            "b": 3
+          },
+          {
+            "label": "Item two",
+            "a": 3,
+            "b": 5
+          },
+          {
+            "label": "Item three",
+            "a": 4,
+            "b": 2
+          }
+        ],
+        "caption": "Two-axis intensity comparison, 0–5 per row."
+      },
+      "used_by_recipes": [],
+      "example_usage": null
+    },
+    "cover-page": {
+      "name": "cover-page",
+      "version": "0.1.0",
+      "kind": "presentation",
+      "tier": 1,
+      "shape": "default",
+      "category": "cover",
+      "description": "Full-page document opener. Defaults to a minimalist-typographic layout (CSS-only); supply an `image` path and it full-bleeds that photo with a dark gradient overlay for legible white text. Optional logo + author from the brand layer; eyebrow, title, subtitle, and a footer reference code from inputs.",
+      "inputs": [
+        {
+          "name": "eyebrow",
+          "type": "string",
+          "required": false,
+          "description": "Category label above the title (e.g. Tutorial, Strategy brief). Usually a standing series label — set once.",
+          "slot_class": "static"
+        },
+        {
+          "name": "title",
+          "type": "string",
+          "required": true,
+          "description": "The cover title.",
+          "slot_class": "judgment"
+        },
+        {
+          "name": "subtitle",
+          "type": "string",
+          "required": false,
+          "description": "Supporting line under the title.",
+          "slot_class": "judgment"
+        },
+        {
+          "name": "reference_code",
+          "type": "string",
+          "required": false,
+          "description": "Monospace code rendered in the footer strip. Usually computed (date / sequence) each run.",
+          "slot_class": "deterministic"
+        },
+        {
+          "name": "image",
+          "type": "string",
+          "required": false,
+          "description": "Absolute path (or file:// URI) to a full-bleed background photo. When present the cover switches to the image-background layout: the photo covers the page, a dark gradient overlay keeps the white title legible. Omit for the minimalist-typographic layout. Typically a deterministic slot — a pipeline picks today's image from a pool by date, no model call.",
+          "slot_class": "deterministic"
+        }
+      ],
+      "outputs": [],
+      "template": {
+        "en": "en.html",
+        "ar": "ar.html"
+      },
+      "styles": "styles.css",
+      "tokens": [
+        "--text",
+        "--text-secondary",
+        "--text-tertiary",
+        "--accent-2",
+        "--border-strong"
+      ],
+      "languages": [
+        "en",
+        "ar"
+      ],
+      "sample_inputs": {
+        "eyebrow": "Report",
+        "title": "Document Title",
+        "subtitle": "A supporting subtitle line that sets context for the document.",
+        "reference_code": "REF-001"
+      },
+      "used_by_recipes": [],
+      "example_usage": null
+    },
+    "doc-render": {
+      "name": "doc-render",
+      "version": "0.1.0",
+      "kind": "subprocess",
+      "tier": 1,
+      "shape": "default",
+      "category": "render",
+      "runtime": "python",
+      "description": "Render an ordered composition of kind:presentation components to a single PDF via WeasyPrint. Naseej-owned document engine; replaces the external katib-build dependency.",
+      "when_to_use": "Produce a branded PDF from a sequence of presentation components (cover, module, callout, ...). Pass the ordered composition + a brand token map + lang; get back a rendered PDF path. The render engine for any document recipe.",
+      "when_not_to_use": "Score or rewrite prose (use stop-slop or inline-llm-pass). Run a non-presentation subprocess primitive (this only composes kind:presentation catalog entries). Generate charts or fetch remote images — the image/cover provider layer is Phase 2, not in this engine yet.",
+      "inputs": [
+        {
+          "name": "composition",
+          "type": "array",
+          "required": false,
+          "description": "Ordered list of presentation-component instances. Each entry is an object with `component` (a kind:presentation slug in the catalog) and `inputs` (the data slots that component's template fills). Rendered top to bottom into one document. Required unless `composition_path` is supplied."
+        },
+        {
+          "name": "composition_path",
+          "type": "string",
+          "required": false,
+          "description": "Path to a JSON file holding the composition — either a bare array or an object with a `composition` key. Use when the composition is too large for the caller's inline value limit (e.g. a recipe step's 10KB stdout cap): the producer writes it to a file and passes the path. Ignored when `composition` is supplied inline."
+        },
+        {
+          "name": "brand",
+          "type": "object",
+          "required": false,
+          "description": "Brand layer merged over the shipped base tokens. Three forms: an inline token map (colors/fonts/identity/logo); a string path to a brand YAML file (has / or .yaml/.yml); or a bare brand SLUG resolved against the catalog brands dir (ADR-031). Omit for the neutral defaults."
+        },
+        {
+          "name": "brands_dir",
+          "type": "string",
+          "required": false,
+          "description": "Override the dir a brand SLUG resolves against. Defaults to the `brands` sibling of catalog_root (catalog/brands). Used by tests."
+        },
+        {
+          "name": "lang",
+          "type": "string",
+          "default": "en",
+          "enum": [
+            "en",
+            "ar"
+          ],
+          "description": "Render language. Picks template.ar when present (else falls back to the en template under dir=rtl, with a warning) and the ar font stack + per-language identity."
+        },
+        {
+          "name": "out_pdf",
+          "type": "string",
+          "required": true,
+          "description": "Output path for the rendered PDF. Parent dirs are created. Returned, resolved, as `pdf_path`."
+        },
+        {
+          "name": "catalog_root",
+          "type": "string",
+          "required": false,
+          "description": "Override the component search dir. Defaults to this component's parent (catalog/components/). Used by tests to point at a fixture catalog."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "pdf_path",
+          "type": "string",
+          "description": "Absolute path to the rendered PDF."
+        },
+        {
+          "name": "bytes",
+          "type": "integer",
+          "description": "Size of the rendered PDF in bytes."
+        },
+        {
+          "name": "components_rendered",
+          "type": "integer",
+          "description": "Count of composition entries rendered into the document."
+        },
+        {
+          "name": "warnings",
+          "type": "array",
+          "description": "Non-fatal notes (e.g. an ar render that fell back to the en template, or a declared styles file that was missing). Empty on a clean render."
+        }
+      ],
+      "used_by_recipes": [
+        "peer-brief-rebuild"
+      ],
+      "example_usage": {
+        "from_recipe": "peer-brief-rebuild",
+        "step": {
+          "id": "render",
+          "component": "doc-render@0.1.0",
+          "inputs": {
+            "composition_path": "{{steps.correct.outputs.corrected_path}}",
+            "brand": "{{inputs.brand}}",
+            "lang": "en",
+            "out_pdf": "{{inputs.out_pdf}}"
+          }
+        }
+      }
+    },
+    "horizontal-bar-chart": {
+      "name": "horizontal-bar-chart",
+      "version": "0.1.0",
+      "kind": "presentation",
+      "tier": 1,
+      "shape": "default",
+      "category": "chart",
+      "description": "Generic horizontal bar chart drawn as inline SVG. Bars auto-scale to the largest value and are color-coded by intensity tier (high / mid / low). Value labels render next to each bar. Domain-neutral: framing comes from inputs.",
+      "inputs": [
+        {
+          "name": "eyebrow",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "title",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "x_axis_label",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "items",
+          "type": "array",
+          "required": true,
+          "description": "Bars to plot. Each is {label, value, value_display, intensity: high|mid|low}."
+        },
+        {
+          "name": "caption",
+          "type": "string",
+          "required": false
+        }
+      ],
+      "outputs": [],
+      "template": {
+        "en": "en.html",
+        "ar": "ar.html"
+      },
+      "styles": "styles.css",
+      "tokens": [
+        "--text",
+        "--accent",
+        "--text-secondary",
+        "--border"
+      ],
+      "languages": [
+        "en",
+        "ar"
+      ],
+      "sample_inputs": {
+        "eyebrow": "Volume by category",
+        "x_axis_label": "TOTAL VIEWS",
+        "items": [
+          {
+            "label": "Category A",
+            "value": 1830000,
+            "value_display": "1.83M",
+            "intensity": "high"
+          },
+          {
+            "label": "Category B",
+            "value": 920000,
+            "value_display": "920K",
+            "intensity": "mid"
+          },
+          {
+            "label": "Category C",
+            "value": 340000,
+            "value_display": "~340K",
+            "intensity": "low"
+          }
+        ],
+        "caption": "Values by category; bars scale to the largest."
+      },
+      "used_by_recipes": [],
+      "example_usage": null
+    },
+    "human-form": {
+      "name": "human-form",
+      "version": "1.0.0",
+      "kind": "subprocess",
+      "tier": 1,
+      "shape": "gate",
+      "category": "capability",
+      "runtime": "node",
+      "description": "Pause a recipe run and collect structured operator input via a prompt + optional field schema. Uses the stdout-code-2 pause protocol — first invocation emits a pause-request and exits 2; the runner intercepts, registers the pause, awaits the operator's response, then re-invokes the component with resume_response injected; second invocation exits 0 with the operator's payload.",
+      "when_to_use": "Collect free-form or structured data from the operator mid-recipe — confirmation with comment, manual data entry for a downstream step, schema-driven form responses. Use the `fields[]` input for typed fields.",
+      "when_not_to_use": "A binary approved/rejected decision is enough (use `approval-gate` — simpler UI). The pipeline must run unattended (gates block forever without an operator). You can derive the value without human input (compute it with `inline-llm-pass` or `shell-exec`).",
+      "inputs": [],
+      "outputs": [],
+      "used_by_recipes": [
+        "cp4-human-smoke",
+        "human-smoke-naseej",
+        "timeout-smoke-naseej"
+      ],
+      "example_usage": {
+        "from_recipe": "cp4-human-smoke",
+        "step": {
+          "id": "ask",
+          "component": "human-form@1.0.0",
+          "inputs": {
+            "prompt": "CP4 smoke — what is your favourite Naseej component slug?",
+            "fields": [
+              {
+                "name": "slug",
+                "type": "text",
+                "label": "Component slug",
+                "required": true
+              }
+            ],
+            "timeout_sec": 120
+          }
+        }
+      }
+    },
+    "inline-llm-pass": {
+      "name": "inline-llm-pass",
+      "version": "1.0.0",
+      "kind": "subprocess",
+      "tier": 1,
+      "shape": "default",
+      "category": "capability",
+      "runtime": "node",
+      "description": "Run a single-purpose LLM pass via `claude -p --output-format=json`. Tier-1 capability per ADR-006 D4 — generic prompt-in/text-out wrapper for recipes that need a one-shot model call without the iterative `/goal` loop or an agent definition. The decomposition primitive for any pipeline that splits work into narrow, parallelizable model calls.",
+      "when_to_use": "A single-pass model call — em-dash strip, polish pass, JSON extraction, decomposition step. Cheaper + faster than `agent-dispatch` because there is no agent loop. Use a narrow `system_prompt` to constrain.",
+      "when_not_to_use": "Needs multi-tool iteration / convergence (use `agent-dispatch`). Output is deterministic / rule-based (use `shell-exec` running a script — no model cost). Needs operator approval after generation (chain with `approval-gate` or `human-form`).",
+      "inputs": [
+        {
+          "name": "prompt",
+          "type": "string",
+          "required": true,
+          "description": "The full prompt sent to the model. Plain text — no system/user role markers. If you need to operate on existing text, pass it via `input_text` and reference it from the prompt body."
+        },
+        {
+          "name": "input_text",
+          "type": "string",
+          "description": "Optional content the prompt should operate on. Appended to the prompt under a `\\n\\n---\\n\\n# Input\\n\\n<text>` block before invocation. Useful for decomposed pipelines that pass the previous step's output forward. Mutually exclusive with `input_text_path`."
+        },
+        {
+          "name": "input_text_path",
+          "type": "string",
+          "description": "Absolute path to a file whose contents become `input_text`. Use this when the upstream step's output exceeds shell-exec's 10 KB inline cap — pair with the upstream's `stdout_to_file` and pass its `outputs.stdout_path` here. Mutually exclusive with `input_text`."
+        },
+        {
+          "name": "model",
+          "type": "string",
+          "default": "claude-sonnet-4-6",
+          "description": "Model slug passed verbatim as `--model`. Defaults to Sonnet 4.6 — Opus 4.7 is overkill for single-purpose polish passes, Haiku 4.5 may not survive stop-slop work. Recipe authors override per-step for cost/quality tuning."
+        },
+        {
+          "name": "system_prompt",
+          "type": "string",
+          "description": "Optional system-level framing passed as `--append-system-prompt`. Use for narrow remit (\"You are an em-dash stripping editor. Reply with the rewritten text only — no preamble.\"). Reduces token count vs stuffing the framing into `prompt`."
+        },
+        {
+          "name": "budget_seconds",
+          "type": "integer",
+          "default": 120,
+          "description": "Wall-clock cap before SIGTERM (5s SIGKILL grace). 120s is generous for single-pass work; tune down to 60s for narrow polish passes, up to 300s for long drafts."
+        },
+        {
+          "name": "claude_binary",
+          "type": "string",
+          "description": "Absolute path to the `claude` executable. Tests override to point at a stub script. Production leaves unset — resolves `claude` from PATH."
+        },
+        {
+          "name": "cwd",
+          "type": "string",
+          "default": "/tmp",
+          "description": "Working directory for the spawned claude process. Defaults to `/tmp` (a clean dir) on purpose — running from a directory with a CLAUDE.md auto-loads ~10× the per-call token cost. Override only when the call genuinely needs project context (rare for decomposed pipelines)."
+        },
+        {
+          "name": "max_budget_usd",
+          "type": "number",
+          "description": "Optional per-call dollar ceiling (passed as `--max-budget-usd`). Bounds runaway risk on long generation. Recommend setting on every call in production recipes — even $0.10 catches infinite-loop bugs that would otherwise burn $5 before the wall-clock budget fires."
+        },
+        {
+          "name": "json_schema",
+          "type": "object",
+          "description": "Optional JSON Schema (passed as `--json-schema`). When set, the model's output MUST conform to the schema or the CLI returns is_error=true. Eliminates an entire class of malformed-output failures for structured generation (findings, tables, metadata). Leave unset for prose generation where structure is loose."
+        },
+        {
+          "name": "session_action",
+          "type": "string",
+          "enum": [
+            "start",
+            "continue"
+          ],
+          "description": "ADR-028 session mode. `start` opens a persistent claude conversation (drops --no-session-persistence, passes --session-id) and returns its `session_id`. `continue` resumes a prior session (--resume) so this turn has the full context of earlier turns — enables cross-step consistency and stop-slop-as-remediation. Omit for the default stateless one-shot call. Session mode is sequential — a session cannot be resumed from parallel steps."
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "description": "UUID of the session to use. With `session_action=continue` this is REQUIRED and names the session to resume. With `session_action=start` it is optional — when omitted the component generates a UUID and returns it. Thread it forward via `{{steps.<start-step>.outputs.session_id}}`. Ignored when `session_action` is unset. A session chain MUST share the same `cwd` across steps (claude keys sessions by project dir)."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "text",
+          "type": "string",
+          "description": "The model's response text, extracted from the CLI envelope's `result` field. Trimmed of leading/trailing whitespace."
+        },
+        {
+          "name": "exit_code",
+          "type": "integer",
+          "description": "0 ok / 2 bad input / 124 timeout / 1 CLI error (envelope `is_error=true` or non-zero CLI exit). Mirrors the wrapped CLI's exit so the runner's halt-on-non-zero fires correctly."
+        },
+        {
+          "name": "duration_ms",
+          "type": "integer",
+          "description": "Wall-clock time the subprocess ran for."
+        },
+        {
+          "name": "cost_usd",
+          "type": "number",
+          "description": "Cost from the CLI envelope's `total_cost_usd`. May be 0 for cached or zero-cost branches."
+        },
+        {
+          "name": "num_turns",
+          "type": "integer",
+          "description": "Turn count from the CLI envelope. Always 1 for inline-llm-pass (no /goal loop) — surfaced for symmetry with agent-step metrics."
+        },
+        {
+          "name": "model_used",
+          "type": "string",
+          "description": "Model slug actually used by the CLI (may differ from `model` input if the CLI falls back)."
+        },
+        {
+          "name": "timed_out",
+          "type": "boolean",
+          "description": "True when budget_seconds was exceeded and SIGTERM was sent. exit_code is then 124."
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "description": "Present only in session mode (`session_action` set). The session UUID — for `start` the opened/generated id, for `continue` the resumed id. Thread to the next step's `session_id` input to chain the conversation."
+        }
+      ],
+      "used_by_recipes": [
+        "peer-brief-rebuild"
+      ],
+      "example_usage": {
+        "from_recipe": "peer-brief-rebuild",
+        "step": {
+          "id": "draft-prose",
+          "component": "inline-llm-pass@1.0.0",
+          "inputs": {
+            "session_action": "start",
+            "model": "{{inputs.draft_model}}",
+            "budget_seconds": 300,
+            "max_budget_usd": 0.4,
+            "system_prompt": "You are a peer-brief author for an executive readership in the GCC.\nVoice: warm + professional + visionary; analytical, not consultative.\nWe build the brief over several turns in this conversation. Hold the\ncontext I give you now in mind for every later turn.\n\nSTOP-SLOP DISCIPLINE (apply to every turn):\n- NO em-dashes (the long dash or a double hyphen). Use commas, periods, or rephrase.\n- Vary sentence rhythm. Avoid three consecutive clauses of similar length.\n- Cite signal counts and source names from the context.\n- Plain English. Avoid corporate slop (leverage, unlock, robust, delve).\n\nOUTPUT FORMAT (this turn): reply with ONE valid JSON object and nothing\nelse. No code fence, no preamble. Keys exactly:\n  {\n    \"cover_title\": \"<2-5 word title — see COVER CRAFT below>\",\n    \"cover_subtitle\": \"<75-110 word single cohesive paragraph — see COVER CRAFT below. End with: By Jasem Al Neaimi, jneaimi.com>\",\n    \"exec_summary\": \"<200-300 word summary: signal count, number of findings, today's hinge claim, which pillar dominates, a 1-2 sentence operator framing>\"\n  }\nAll values are plain prose strings (no HTML in this turn). Remember the\ntitle and hinge you choose; later turns must stay consistent with them.\n\nCOVER CRAFT (the title + subtitle are the most-read 20 words of the whole\nbrief — they are the editorial centerpiece, not a label. Spend effort here):\n- cover_title: 2 to 5 words. Imperative verb phrase OR a sharp, concrete\n  noun phrase. It NAMES today's hinge, it does not describe it. No buzzwords,\n  no \"AI\", no \"this week\".\n    GOOD: \"Control the Agent Stack\" · \"The App Store Moment\"\n    WEAK: \"AI Trends This Week\" · \"Important Developments in Agents\"\n- cover_subtitle: exactly ONE cohesive paragraph, 75 to 110 words, that reads\n  as a single connected argument — NOT a list of short declaratives. Arc:\n  (1) open on the concrete pattern with a NUMBER or named source from the\n  context, (2) turn to the tension or what is at stake, (3) land a forward\n  claim for the GCC operator. Use connective tissue between sentences and\n  vary their length. NEVER write three short staccato sentences in a row.\n  Then end with exactly: By Jasem Al Neaimi, jneaimi.com\n    GOOD shape (study the flow, not the content): \"Five companies that build\n    no models at all are quietly capturing the infrastructure that will govern\n    every AI agent deployed at scale. Model capability is no longer the\n    differentiating variable; runtime control, identity, and payment authority\n    are. For GCC governments advancing under Vision 2030, these dimensions map\n    onto data-residency law and procurement boundaries, and whoever defines\n    them now sets the terms for regional AI governance for a decade.\"\n    BAD shape (choppy + undershot — do NOT do this): \"Vibe coding crossed into\n    the App Store this week. The production gap remains. Governance is the\n    question underneath both.\"\n",
+            "prompt": "Produce the JSON object (cover_title, cover_subtitle, exec_summary) from the context below.",
+            "input_text": "===CONTEXT (parse JSON; summary_stats for counts, topics[0..4] for findings, breakthrough for the hinge, content_opportunities for the pillar distribution)===\n{{steps.build-context.outputs.stdout}}\n"
+          }
+        }
+      }
+    },
+    "katib-build": {
+      "name": "katib-build",
+      "version": "1.0.0",
+      "kind": "subprocess",
+      "tier": 2,
+      "shape": "default",
+      "category": "build",
+      "runtime": "node",
+      "description": "DEPRECATED (ADR-029/030) — renders a recipe to PDF via the EXTERNAL ~/dev/katib CLI. Superseded by the internal `doc-render` engine, which composes kind:presentation components with zero katib dependency. Retained only for the live `peer-brief-daily-naseej-v2` shadow until ADR-034 CP3 cutover, then removed. Do NOT use in new recipes.",
+      "when_to_use": "Do not use in new recipes — use `doc-render` (the internal engine). This adapter exists only until the last katib-dependent shadow is retired at ADR-034 CP3.",
+      "when_not_to_use": "Any new document render — use `doc-render` with kind:presentation components (no external katib dependency, brand-by-slug, slot-aware).",
+      "inputs": [
+        {
+          "name": "recipe_path",
+          "type": "string",
+          "required": true,
+          "description": "Absolute path to the katib recipe YAML (the synthesised recipe, not the Naseej recipe). Passed verbatim as the first positional arg to scripts/build.py."
+        },
+        {
+          "name": "out_pdf",
+          "type": "string",
+          "required": true,
+          "description": "Absolute path where katib should write the rendered PDF."
+        },
+        {
+          "name": "lang",
+          "type": "string",
+          "default": "en",
+          "enum": [
+            "en",
+            "ar"
+          ],
+          "description": "Render language — en (LTR) or ar (RTL). Passed as `--lang`."
+        },
+        {
+          "name": "brand",
+          "type": "string",
+          "default": "jasem",
+          "description": "Brand identifier resolved by katib's brand registry. Passed as `--brand`."
+        },
+        {
+          "name": "skip_audit_check",
+          "type": "boolean",
+          "default": true,
+          "description": "When true, passes `--skip-audit-check` to katib (the daily peer-brief path; PDFs that are not audit-gated). Set false for audit-gated builds."
+        },
+        {
+          "name": "katib_project_dir",
+          "type": "string",
+          "description": "Katib repo dir. Defaults to ~/dev/katib. Override for tests or sibling katib clones."
+        },
+        {
+          "name": "timeout_sec",
+          "type": "integer",
+          "default": 300,
+          "description": "Wall-clock cap on the katib subprocess. Typical daily peer-brief builds complete in 30-60s; default 300 gives headroom for cold WeasyPrint imports + large signal-cluster pages."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "pdf_path",
+          "type": "string",
+          "description": "Absolute path of the rendered PDF (echo of out_pdf input on success)."
+        },
+        {
+          "name": "pdf_size_bytes",
+          "type": "integer",
+          "description": "Size of the rendered PDF on disk. Useful for parity checks during shadow runs."
+        },
+        {
+          "name": "build_duration_ms",
+          "type": "integer",
+          "description": "Wall-clock time the katib subprocess ran."
+        },
+        {
+          "name": "brand_resolved",
+          "type": "string",
+          "description": "Echo of the brand input — surfaced so the recipe can branch on it without re-templating."
+        },
+        {
+          "name": "error_summary",
+          "type": "string",
+          "description": "Set only on failure. Last ERROR/WeasyPrint line found in the build.log tail (last 40 lines). For full triage, read build_log_tail."
+        },
+        {
+          "name": "build_log_tail",
+          "type": "string",
+          "description": "Set only on failure. Last 20 lines of combined stdout+stderr from katib."
+        }
+      ],
+      "used_by_recipes": [
+        "peer-brief"
+      ],
+      "example_usage": {
+        "from_recipe": "peer-brief",
+        "step": {
+          "id": "render",
+          "component": "katib-build@1.0.0",
+          "inputs": {
+            "recipe_path": "{{steps.synth.outputs.artifact_path}}",
+            "out_pdf": "{{inputs.out_pdf}}",
+            "lang": "en",
+            "brand": "jasem",
+            "skip_audit_check": true
+          }
+        }
+      }
+    },
+    "module": {
+      "name": "module",
+      "version": "0.1.0",
+      "kind": "presentation",
+      "tier": 1,
+      "shape": "default",
+      "category": "section",
+      "description": "Flexible body unit — optional numbered eyebrow, heading, intro, and body. All heading fields are optional; use without a title for continuous prose. `body` is auto-escaped plain text; `raw_body` accepts trusted HTML (tables, pull-quotes, nested callouts).",
+      "inputs": [
+        {
+          "name": "number",
+          "type": "int",
+          "required": false,
+          "description": "Module number rendered as a large accent-colored digit (numbered variant only)."
+        },
+        {
+          "name": "eyebrow",
+          "type": "string",
+          "required": false,
+          "description": "Above-title category label (e.g. Module 1 · Foundations)."
+        },
+        {
+          "name": "title",
+          "type": "string",
+          "required": false,
+          "description": "Module heading. Omit for continuous prose sections (letter bodies, abstracts)."
+        },
+        {
+          "name": "intro",
+          "type": "string",
+          "required": false,
+          "description": "Paragraph under the title setting context for the body."
+        },
+        {
+          "name": "body",
+          "type": "string",
+          "required": false,
+          "description": "Plain-text body. Auto-escaped — safe for any source."
+        },
+        {
+          "name": "raw_body",
+          "type": "string",
+          "required": false,
+          "description": "Trusted HTML body. NOT auto-escaped — recipe-authored content only. Takes precedence over body."
+        }
+      ],
+      "outputs": [],
+      "template": {
+        "en": "en.html",
+        "ar": "ar.html"
+      },
+      "styles": "styles.css",
+      "tokens": [
+        "--text",
+        "--text-secondary",
+        "--accent",
+        "--accent-on",
+        "--border"
+      ],
+      "languages": [
+        "en",
+        "ar"
+      ],
+      "sample_inputs": {
+        "eyebrow": "Section 1",
+        "title": "Section heading",
+        "intro": "A short paragraph that sets context for what follows.",
+        "body": "Body text for the section — plain prose that flows under the heading."
+      },
+      "used_by_recipes": [],
+      "example_usage": null
+    },
+    "pull-quote": {
+      "name": "pull-quote",
+      "version": "0.1.0",
+      "kind": "presentation",
+      "tier": 1,
+      "shape": "default",
+      "category": "primitive",
+      "description": "Emphasized blockquote — larger italic text with an accent rule (rule-leading) or a big opening quote mark (large-quote), plus optional attribution.",
+      "inputs": [
+        {
+          "name": "text",
+          "type": "string",
+          "required": true,
+          "description": "The quote body."
+        },
+        {
+          "name": "attribution",
+          "type": "string",
+          "required": false,
+          "description": "Attribution line (author, source, role)."
+        }
+      ],
+      "outputs": [],
+      "template": {
+        "en": "en.html",
+        "ar": "ar.html"
+      },
+      "styles": "styles.css",
+      "tokens": [
+        "--text",
+        "--accent",
+        "--text-secondary"
+      ],
+      "languages": [
+        "en",
+        "ar"
+      ],
+      "sample_inputs": {
+        "text": "A concise, emphasized statement that deserves visual weight on the page.",
+        "attribution": "Source or author"
+      },
+      "used_by_recipes": [],
+      "example_usage": null
+    },
+    "shell-exec": {
+      "name": "shell-exec",
+      "version": "1.0.0",
+      "kind": "subprocess",
+      "tier": 1,
+      "shape": "default",
+      "category": "capability",
+      "runtime": "node",
+      "description": "Run an arbitrary subprocess with stdin/stdout/stderr capture, optional file redirection, and a wall-clock timeout. Tier-1 capability per ADR-006 D4 — the generic escape hatch for invoking external commands from a recipe before the catalog accretes a typed Tier-2 adapter.",
+      "when_to_use": "Invoke an external command from a recipe — script, CLI tool, binary. No Tier-2 adapter exists yet for that system. Pair with `stdout_to_file` when the upstream output exceeds 10 KB inline.",
+      "when_not_to_use": "A Tier-2 adapter exists for the system (prefer it — typed inputs, error parsing): `katib-build`, `vault-write`, `channel-send-text`. You need shell features like `&&`, `|`, globs — pass a script path instead of a chained command, or invoke `bash -c` deliberately. The command is a one-shot LLM call (use `inline-llm-pass`).",
+      "inputs": [
+        {
+          "name": "cmd",
+          "type": "string",
+          "required": true,
+          "description": "Executable name or absolute path. Resolved via PATH (no shell, so no `&&`, `|`, or globs — pass args separately)."
+        },
+        {
+          "name": "args",
+          "type": "array",
+          "default": [],
+          "description": "Argument vector passed verbatim to the executable. Each element is a single argv slot — no shell-word splitting."
+        },
+        {
+          "name": "cwd",
+          "type": "string",
+          "description": "Working directory for the subprocess. Defaults to soul-hub repo root (the runner's process.cwd)."
+        },
+        {
+          "name": "stdin",
+          "type": "string",
+          "default": "",
+          "description": "Text piped to the subprocess's stdin (closed immediately after). Empty by default."
+        },
+        {
+          "name": "env",
+          "type": "object",
+          "description": "Environment variables merged onto process.env. Use sparingly — secrets should come from the operator shell, not from recipes."
+        },
+        {
+          "name": "timeout_sec",
+          "type": "integer",
+          "default": 60,
+          "description": "Wall-clock cap before the runner sends SIGTERM (then SIGKILL after a 5s grace). Tune up for long renders (katib build, signal-trend extract); tune down for cheap checks."
+        },
+        {
+          "name": "stdout_to_file",
+          "type": "string",
+          "description": "Absolute path. When set, the subprocess's stdout is captured to this file in addition to being truncated inline in `outputs.stdout`. Pair with `{{work_dir}}/<name>` for run-scoped artefacts."
+        },
+        {
+          "name": "stderr_to_file",
+          "type": "string",
+          "description": "Same as stdout_to_file but for stderr."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "exit_code",
+          "type": "integer",
+          "description": "Subprocess exit code (or -1 if spawn failed, 124 on timeout per GNU convention)."
+        },
+        {
+          "name": "stdout",
+          "type": "string",
+          "description": "Captured stdout, truncated at 10KB inline. Full payload at stdout_path if stdout_to_file was set."
+        },
+        {
+          "name": "stderr",
+          "type": "string",
+          "description": "Captured stderr, truncated at 10KB inline. Full payload at stderr_path if stderr_to_file was set."
+        },
+        {
+          "name": "stdout_path",
+          "type": "string",
+          "description": "Absolute path to the captured stdout file. Present only when stdout_to_file was supplied."
+        },
+        {
+          "name": "stderr_path",
+          "type": "string",
+          "description": "Absolute path to the captured stderr file. Present only when stderr_to_file was supplied."
+        },
+        {
+          "name": "duration_ms",
+          "type": "integer",
+          "description": "Wall-clock time the subprocess ran for."
+        },
+        {
+          "name": "timed_out",
+          "type": "boolean",
+          "description": "True when the runner sent SIGTERM due to timeout_sec being exceeded. exit_code is then 124."
+        }
+      ],
+      "used_by_recipes": [
+        "parallel-smoke",
+        "peer-brief",
+        "peer-brief-rebuild",
+        "shell-smoke-naseej"
+      ],
+      "example_usage": {
+        "from_recipe": "parallel-smoke",
+        "step": {
+          "id": "leaf-a",
+          "component": "shell-exec@1.0.0",
+          "inputs": {
+            "cmd": "sh",
+            "args": [
+              "-c",
+              "sleep 3 && echo leaf-a-done"
+            ],
+            "timeout_sec": 10
+          }
+        }
+      }
+    },
+    "stacked-area-chart": {
+      "name": "stacked-area-chart",
+      "version": "0.1.0",
+      "kind": "presentation",
+      "tier": 1,
+      "shape": "default",
+      "category": "chart",
+      "description": "Generic stacked-area chart drawn as inline SVG from pre-computed polygon bands over an x-axis, with optional ticks, legend, and a highlighted column. Domain-neutral: all framing comes from inputs.",
+      "inputs": [
+        {
+          "name": "eyebrow",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "title",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "bands",
+          "type": "array",
+          "required": true,
+          "description": "Stacked area bands, bottom to top. Each is {cluster, color, points, today_value}."
+        },
+        {
+          "name": "x_ticks",
+          "type": "array",
+          "required": true,
+          "description": "X-axis ticks. Each is {x, label}."
+        },
+        {
+          "name": "y_ticks",
+          "type": "array",
+          "required": true,
+          "description": "Y-axis ticks. Each is {y, label}."
+        },
+        {
+          "name": "today_x",
+          "type": "number",
+          "required": false,
+          "description": "X coordinate for the highlighted column rule."
+        },
+        {
+          "name": "today_index",
+          "type": "number",
+          "required": false
+        },
+        {
+          "name": "y_max",
+          "type": "number",
+          "required": false
+        },
+        {
+          "name": "chart_geometry",
+          "type": "object",
+          "required": true,
+          "description": "SVG geometry. {view_w, view_h, chart_top, chart_bottom, chart_left, chart_right}."
+        },
+        {
+          "name": "caption",
+          "type": "string",
+          "required": false
+        }
+      ],
+      "outputs": [],
+      "template": {
+        "en": "en.html",
+        "ar": "ar.html"
+      },
+      "styles": "styles.css",
+      "tokens": [
+        "--accent",
+        "--text-secondary"
+      ],
+      "languages": [
+        "en",
+        "ar"
+      ],
+      "sample_inputs": {
+        "eyebrow": "Trend",
+        "title": "Volume over time",
+        "chart_geometry": {
+          "view_w": 600,
+          "view_h": 240,
+          "chart_top": 20,
+          "chart_bottom": 210,
+          "chart_left": 40,
+          "chart_right": 580
+        },
+        "y_ticks": [
+          {
+            "y": 210,
+            "label": "0"
+          },
+          {
+            "y": 115,
+            "label": "50"
+          },
+          {
+            "y": 20,
+            "label": "100"
+          }
+        ],
+        "x_ticks": [
+          {
+            "x": 40,
+            "label": "T-6"
+          },
+          {
+            "x": 310,
+            "label": "T-3"
+          },
+          {
+            "x": 580,
+            "label": "now"
+          }
+        ],
+        "bands": [
+          {
+            "cluster": "Series A",
+            "color": "#1F3A68",
+            "points": "40,180 310,160 580,150 580,210 40,210",
+            "today_value": 42
+          },
+          {
+            "cluster": "Series B",
+            "color": "#D4A437",
+            "points": "40,150 310,120 580,110 580,150 310,160 40,180",
+            "today_value": 18
+          }
+        ],
+        "today_x": 580,
+        "today_index": 6,
+        "caption": "Stacked series volume over the window; latest column highlighted."
+      },
+      "used_by_recipes": [],
+      "example_usage": null
+    },
+    "stop-slop": {
+      "name": "stop-slop",
+      "version": "1.0.0",
+      "kind": "subprocess",
+      "tier": 2,
+      "shape": "default",
+      "category": "gate",
+      "runtime": "python",
+      "description": "Content quality gate — deterministic anti-slop scanner with 0-50 score and HARD-violation blocking",
+      "when_to_use": "Score prose against the anti-slop rubric before publish/send. Block (exit 6) on score below threshold OR any hard violation. Cheap, fast, deterministic — no model cost.",
+      "when_not_to_use": "Need qualitative rewriting / model-driven polish (use `inline-llm-pass` with a stop-slop framing prompt). Need a human approval rather than a rubric (use `approval-gate`). Need to score a non-English language other than the rubric covers — only `default` is implemented in v1.",
+      "inputs": [
+        {
+          "name": "text",
+          "type": "string",
+          "required": true,
+          "description": "The prose to score. UTF-8. Newlines preserved. HTML tags stripped before scanning."
+        },
+        {
+          "name": "rubric",
+          "type": "string",
+          "default": "default",
+          "enum": [
+            "default",
+            "analytical",
+            "linkedin",
+            "arabic"
+          ],
+          "description": "Banned-phrase set to apply. v1.0.0 only implements `default`; other values accepted as forward-compat but route to `default`."
+        },
+        {
+          "name": "min_score",
+          "type": "integer",
+          "default": 35,
+          "min": 0,
+          "max": 50,
+          "description": "Minimum total score (0-50). Below this, `passed` is false."
+        },
+        {
+          "name": "block_on_fail",
+          "type": "boolean",
+          "default": true,
+          "description": "When true, non-zero exit code (6) on fail. When false, always exit 0 and let the caller decide."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "score",
+          "type": "integer",
+          "description": "Total 0-50. Sum of 5 dimensions (each 0-10, floored)."
+        },
+        {
+          "name": "passed",
+          "type": "boolean",
+          "description": "True iff score >= min_score AND hard_violation_count == 0."
+        },
+        {
+          "name": "per_dimension",
+          "type": "object",
+          "description": "{ directness, rhythm, trust, authenticity, density } — each 0-10"
+        },
+        {
+          "name": "hard_violations",
+          "type": "array",
+          "description": "Array of `{ kind, phrase, context }` for every HARD violation found. Empty when text is clean."
+        },
+        {
+          "name": "soft_violation_count",
+          "type": "integer",
+          "description": "Count of soft (non-blocking) violations detected. Lower the dimension score but do not block."
+        },
+        {
+          "name": "by_kind",
+          "type": "object",
+          "description": "Histogram `{ <violation_kind>: count }` aggregating both hard + soft violations. Empty when clean."
+        },
+        {
+          "name": "min_score",
+          "type": "integer",
+          "description": "Echo of the input min_score (or default 35) — convenient for recipe authors who want to log the gate threshold without re-templating the input."
+        },
+        {
+          "name": "rubric",
+          "type": "string",
+          "description": "Echo of the input rubric (or default `default`) — same convenience as min_score."
+        }
+      ],
+      "used_by_recipes": [
+        "filter-smoke-naseej",
+        "hello-naseej",
+        "quality-check-and-log"
+      ],
+      "example_usage": {
+        "from_recipe": "filter-smoke-naseej",
+        "step": {
+          "id": "score",
+          "component": "stop-slop@1.0.0",
+          "inputs": {
+            "text": "{{inputs.text}}",
+            "rubric": "default",
+            "min_score": 0,
+            "block_on_fail": false
+          }
+        }
+      }
+    },
+    "text-correct": {
+      "name": "text-correct",
+      "version": "1.0.0",
+      "kind": "subprocess",
+      "tier": 1,
+      "shape": "default",
+      "category": "capability",
+      "runtime": "python",
+      "description": "Prescription-pattern AI corrector. A model reads prose against a ruleset and emits a minimal substitution map ([{find, replace, why}]); the component applies it deterministically + a regex backstop. Fact-preserving (only proposed substrings change) and truncation-proof (the model emits a diff, never the full content). Tier-1 per ADR-035 — the ruleset is a parameter, so it corrects against any style guide, not just stop-slop.",
+      "when_to_use": "A second-pass cleanup that FIXES prose instead of only detecting slop. Pair after a draft step and before a verify gate (the 3-beat draft -> text-correct -> stop-slop sequence). Use when re-emitting the full content would risk truncation or fact corruption (large compositions, recipes).",
+      "when_not_to_use": "Need only a pass/fail score with no edits (use `stop-slop`). Need a full creative rewrite rather than surgical fixes (use `inline-llm-pass` with a rewrite prompt). Need human sign-off on the edits (chain with `approval-gate`). The content is deterministic / rule-based with no judgment (use `shell-exec`).",
+      "inputs": [
+        {
+          "name": "input_text",
+          "type": "string",
+          "description": "The prose to correct, inline. Mutually exclusive with `input_text_path`. The component writes it to a temp file so the model reads it the same way it reads a path input."
+        },
+        {
+          "name": "input_text_path",
+          "type": "string",
+          "description": "Absolute path to a file whose contents are corrected in place of `input_text`. Use for large upstream artefacts (a composition / recipe) — pair with the upstream step's `stdout_to_file` + its `outputs.stdout_path`. Mutually exclusive with `input_text`."
+        },
+        {
+          "name": "ruleset",
+          "type": "string",
+          "default": "~/.claude/skills/stop-slop/SKILL.md",
+          "description": "Path to a markdown ruleset appended to the model as `--append-system-prompt`. Defaults to the stop-slop skill. Swap it for an arabic-voice, brand-voice, or legal-tone ruleset — the corrector itself is style-agnostic. `~` is expanded."
+        },
+        {
+          "name": "model",
+          "type": "string",
+          "default": "claude-sonnet-4-6",
+          "description": "Model slug passed verbatim as `--model`. Sonnet is sufficient for a substitution-map pass; Haiku may miss subtle slop."
+        },
+        {
+          "name": "max_budget_usd",
+          "type": "number",
+          "default": 0.4,
+          "description": "Per-call dollar ceiling (`--max-budget-usd`). The map is small, so this is generous headroom, not a target."
+        },
+        {
+          "name": "emdash_backstop",
+          "type": "boolean",
+          "default": true,
+          "description": "When true, a deterministic regex pass converts every em-dash (`—` or ` -- `) to a comma AFTER the model map is applied. Guarantees the hard em-dash ban regardless of what the model missed."
+        },
+        {
+          "name": "output_path",
+          "type": "string",
+          "description": "Absolute path to write the corrected content to. When set, the corrected file is written and `corrected_path` is returned (the full text is NOT echoed to stdout, to bound output size). When omitted, the corrected content is returned inline as `corrected_text`."
+        },
+        {
+          "name": "claude_binary",
+          "type": "string",
+          "description": "Absolute path to the `claude` executable. Tests override to a stub. Production leaves unset — resolves `claude` from PATH."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "corrected_path",
+          "type": "string",
+          "description": "Path the corrected content was written to. Present only when `output_path` was supplied."
+        },
+        {
+          "name": "corrected_text",
+          "type": "string",
+          "description": "The corrected content inline. Present only when `output_path` was NOT supplied."
+        },
+        {
+          "name": "substitutions_applied",
+          "type": "integer",
+          "description": "Count of model-proposed substitutions whose `find` matched and was replaced."
+        },
+        {
+          "name": "substitutions_missed",
+          "type": "integer",
+          "description": "Count of proposed substitutions whose `find` did not match the content verbatim (skipped, not guessed)."
+        },
+        {
+          "name": "emdash_fixed",
+          "type": "boolean",
+          "description": "True if the deterministic em-dash backstop changed the content."
+        },
+        {
+          "name": "cost_usd",
+          "type": "number",
+          "description": "Cost of the prescription model call from the CLI envelope. 0 when the call was skipped or stubbed."
+        },
+        {
+          "name": "exit_code",
+          "type": "integer",
+          "description": "0 ok / 2 bad input. The corrector is best-effort — a failed or empty model map does not fail the step; the backstop still runs and the (possibly unchanged) content is written."
+        }
+      ],
+      "used_by_recipes": [
+        "peer-brief-rebuild",
+        "text-correct-smoke"
+      ],
+      "example_usage": {
+        "from_recipe": "peer-brief-rebuild",
+        "step": {
+          "id": "correct",
+          "component": "text-correct@1.0.0",
+          "inputs": {
+            "input_text_path": "{{steps.fill.outputs.stdout_path}}",
+            "output_path": "{{work_dir}}/composition.corrected.json",
+            "ruleset": "{{inputs.correct_ruleset}}",
+            "model": "{{inputs.draft_model}}",
+            "max_budget_usd": 0.4,
+            "emdash_backstop": true
+          }
+        }
+      }
+    },
+    "vault-write": {
+      "name": "vault-write",
+      "version": "1.0.0",
+      "kind": "subprocess",
+      "tier": 2,
+      "shape": "default",
+      "category": "vault",
+      "runtime": "node",
+      "description": "Explicit vault note creation. Routes through POST/PUT /api/vault/notes — no direct-fs fallback. Closes the cafe-ops orphan-project hole.",
+      "when_to_use": "Persist a markdown note to `~/vault/<zone>/...` from a recipe — research output, peer-brief, log entry, ADR draft. Frontmatter is required (zone-aware); body is markdown without the `---` delimiters.",
+      "when_not_to_use": "You need to write outside the vault (use `shell-exec` with `mkdir/echo` — note the soul-cli-guard). You're inside soul-hub app code (call the engine directly via `vault.createNote`). You need a non-markdown asset under the vault (PDF, image — `katib-build` for PDFs).",
+      "inputs": [
+        {
+          "name": "path",
+          "type": "string",
+          "required": true,
+          "description": "Vault-relative path including filename. Must end with .md. Must not contain `..` or start with `/`. The runner is responsible for ensuring this path is under the recipe's declared project zone."
+        },
+        {
+          "name": "frontmatter",
+          "type": "object",
+          "required": true,
+          "description": "Note frontmatter as a JSON object. Required keys per zone — at minimum `type`, `created`, `tags`. `source_agent` recommended for audit log + rate-limit attribution."
+        },
+        {
+          "name": "body",
+          "type": "string",
+          "required": true,
+          "description": "Note body in Markdown. UTF-8. The frontmatter `---` delimiters are added by the API; do NOT include them here."
+        },
+        {
+          "name": "mode",
+          "type": "string",
+          "default": "create",
+          "enum": [
+            "create",
+            "append",
+            "replace"
+          ],
+          "description": "`create` POST (refuses overwrite). `replace` PUT (overwrites meta + body). `append` GET-then-PUT (concatenates body to existing)."
+        },
+        {
+          "name": "api_base",
+          "type": "string",
+          "default": "http://localhost:2400",
+          "description": "Override the Soul Hub base URL. Set this when running against a non-default port."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "vault_path",
+          "type": "string",
+          "description": "Vault-relative path of the written note (mirrors input `path`)."
+        },
+        {
+          "name": "note_uri",
+          "type": "string",
+          "description": "`vault://<path>` URI for downstream references."
+        },
+        {
+          "name": "bytes_written",
+          "type": "integer",
+          "description": "Length of the rendered note (frontmatter + body) in bytes."
+        },
+        {
+          "name": "action",
+          "type": "string",
+          "enum": [
+            "created",
+            "updated"
+          ],
+          "description": "Whether the write created a new note or updated an existing one."
+        },
+        {
+          "name": "warnings",
+          "type": "array",
+          "description": "Non-fatal warnings from the API (e.g., unresolved wikilinks per ADR-047)."
+        }
+      ],
+      "used_by_recipes": [
+        "filter-smoke-naseej",
+        "hello-naseej",
+        "quality-check-and-log",
+        "shell-smoke-naseej"
+      ],
+      "example_usage": {
+        "from_recipe": "filter-smoke-naseej",
+        "step": {
+          "id": "log",
+          "component": "vault-write@1.0.0",
+          "inputs": {
+            "path": "inbox/_naseej-runs/{{date}}-{{run_id}}-filter-smoke.md",
+            "frontmatter": {
+              "type": "output",
+              "created": "{{date}}",
+              "tags": [
+                "naseej",
+                "filter-smoke",
+                "adr-006-s2",
+                "auto-generated"
+              ],
+              "project": "naseej",
+              "run_id": "{{run_id}}",
+              "source_agent": "naseej-runner"
+            },
+            "body": "# filter-smoke run {{run_id}}\n\nADR-006 S2 verification. Filters resolved at recipe-start (defaults)\nand at step-time (this body), all against the same ctx.\n\n## Context globals (ADR-006 D2)\n\n- `HOME`: `{{HOME}}`\n- `work_dir`: `{{work_dir}}`\n- `work_dir | basename`: `{{work_dir | basename}}`\n- `work_dir | dirname`: `{{work_dir | dirname}}`\n- `date`: `{{date}}`\n- `date | date_fmt:DD/MM/YYYY`: `{{date | date_fmt:DD/MM/YYYY}}`\n\n## Default-time filter resolution (ADR-006 S2)\n\n- `inputs.today_short`: `{{inputs.today_short}}` (resolved from default `date_fmt:DD/MM/YYYY`)\n- `inputs.work_basename`: `{{inputs.work_basename}}` (resolved from default `work_dir | basename`)\n\n## Step output filter resolution (ADR-006 D3)\n\n- `steps.score.outputs.score`: `{{steps.score.outputs.score}}`\n- `steps.score.outputs.score | human_bytes`: `{{steps.score.outputs.score | human_bytes}}` (filter applied to integer — 49 → 49B)\n"
+          }
+        }
+      }
+    }
+  },
+  "recipes": {
+    "agent-smoke-naseej": {
+      "name": "agent-smoke-naseej",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "First live agent recipe (ADR-005 CP2 keystone). Drives the `inspector`\nagent on a tiny verification task with a tight budget override to keep\nend-to-end spend under $0.10 per run. Closes falsifier #1 (agent step\nend-to-end via the runner).\n\nThe task asks inspector to check whether a known file exists in the\nworking directory and report one of two literal lines. The goal_condition\nends the session as soon as the verification line is written, so the\nPTY backend exits gracefully via the goal-loop without burning the\n600s default timeout.\n\nRe-authored for ADR-023 CP5: `agent:` step type replaced with\n`component: agent-dispatch@1.0.0`. Budget fields flattened into inputs.\n",
+      "step_count": 1,
+      "components_used": [
+        "agent-dispatch"
+      ],
+      "recipe_path": "catalog/recipes/agent-smoke-naseej/recipe.yaml"
+    },
+    "artifact-smoke-naseej": {
+      "name": "artifact-smoke-naseej",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "ARTIFACT marker exercise (ADR-005 D7, CP3). Drives inspector to write\na tiny file via Bash + emit the `===ARTIFACT===\\n<path>\\n===END===`\nmarker. Verifies the runner's regex (src/lib/naseej/runner.ts line 56)\nsurfaces `artifact_path` on the step result.\n\nWrites to /tmp/ (not the vault) to keep the file outside the ADR-046\nchokepoint — the marker convention is path-agnostic at the runner\nlayer, this just keeps the smoke deterministic.\n\nRe-authored for ADR-023 CP5: `agent:` step type replaced with\n`component: agent-dispatch@1.0.0`. Budget fields flattened into inputs.\n",
+      "step_count": 1,
+      "components_used": [
+        "agent-dispatch"
+      ],
+      "recipe_path": "catalog/recipes/artifact-smoke-naseej/recipe.yaml"
+    },
+    "cancel-smoke-naseej": {
+      "name": "cancel-smoke-naseej",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "Cancellation smoke (ADR-005 CP3 falsifier #5). Drives inspector with NO\ngoal_condition and a heavy enumeration task so the dispatcher runs long\nenough for an external POST /api/recipes/runs/<id>/cancel to land.\n\nUsage:\n  uuid=$(uuidgen | tr 'A-Z' 'a-z')\n  curl -X POST http://localhost:2400/api/recipes/run \\\n    -H 'Content-Type: application/json' \\\n    -d \"{\\\"recipe\\\":\\\"cancel-smoke-naseej\\\",\\\"run_id\\\":\\\"$uuid\\\"}\" &\n  sleep 5\n  curl -X POST http://localhost:2400/api/recipes/runs/$uuid/cancel\n\nExpected: the foreground curl returns status 'failed' with the verify\nstep at agent_status 'cancelled' and exit_code 1.\n\nRe-authored for ADR-023 CP5: `agent:` step type replaced with\n`component: agent-dispatch@1.0.0`. Budget fields flattened into inputs.\n",
+      "step_count": 1,
+      "components_used": [
+        "agent-dispatch"
+      ],
+      "recipe_path": "catalog/recipes/cancel-smoke-naseej/recipe.yaml"
+    },
+    "cp4-gate-smoke": {
+      "name": "cp4-gate-smoke",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "CP4 smoke for ADR-023. Exercises the runner pause-intercept hook via\nthe new `approval-gate@1.0.0` component (component-syntax path, not the\nlegacy `gate:` step type). Pauses until POST /api/recipes/runs/<id>/respond\nfires with a matching `{decision, comment?}` payload.\n",
+      "step_count": 1,
+      "components_used": [
+        "approval-gate"
+      ],
+      "recipe_path": "catalog/recipes/cp4-gate-smoke/recipe.yaml"
+    },
+    "cp4-human-smoke": {
+      "name": "cp4-human-smoke",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "CP4 smoke for ADR-023. Exercises the runner pause-intercept hook via\nthe new `human-form@1.0.0` component (component-syntax path, not the\nlegacy `human:` step type). Pauses until POST /api/recipes/runs/<id>/respond\nfires with a matching response payload.\n",
+      "step_count": 1,
+      "components_used": [
+        "human-form"
+      ],
+      "recipe_path": "catalog/recipes/cp4-human-smoke/recipe.yaml"
+    },
+    "filter-smoke-naseej": {
+      "name": "filter-smoke-naseej",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "ADR-006 S2 precursor smoke. Verifies the templating engine's new context\nglobals (HOME, work_dir) + the four filters (basename, dirname,\nhuman_bytes, date_fmt) all interpolate cleanly through input defaults +\nstep inputs. Composes existing Tier-2 components only — the full\nshell-smoke-naseej lands in S3 alongside shell-exec.\n",
+      "step_count": 2,
+      "components_used": [
+        "stop-slop",
+        "vault-write"
+      ],
+      "recipe_path": "catalog/recipes/filter-smoke-naseej/recipe.yaml"
+    },
+    "gate-smoke-naseej": {
+      "name": "gate-smoke-naseej",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "ADR-011 v1 smoke — single gate step. Pauses on POST /run, expects a\nPOST /respond with {decision, comment?}, returns the decision in\nsteps.approve.outputs.decision.\n\nRe-authored for ADR-023 CP5: `gate:` block replaced with\n`component: approval-gate@1.0.0`. All fields moved into inputs.\n",
+      "step_count": 1,
+      "components_used": [
+        "approval-gate"
+      ],
+      "recipe_path": "catalog/recipes/gate-smoke-naseej/recipe.yaml"
+    },
+    "hello-naseej": {
+      "name": "hello-naseej",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "The smallest meaningful Naseej recipe. Composes all 3 v1 components end-to-end:\nscores operator text with stop-slop, writes the verdict to the vault, and\nnotifies via Telegram with the resulting note path. Proves the spine works.\n\nThe persist step references `{{now}}` (ISO ms-precision timestamp from the\nrunner ctx) so repeat runs with the default text remain content-unique and\ndon't trip the vault chokepoint's content dedup gate.\n",
+      "step_count": 3,
+      "components_used": [
+        "channel-send-text",
+        "stop-slop",
+        "vault-write"
+      ],
+      "recipe_path": "catalog/recipes/hello-naseej/recipe.yaml"
+    },
+    "human-smoke-naseej": {
+      "name": "human-smoke-naseej",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "ADR-011 v1 smoke — single human step. Pauses on POST /run, expects a\nPOST /respond with the field payload, returns the response in\nsteps.ask-name.outputs.response.\n\nRe-authored for ADR-023 CP5: `human:` block replaced with\n`component: human-form@1.0.0`. All fields moved into inputs.\n",
+      "step_count": 1,
+      "components_used": [
+        "human-form"
+      ],
+      "recipe_path": "catalog/recipes/human-smoke-naseej/recipe.yaml"
+    },
+    "parallel-smoke": {
+      "name": "parallel-smoke",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "ADR-013 parallel-execution smoke test. Three independent sleep steps in\nwave 1, one consolidating step in wave 2. Expected wall-clock with\nparallelism: ~3s (longest leaf) + ~1s consolidate ≈ 4s.\nWithout parallelism the same would take ~3+3+3+1 = 10s.\n",
+      "step_count": 4,
+      "components_used": [
+        "shell-exec"
+      ],
+      "recipe_path": "catalog/recipes/parallel-smoke/recipe.yaml"
+    },
+    "peer-brief": {
+      "name": "peer-brief",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "Daily peer-brief PDF render. Naseej port of scripts/peer-brief-render.py\n(ADR-007). Five steps compose: signal-trend extraction (shell-exec), recipe\nsynthesis (peer-brief-synth agent), stop-slop gate (peer-brief-aware scanner\nvia shell-exec), katib PDF render, Telegram alert.\n\nFaithful to the legacy script for the 5-day shadow window. The stop-slop\nscan deliberately invokes the existing peer-brief-aware scanner script\n(scripts/peer-brief/stop-slop-scan.py) rather than the generic stop-slop\ncomponent, because the scanner extracts prose fields from the katib recipe\nYAML and the generic component scans raw text. Swap to the generic component\nonce peer-brief parity is no longer the bar.\n\nRe-authored for ADR-023 CP5: `agent:` step type on synth replaced with\n`component: agent-dispatch@1.0.0`. Budget fields flattened into inputs.\nDownstream `{{steps.synth.outputs.artifact_path}}` reference preserved.\n",
+      "step_count": 5,
+      "components_used": [
+        "agent-dispatch",
+        "channel-send-text",
+        "katib-build",
+        "shell-exec"
+      ],
+      "recipe_path": "catalog/recipes/peer-brief/recipe.yaml"
+    },
+    "peer-brief-rebuild": {
+      "name": "peer-brief-rebuild",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "ADR-034 CP3 — the daily peer-brief rebuilt on the internalized Naseej stack:\nthe peer-brief DOCUMENT TEMPLATE (catalog/documents/peer-brief) + the slot\ntaxonomy + doc-render. ZERO katib.\n\nSpine: two deterministic context loads (trend SQL + miner-daily split) run in\nparallel; a sequential 3-turn claude session chain drafts the JUDGMENT slots\nas JSON (so figure labels stay consistent with finding titles — the same\nmodel wrote both); fill-template.py merges static template values +\ndeterministic data + the JSON drafts into a concrete doc-render composition;\nstop-slop scans it as a safety net; doc-render renders the PDF.\n\nThe static slots (Why / Method bodies, figure labels, GCC sector columns) and\nthe deterministic trend chart never hit the model — only genuine analytical\njudgment costs tokens. This is the ADR-029 payoff.\n\nRuns as a shadow beside the legacy `peer-brief-daily` cron for a week of\nparity (ADR-034 falsifier), then legacy is retired.\n",
+      "step_count": 18,
+      "components_used": [
+        "doc-render",
+        "inline-llm-pass",
+        "shell-exec",
+        "text-correct"
+      ],
+      "recipe_path": "catalog/recipes/peer-brief-rebuild/recipe.yaml"
+    },
+    "per-step-mode-smoke-naseej": {
+      "name": "per-step-mode-smoke-naseej",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "ADR-020 smoke. Two agent steps that explicitly request different dispatch\nbackends per step. Step 1 pins `mode: production` (claude-pty, goal-loop\nactive). Step 2 pins `mode: oneshot` (claude-cli-flag, no `/goal` line).\nThe recipe itself sets no top-level mode — the runner resolves each step's\noverride independently.\n\nVerification — read the per-run stream:\n  - Step 1 logs `[agents/claude-pty] goal-mode active for verify-pty …`\n  - Step 2 logs `claude-cli-flag` backend dispatch, no `/goal` line, no PTY\n  - Both steps exit 0; total spend <$0.20\n\nInvoke with mode unset (so recipe-wide defaults to 'production') — the\nper-step `mode: oneshot` on step 2 must still flip the backend independently.\n\nRe-authored for ADR-023 CP5: `agent:` step types replaced with\n`component: agent-dispatch@1.0.0`. Per-step `mode:` moved into inputs.\nBudget fields flattened into inputs.\n",
+      "step_count": 2,
+      "components_used": [
+        "agent-dispatch"
+      ],
+      "recipe_path": "catalog/recipes/per-step-mode-smoke-naseej/recipe.yaml"
+    },
+    "quality-check-and-log": {
+      "name": "quality-check-and-log",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "Score a piece of prose against stop-slop and log the per-dimension breakdown\nto the vault under a date-bucketed path. No notification step. Use for\nreviewing drafts before sending without triggering Telegram noise.\n",
+      "step_count": 2,
+      "components_used": [
+        "stop-slop",
+        "vault-write"
+      ],
+      "recipe_path": "catalog/recipes/quality-check-and-log/recipe.yaml"
+    },
+    "shell-smoke-naseej": {
+      "name": "shell-smoke-naseej",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "ADR-006 S3 keystone smoke (closes F2). Composes every primitive ADR-006\nintroduced: `file: must_exist=true` input, four templating filters,\nHOME + work_dir context globals, and the Tier-1 `shell-exec` component.\nNo agents, no LLM cost — pure subprocess + vault-write composition.\n\nFlow:\n1. Recipe-start resolves `target_file` to a known-good file path and stat-checks it.\n2. `shell-exec` runs `wc -l` on the file, redirecting stdout into work_dir.\n3. `vault-write` logs the result to inbox/_naseej-runs/ using filters\n   (basename, dirname, human_bytes, date_fmt) to verify they all interpolate\n   at step time.\n",
+      "step_count": 2,
+      "components_used": [
+        "shell-exec",
+        "vault-write"
+      ],
+      "recipe_path": "catalog/recipes/shell-smoke-naseej/recipe.yaml"
+    },
+    "text-correct-smoke": {
+      "name": "text-correct-smoke",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "Genericity proof for text-correct (ADR-035 P3 falsifier — >=2 distinct ruleset consumers). The peer-brief-rebuild recipe consumes text-correct with the stop-slop ruleset; this recipe consumes the SAME component with a DIFFERENT, prose-oriented ruleset (British-English spelling) that targets things stop-slop never touches. A passing run (American spellings -> British) proves the corrector follows whatever ruleset it is handed, so it is style-agnostic and not peer-brief-specific. Doubles as a live regression smoke for the component.\n",
+      "step_count": 1,
+      "components_used": [
+        "text-correct"
+      ],
+      "recipe_path": "catalog/recipes/text-correct-smoke/recipe.yaml"
+    },
+    "timeout-smoke-naseej": {
+      "name": "timeout-smoke-naseej",
+      "version": "1.0.0",
+      "project": "naseej",
+      "description": "ADR-011 timeout test — 2s pause, no responder, expect fail.\n\nRe-authored for ADR-023 CP5: `human:` block replaced with\n`component: human-form@1.0.0`.\n",
+      "step_count": 1,
+      "components_used": [
+        "human-form"
+      ],
+      "recipe_path": "catalog/recipes/timeout-smoke-naseej/recipe.yaml"
+    }
+  }
+}

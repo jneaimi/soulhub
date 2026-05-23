@@ -1,0 +1,68 @@
+name: hello-naseej
+version: 1.0.0
+project: naseej
+description: |
+  The smallest meaningful Naseej recipe. Composes all 3 v1 components end-to-end:
+  scores operator text with stop-slop, writes the verdict to the vault, and
+  notifies via Telegram with the resulting note path. Proves the spine works.
+
+  The persist step references `{{now}}` (ISO ms-precision timestamp from the
+  runner ctx) so repeat runs with the default text remain content-unique and
+  don't trip the vault chokepoint's content dedup gate.
+
+inputs:
+  - name: text
+    type: string
+    required: true
+    default: "Cats walk softly. Dogs run hard. Birds glide quietly."
+  - name: notify
+    type: boolean
+    default: true
+
+steps:
+  - id: score
+    component: stop-slop@1.0.0
+    inputs:
+      text: "{{inputs.text}}"
+      rubric: default
+      min_score: 0
+      block_on_fail: false
+
+  - id: persist
+    component: vault-write@1.0.0
+    depends_on: [score]
+    inputs:
+      path: "inbox/_naseej-runs/{{date}}-{{run_id}}-hello-naseej.md"
+      frontmatter:
+        type: output
+        created: "{{date}}"
+        tags: [naseej, hello-naseej, recipe-output]
+        project: naseej
+        run_id: "{{run_id}}"
+        ran_at: "{{now}}"
+        source_agent: naseej-runner
+      body: |
+        # hello-naseej run {{run_id}}
+
+        Recorded at {{now}}.
+
+        **Score**: {{steps.score.outputs.score}}/50 (passed: {{steps.score.outputs.passed}})
+
+        ## Scored text
+
+        > {{inputs.text}}
+
+        ## Per-dimension
+
+        - directness: {{steps.score.outputs.per_dimension.directness}}
+        - rhythm: {{steps.score.outputs.per_dimension.rhythm}}
+        - trust: {{steps.score.outputs.per_dimension.trust}}
+        - authenticity: {{steps.score.outputs.per_dimension.authenticity}}
+        - density: {{steps.score.outputs.per_dimension.density}}
+
+  - id: notify
+    component: channel-send-text@1.0.0
+    depends_on: [persist]
+    inputs:
+      channel: telegram
+      text: "[hello-naseej] Recipe done. Score: {{steps.score.outputs.score}}/50. Note: {{steps.persist.outputs.vault_path}}"

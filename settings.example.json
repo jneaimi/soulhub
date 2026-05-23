@@ -1,0 +1,102 @@
+{
+  "terminal": {
+    "fontSize": 13,
+    "cols": 120,
+    "rows": 40,
+    "cursorBlink": true
+  },
+  "interface": {
+    "defaultPanel": "code",
+    "panelWidth": 260
+  },
+  "paths": {
+    "devDir": "~/dev",
+    "vaultDir": "~/vault",
+    "catalogDir": "~/dev/soul-hub/catalog",
+    "claudeBinary": "~/.local/bin/claude"
+  },
+  "server": {
+    "port": 2400
+  },
+  "channels": {
+    "telegram": {
+      "enabled": false,
+      "label": "Telegram",
+      "defaultFor": [
+        "send"
+      ]
+    }
+  },
+  "proxy": {
+    "enabled": true,
+    "allowedPortRange": [
+      1024,
+      9999
+    ],
+    "blockedPorts": [
+      2400
+    ]
+  },
+  "orchestration": {
+    "maxWorkers": 4,
+    "maxIterationsPerWorker": 8,
+    "worktreeDir": ".worktrees",
+    "depInstaller": "auto"
+  },
+  "scheduler": {
+    "tasks": [
+      {
+        "id": "vault-backup-daily",
+        "type": "shell-script",
+        "cron": "0 23 * * *",
+        "timezone": "Asia/Dubai",
+        "enabled": true,
+        "noOverlap": true,
+        "description": "Daily vault git snapshot \u2014 safety net under event-driven commits (ADR-019)",
+        "params": {
+          "command": [
+            "bash",
+            "scripts/vault-backup-daily.sh"
+          ],
+          "cwd": "<REPO_ROOT>",
+          "timeoutMs": 60000
+        }
+      },
+      {
+        "id": "soul-hub-backup-daily",
+        "type": "shell-script",
+        "cron": "30 23 * * *",
+        "timezone": "Asia/Dubai",
+        "enabled": true,
+        "noOverlap": true,
+        "description": "Daily soul-hub git push \u2014 flushes unpushed main commits to origin (push-only mirror of vault-backup-daily safety-net)",
+        "params": {
+          "command": [
+            "bash",
+            "scripts/soul-hub-backup-daily.sh"
+          ],
+          "cwd": "<REPO_ROOT>",
+          "timeoutMs": 60000
+        }
+      },
+      {
+        "id": "intent-mining-daily",
+        "type": "intent-mining",
+        "cron": "0 2 * * *",
+        "timezone": "Asia/Dubai",
+        "enabled": true,
+        "noOverlap": true,
+        "description": "Daily intent analyst (ADR-023 P1.5) \u2014 mines intent_log + chat_history, proposes routing patterns, nudges via Telegram.",
+        "params": {
+          "lookbackDays": 7,
+          "minNewRows": 10
+        }
+      }
+    ]
+  },
+  "features": {
+    "naseej": false,
+    "workspaces": false,
+    "playbook": false
+  }
+}

@@ -1,0 +1,34 @@
+name: "TODO: Handoff Playbook Name"
+type: playbook
+description: "TODO: What this iterative handoff does"
+
+inputs:
+  - id: target
+    type: text
+    description: "TODO: What to iterate on"
+    required: true
+
+roles:
+  - id: role-a
+    provider: claude
+    model: sonnet
+    agent: roles/role-a.md
+
+  - id: role-b
+    provider: claude
+    model: sonnet
+    agent: roles/role-b.md
+
+phases:
+  - id: iterate
+    type: handoff
+    between: [role-a, role-b]
+    loop_until: "TODO: condition that signals completion"
+    max_iterations: 3
+    task: "TODO: What the agents should refine about $inputs.target"
+    output: final.md
+
+output:
+  type: artifact
+  file: final.md
+  vault_capture: true

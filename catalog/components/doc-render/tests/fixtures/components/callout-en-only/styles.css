@@ -1,0 +1,10 @@
+.callout {
+    font-family: var(--font-primary);
+    padding: 10pt 14pt;
+    margin: 0.9em 0;
+    border-radius: 3pt;
+    color: var(--text);
+    border-left: 3px solid var(--accent);
+    background: var(--tag-bg);
+}
+.callout__body { font-size: 10.5pt; line-height: 1.55; }

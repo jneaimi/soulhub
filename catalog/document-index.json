@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-20T19:47:19.348Z",
+  "documents": {
+    "peer-brief": {
+      "slug": "peer-brief",
+      "name": "Signal Forge Peer Brief",
+      "brand": "jneaimi",
+      "lang": "en",
+      "component_count": 15,
+      "slots": {
+        "static": 27,
+        "deterministic": 10,
+        "judgment": 46
+      },
+      "document_path": "catalog/documents/peer-brief/document.yaml"
+    }
+  }
+}

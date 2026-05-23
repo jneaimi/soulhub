@@ -1,0 +1,174 @@
+name: Signal Forge Peer Brief
+brand: jneaimi
+lang: en
+
+# ADR-034 CP3 + 2026-05-20 adjustment — the daily peer-brief as a document
+# template, aligned to the canonical 15-section legacy structure.
+# Section order: cover → exec summary → trend(Fig0) → why → method →
+# bar(Fig1) → findings → matrix(Fig2) → pull-quote → heatmap(Fig3) →
+# delta → how-to-use → closing note → notes → about the author.
+# Slot classes:
+#   static        — boilerplate set once here (why/method/about-author bodies,
+#                   figure labels, GCC sector columns), never regenerated.
+#   deterministic — computed each run (trend chart, reference code, cover image
+#                   picked from the pool by date), no LLM.
+#   judgment      — the analytical prose + figure data an LLM pass fills.
+
+composition:
+  # ── Cover (image-background, rotating pool) ────────────────────────────────
+  - component: cover-page
+    slots:
+      eyebrow:
+        class: static
+        value: "Signal Forge · Peer Briefing"
+      title:
+        class: judgment
+      subtitle:
+        class: judgment
+      reference_code:
+        class: deterministic
+      image:
+        class: deterministic       # picked from the cover pool by date
+
+  # ── Executive Summary ──────────────────────────────────────────────────────
+  - component: callout
+    slots:
+      tone:
+        class: static
+        value: neutral
+      title:
+        class: static
+        value: "Executive Summary"
+      body:
+        class: judgment
+
+  # ── Figure 0 · Signal volume trend (deterministic) ─────────────────────────
+  - component: stacked-area-chart
+    slots:
+      eyebrow:
+        class: static
+        value: "Figure 0 · Signal volume · rolling window"
+      bands: { class: deterministic }
+      x_ticks: { class: deterministic }
+      y_ticks: { class: deterministic }
+      chart_geometry: { class: deterministic }
+      today_x: { class: deterministic }
+      today_index: { class: deterministic }
+      y_max: { class: deterministic }
+      caption: { class: deterministic }
+
+  # ── Section 1 · Why this brief (evergreen) ─────────────────────────────────
+  - component: module
+    variant: numbered
+    slots:
+      number: { class: static, value: 1 }
+      title: { class: static, value: "What This Brief Is For" }
+      raw_body:
+        class: static
+        value: |
+          <p><span style="font-size: 28pt; line-height: 1; color: var(--accent); font-weight: 500; padding-right: 2pt; float: left; margin-right: 4pt;">T</span>his brief reads the open market the way an operator reads a position. Not a clippings file, and not a trend roundup. Each day it isolates the few signals that moved with conviction across the platforms where decisions actually form, then asks the only question that matters to someone building in the region: what does this change about where I place attention this week.</p>
+          <p>The audience is a single reader who carries a P&amp;L and a calendar. So the brief stays short, defends every claim from public evidence, and refuses the consultant reflex of selling the reader their own context back. Where global discourse and GCC reality diverge, the divergence is the finding. Where they converge, the convergence is the timing signal.</p>
+  # ── Section 2 · Method (evergreen) ─────────────────────────────────────────
+  - component: module
+    variant: numbered
+    slots:
+      number: { class: static, value: 2 }
+      title: { class: static, value: "Method" }
+      raw_body:
+        class: static
+        value: |
+          <p>The brief draws on a daily cross-platform pull through Signal Forge, the in-house intelligence pipeline. Signals are clustered by theme, scored for cross-platform reach, and filtered against a persistence threshold so that a single viral spike does not masquerade as a pattern. Only clusters that hold across more than one platform and more than one day clear into the findings below.</p>
+          <p>Each finding pairs a global signal with its GCC counterpart and an analytical read. The pairing is deliberate: a pattern visible everywhere is rarely actionable until it is mapped onto the region's operating reality, where capital, regulation, and buyer behaviour bend it into a specific shape.</p>
+          <p>Two caveats are non-negotiable. The pull captures public discourse, so it underweights the private conversations where the largest regional decisions are still made. And volume is not validation: a loud signal in global discourse can be near-silent inside a GCC boardroom, which is exactly the gap the GCC counterpart paragraph exists to flag.</p>
+  # ── Figure 1 · Cluster discourse density (judgment data) ────────────────────
+  - component: horizontal-bar-chart
+    slots:
+      eyebrow:
+        class: static
+        value: "Figure 1 · Cluster discourse density · 24-hour pull"
+      x_axis_label:
+        class: static
+        value: "CROSS-PLATFORM VIEWS · 24-HOUR PULL"
+      items: { class: judgment }
+      caption: { class: judgment }
+
+  # ── Section 3 · Five Findings (judgment) ───────────────────────────────────
+  - component: module
+    variant: numbered
+    slots:
+      number: { class: static, value: 3 }
+      title: { class: static, value: "Five Findings" }
+      raw_body: { class: judgment }
+
+  # ── Figure 2 · Global discourse vs GCC resonance (judgment data) ────────────
+  - component: comparison-dot-matrix
+    slots:
+      eyebrow:
+        class: static
+        value: "Figure 2 · Signal-intensity matrix · global discourse vs GCC resonance"
+      row_header_label: { class: static, value: "Finding" }
+      column_a_label: { class: static, value: "Global discourse" }
+      column_b_label: { class: static, value: "GCC resonance" }
+      rows: { class: judgment }
+      caption: { class: judgment }
+
+  # ── Pull-quote (judgment) ───────────────────────────────────────────────────
+  - component: pull-quote
+    variant: rule-leading
+    slots:
+      text: { class: judgment }
+      attribution: { class: judgment }
+
+  # ── Figure 3 · GCC sector relevance (judgment cells, static sector columns) ─
+  - component: categorical-heatmap
+    slots:
+      eyebrow:
+        class: static
+        value: "Figure 3 · GCC sector relevance · finding × sector"
+      columns:
+        class: static
+        value: [Banking, Government, Real Estate, Logistics, SME/SMB]
+      rows: { class: judgment }
+      caption: { class: judgment }
+
+  # ── Section 4 · Delta vs Previous Run (judgment) ────────────────────────────
+  - component: module
+    variant: numbered
+    slots:
+      number: { class: static, value: 4 }
+      title: { class: static, value: "Delta vs Previous Run" }
+      raw_body: { class: judgment }
+
+  # ── Section 5 · How to Use This Brief (judgment) ────────────────────────────
+  - component: module
+    variant: numbered
+    slots:
+      number: { class: static, value: 5 }
+      title: { class: static, value: "How to Use This Brief" }
+      raw_body: { class: judgment }
+
+  # ── Closing Note (judgment) ─────────────────────────────────────────────────
+  - component: callout
+    slots:
+      tone: { class: static, value: neutral }
+      title: { class: static, value: "Closing Note" }
+      body: { class: judgment }
+
+  # ── Notes (judgment, methodology — untitled module, own heading in body) ────
+  - component: module
+    slots:
+      raw_body: { class: judgment }
+
+  # ── About the Author (evergreen static bio — untitled module) ───────────────
+  - component: module
+    break_inside: avoid          # keep the bio card whole on one page
+    slots:
+      raw_body:
+        class: static
+        value: |
+          <section style="margin-top: 24pt; padding: 16pt 18pt; border: 0.5pt solid var(--border); background: var(--page-bg); font-size: 10pt; line-height: 1.6; page-break-inside: avoid; break-inside: avoid;">
+            <h4 style="font-size: 9pt; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); font-weight: 700; margin: 0 0 6pt 0;">About the Author</h4>
+            <div style="font-weight: 700; font-size: 11pt; margin-bottom: 2pt; color: var(--text);">Jasem Al Neaimi</div>
+            <p style="margin: 0 0 6pt 0; color: var(--text);">Jasem is a UAE-based operator working at the intersection of enterprise AI strategy, agentic systems, and bilingual market positioning. He runs Signal Forge, a multi-agent intelligence pipeline that ingests six platforms and produces daily and weekly briefs for GCC operators. Prior writing covers the GCC Enterprise Agentic AI Decision Framework, Building a Second Brain with Claude Code, and the Bloom's AI Collaboration Framework.</p>
+            <p style="margin-top: 6pt; font-size: 9pt; color: var(--text-tertiary);">Contact: jasem@jneaimi.com · jneaimi.com · This brief is shared peer-to-peer. Quote, forward, and disagree freely.</p>
+          </section>

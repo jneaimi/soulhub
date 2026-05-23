@@ -1,0 +1,184 @@
+.naseej-module {
+    margin: 1.5em 0 1.2em 0;
+}
+
+.naseej-module__head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6em;
+    margin-bottom: 0.4em;
+}
+
+.naseej-module__number {
+    font-family: var(--font-display);
+    font-size: 32pt;
+    font-weight: 700;
+    line-height: 0.95;
+    color: var(--accent);
+    letter-spacing: -0.02em;
+    min-width: 0.9em;
+    flex-shrink: 0;
+}
+
+.naseej-module[lang="ar"] .naseej-module__number {
+    letter-spacing: 0;
+    font-size: 36pt;
+}
+
+.naseej-module__headings {
+    flex: 1;
+}
+
+/* Minimal eyebrow rule — inlined so module renders standalone (the eyebrow
+   primitive is not ported in CP3). */
+.naseej-eyebrow--accent {
+    font-family: var(--font-display);
+    font-size: 9pt;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 0.3em;
+}
+.naseej-eyebrow--accent[lang="ar"] {
+    letter-spacing: 0;
+    text-transform: none;
+    font-size: 10.5pt;
+}
+
+.naseej-module__title {
+    margin: 0;
+    font-size: 16pt;
+    line-height: 1.25;
+}
+
+.naseej-module--plain .naseej-module__title { font-size: 15pt; }
+
+.naseej-module__intro {
+    font-size: 10.5pt;
+    color: var(--text-secondary);
+    line-height: 1.55;
+    margin: 0.4em 0 0 0;
+}
+
+.naseej-module__body {
+    margin-top: 0.6em;
+    font-size: 11pt;
+    line-height: 1.6;
+    color: var(--text);
+}
+
+.naseej-module__body > p:first-child { margin-top: 0; }
+.naseej-module__body > p:last-child  { margin-bottom: 0; }
+
+/* -------- rich-body styling — applies only when raw_body is supplied -------- */
+
+.naseej-module__body--rich h3 {
+    margin: 1em 0 0.3em 0;
+    font-size: 12pt;
+    line-height: 1.3;
+    color: var(--text);
+}
+
+.naseej-module__body--rich h4 {
+    margin: 0.8em 0 0.25em 0;
+    font-size: 10.5pt;
+    line-height: 1.3;
+    color: var(--text);
+}
+
+.naseej-module__body--rich figure {
+    margin: 1em 0;
+    page-break-inside: avoid;
+}
+
+.naseej-module__body--rich figure svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    max-width: 100%;
+}
+
+.naseej-module__body--rich figcaption {
+    font-size: 9pt;
+    color: var(--text-secondary);
+    margin-top: 0.35em;
+    line-height: 1.45;
+    text-align: center;
+}
+
+.naseej-module__body--rich table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.8em 0;
+    font-size: 10pt;
+}
+
+.naseej-module__body--rich thead { display: table-header-group; }
+.naseej-module__body--rich tr { page-break-inside: avoid; }
+
+.naseej-module__body--rich th {
+    background: var(--accent);
+    color: var(--accent-on);
+    padding: 5pt 9pt;
+    text-align: left;
+    font-weight: 600;
+    font-size: 9.5pt;
+    line-height: 1.35;
+}
+
+[lang="ar"] .naseej-module__body--rich th { text-align: right; }
+
+.naseej-module__body--rich td {
+    border: 0.5pt solid var(--border);
+    padding: 5pt 9pt;
+    vertical-align: top;
+    line-height: 1.5;
+}
+
+.naseej-module__body--rich pre {
+    background: #1A1A1A;
+    color: #E8E8E8;
+    padding: 10pt 14pt;
+    border-radius: 4pt;
+    font-size: 8.5pt;
+    line-height: 1.5;
+    margin: 0.8em 0;
+    page-break-inside: avoid;
+    font-family: var(--font-mono, "JetBrains Mono", monospace);
+    direction: ltr;
+}
+
+.naseej-module__body--rich blockquote {
+    margin: 1em 0;
+    padding: 0.3em 0 0.3em 16pt;
+    border-left: 3px solid var(--accent);
+    font-size: 12pt;
+    line-height: 1.5;
+    font-style: italic;
+    color: var(--text);
+    page-break-inside: avoid;
+}
+
+[lang="ar"] .naseej-module__body--rich blockquote {
+    padding: 0.3em 16pt 0.3em 0;
+    border-left: none;
+    border-right: 3px solid var(--accent);
+}
+
+.naseej-module__body--rich ol.steps {
+    list-style: decimal;
+    padding-left: 1.4em;
+    margin: 0.6em 0;
+}
+
+[lang="ar"] .naseej-module__body--rich ol.steps {
+    padding-left: 0;
+    padding-right: 1.4em;
+}
+
+.naseej-module__body--rich ol.steps > li {
+    margin: 0.5em 0;
+    padding-left: 0.3em;
+    line-height: 1.55;
+}

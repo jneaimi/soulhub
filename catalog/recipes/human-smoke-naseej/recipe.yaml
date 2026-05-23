@@ -1,0 +1,21 @@
+name: human-smoke-naseej
+version: 1.0.0
+project: naseej
+description: |
+  ADR-011 v1 smoke — single human step. Pauses on POST /run, expects a
+  POST /respond with the field payload, returns the response in
+  steps.ask-name.outputs.response.
+
+  Re-authored for ADR-023 CP5: `human:` block replaced with
+  `component: human-form@1.0.0`. All fields moved into inputs.
+
+steps:
+  - id: ask-name
+    component: human-form@1.0.0
+    inputs:
+      prompt: "What is your name?"
+      fields:
+        - name: name
+          type: text
+          required: true
+      timeout_sec: 60

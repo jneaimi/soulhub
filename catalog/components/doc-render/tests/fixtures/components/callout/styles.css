@@ -1,0 +1,31 @@
+.callout {
+    font-family: var(--font-primary);
+    padding: 10pt 14pt;
+    margin: 0.9em 0;
+    border-radius: 3pt;
+    color: var(--text);
+    border: 0 solid transparent;
+}
+
+.callout[lang="en"] { border-left-width: 3px; }
+.callout[lang="ar"] { border-right-width: 3px; }
+
+.callout__title {
+    font-weight: 700;
+    margin-bottom: 0.3em;
+    font-size: 11pt;
+}
+
+.callout__body { font-size: 10.5pt; line-height: 1.55; }
+
+.callout--info    { background: var(--callout-info-bg);   border-color: var(--callout-info-accent); }
+.callout--warn    { background: var(--callout-warn-bg);   border-color: var(--callout-warn-accent); }
+.callout--danger  { background: var(--callout-danger-bg); border-color: var(--callout-danger-accent); }
+.callout--tip     { background: var(--callout-tip-bg);    border-color: var(--callout-tip-accent); }
+.callout--neutral { background: var(--tag-bg);            border-color: var(--accent); }
+
+.callout--info    .callout__title { color: var(--callout-info-accent); }
+.callout--warn    .callout__title { color: var(--callout-warn-accent); }
+.callout--danger  .callout__title { color: var(--callout-danger-accent); }
+.callout--tip     .callout__title { color: var(--callout-tip-accent); }
+.callout--neutral .callout__title { color: var(--accent); }

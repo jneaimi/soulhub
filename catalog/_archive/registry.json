@@ -1,0 +1,252 @@
+{
+  "skills": [
+    {
+      "name": "deploy",
+      "description": "Deploy to production with safety checks and rollback support",
+      "category": "development",
+      "runtime": "bash",
+      "userOnly": true,
+      "env_vars": [],
+      "tags": ["ci-cd", "production"]
+    },
+    {
+      "name": "test-coverage",
+      "description": "Run tests and generate coverage reports with threshold enforcement",
+      "category": "development",
+      "runtime": "python-uv",
+      "userOnly": false,
+      "env_vars": [],
+      "tags": ["testing", "quality"]
+    },
+    {
+      "name": "code-review",
+      "description": "Automated code review checking style, complexity, and common issues",
+      "category": "development",
+      "runtime": null,
+      "userOnly": true,
+      "env_vars": [],
+      "tags": ["review", "quality"]
+    },
+    {
+      "name": "security-scan",
+      "description": "Scan codebase for vulnerabilities, exposed secrets, and OWASP issues",
+      "category": "operations",
+      "runtime": null,
+      "userOnly": true,
+      "env_vars": [],
+      "tags": ["security", "owasp", "audit"]
+    },
+    {
+      "name": "draft",
+      "description": "Draft bilingual content (EN+AR) with brand voice and style selection",
+      "category": "content",
+      "runtime": null,
+      "userOnly": true,
+      "env_vars": [],
+      "tags": ["writing", "bilingual", "brand"]
+    },
+    {
+      "name": "collect",
+      "description": "Collect data from social media platforms and news sources",
+      "category": "research",
+      "runtime": "python-uv",
+      "userOnly": true,
+      "env_vars": [
+        { "name": "APIDIRECT_API_KEY", "description": "API key for Twitter, Reddit, TikTok, Instagram, LinkedIn", "required": true },
+        { "name": "YOUTUBE_API_KEY", "description": "YouTube Data API key", "required": true }
+      ],
+      "tags": ["data", "social-media", "collection"]
+    },
+    {
+      "name": "generate",
+      "description": "Generate images, video clips, and voiceovers using AI APIs",
+      "category": "media",
+      "runtime": "python",
+      "userOnly": true,
+      "env_vars": [
+        { "name": "GEMINI_API_KEY", "description": "Gemini API for image + Veo video generation", "required": true },
+        { "name": "ELEVENLABS_API_KEY", "description": "ElevenLabs text-to-speech", "required": true }
+      ],
+      "tags": ["image", "video", "voice", "ai"]
+    },
+    {
+      "name": "health-check",
+      "description": "Check service uptime, SSL certs, DNS resolution, and endpoint health",
+      "category": "operations",
+      "runtime": "bash",
+      "userOnly": true,
+      "env_vars": [],
+      "tags": ["monitoring", "uptime", "devops"]
+    }
+  ],
+  "agents": [
+    {
+      "name": "security-reviewer",
+      "description": "OWASP-focused code security audit with severity ratings and attack vectors",
+      "category": "development",
+      "model": "opus",
+      "effort": "high",
+      "dependsOn": ["security-scan"],
+      "env_vars": [],
+      "tags": ["security", "owasp", "audit"]
+    },
+    {
+      "name": "performance-reviewer",
+      "description": "Find N+1 queries, missing indexes, blocking I/O, and measurable bottlenecks",
+      "category": "development",
+      "model": "opus",
+      "effort": "high",
+      "dependsOn": [],
+      "env_vars": [],
+      "tags": ["performance", "optimization"]
+    },
+    {
+      "name": "arabic-writer",
+      "description": "Arabic content specialist — culturally adapted GCC writing with brand voice",
+      "category": "content",
+      "model": "sonnet",
+      "effort": "medium",
+      "dependsOn": ["draft"],
+      "env_vars": [],
+      "tags": ["arabic", "localization", "gcc"]
+    },
+    {
+      "name": "editor",
+      "description": "Polish drafts for clarity, brand voice, grammar, and anti-slop patterns",
+      "category": "content",
+      "model": "sonnet",
+      "effort": "medium",
+      "dependsOn": ["draft"],
+      "env_vars": [],
+      "tags": ["editing", "brand-voice", "quality"]
+    },
+    {
+      "name": "researcher",
+      "description": "Autonomous research agent — gathers intelligence and delivers structured reports",
+      "category": "research",
+      "model": "sonnet",
+      "effort": "high",
+      "dependsOn": ["collect"],
+      "env_vars": [
+        { "name": "APIDIRECT_API_KEY", "description": "Inherited from collect skill", "required": true },
+        { "name": "YOUTUBE_API_KEY", "description": "Inherited from collect skill", "required": true }
+      ],
+      "tags": ["research", "intelligence", "reports"]
+    },
+    {
+      "name": "media-creator",
+      "description": "Generate images, video clips, voiceovers, and text overlays from briefs",
+      "category": "media",
+      "model": "sonnet",
+      "effort": "medium",
+      "dependsOn": ["generate"],
+      "env_vars": [
+        { "name": "GEMINI_API_KEY", "description": "Inherited from generate skill", "required": true },
+        { "name": "ELEVENLABS_API_KEY", "description": "Inherited from generate skill", "required": true }
+      ],
+      "tags": ["media", "generation", "creative"]
+    },
+    {
+      "name": "sentinel",
+      "description": "Security auditor — scans for vulnerabilities, misconfigs, and exposed secrets",
+      "category": "operations",
+      "model": "opus",
+      "effort": "high",
+      "dependsOn": ["security-scan"],
+      "env_vars": [],
+      "tags": ["security", "audit", "infrastructure"]
+    },
+    {
+      "name": "watchtower",
+      "description": "DevOps monitor — checks uptime, SSL, DNS, and infrastructure health",
+      "category": "operations",
+      "model": "haiku",
+      "effort": "low",
+      "dependsOn": ["health-check"],
+      "env_vars": [],
+      "tags": ["monitoring", "devops", "uptime"]
+    }
+  ],
+  "mcpServers": [
+    {
+      "name": "filesystem",
+      "description": "Read, write, and manage files with secure path controls",
+      "category": "development",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "~/dev"],
+      "env_vars": [],
+      "tags": ["files", "io", "core"]
+    },
+    {
+      "name": "github",
+      "description": "GitHub repos, issues, PRs, and code search via GitHub API",
+      "category": "development",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env_vars": [
+        { "name": "GITHUB_PERSONAL_ACCESS_TOKEN", "description": "GitHub personal access token", "required": true }
+      ],
+      "tags": ["github", "git", "code"]
+    },
+    {
+      "name": "linear",
+      "description": "Linear issues, projects, cycles, and team management",
+      "category": "operations",
+      "command": "npx",
+      "args": ["-y", "@linear/mcp-server"],
+      "env_vars": [
+        { "name": "LINEAR_API_KEY", "description": "Linear API key", "required": true }
+      ],
+      "tags": ["linear", "project-management", "issues"]
+    },
+    {
+      "name": "slack",
+      "description": "Send messages, read channels, and manage Slack workspaces",
+      "category": "operations",
+      "command": "npx",
+      "args": ["-y", "@anthropic/mcp-server-slack"],
+      "env_vars": [
+        { "name": "SLACK_BOT_TOKEN", "description": "Slack Bot OAuth token (xoxb-...)", "required": true }
+      ],
+      "tags": ["slack", "messaging", "notifications"]
+    },
+    {
+      "name": "playwright",
+      "description": "Browser automation — navigate, click, fill forms, screenshot",
+      "category": "development",
+      "command": "npx",
+      "args": ["@playwright/mcp@latest"],
+      "env_vars": [],
+      "tags": ["browser", "testing", "automation"]
+    },
+    {
+      "name": "context7",
+      "description": "Up-to-date documentation context for any library or framework",
+      "category": "research",
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"],
+      "env_vars": [],
+      "tags": ["docs", "context", "libraries"]
+    },
+    {
+      "name": "sequential-thinking",
+      "description": "Structured step-by-step reasoning for complex problems",
+      "category": "research",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "env_vars": [],
+      "tags": ["reasoning", "analysis", "thinking"]
+    },
+    {
+      "name": "stitch",
+      "description": "Generate full UI screens and design variants with Gemini",
+      "category": "media",
+      "command": "npx",
+      "args": ["@_davideast/stitch-mcp", "proxy"],
+      "env_vars": [
+        { "name": "STITCH_API_KEY", "description": "Stitch API key for screen generation", "required": true }
+      ],
+      "tags": ["design", "ui", "screens"]
+    }
+  ]
+}

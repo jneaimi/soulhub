@@ -1,0 +1,132 @@
+.naseej-cover {
+    min-height: 253mm;
+    display: flex;
+    flex-direction: column;
+    padding: 0;
+    margin: 0;
+}
+
+.naseej-cover__logo {
+    margin: 0 0 auto 0;
+    max-height: 18mm;
+}
+
+.naseej-cover__body {
+    margin-top: 60mm;
+    margin-bottom: auto;
+}
+
+.naseej-cover__eyebrow {
+    font-family: var(--font-display);
+    font-size: 10pt;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent-2);
+    margin-bottom: 16pt;
+}
+
+.naseej-cover[lang="ar"] .naseej-cover__eyebrow {
+    letter-spacing: 0;
+    text-transform: none;
+    font-size: 12pt;
+}
+
+.naseej-cover__title {
+    font-family: var(--font-display);
+    font-size: 42pt;
+    font-weight: 700;
+    line-height: 1.05;
+    color: var(--text);
+    margin: 0;
+    letter-spacing: -0.015em;
+    max-width: 16em;
+}
+
+.naseej-cover[lang="ar"] .naseej-cover__title {
+    font-size: 44pt;
+    letter-spacing: 0;
+    line-height: 1.2;
+}
+
+.naseej-cover__subtitle {
+    font-family: var(--font-primary);
+    font-size: 14pt;
+    font-weight: 400;
+    color: var(--text-secondary);
+    margin: 18pt 0 0 0;
+    line-height: 1.45;
+    max-width: 28em;
+}
+
+.naseej-cover__footer {
+    margin-top: auto;
+    padding-top: 0.8em;
+    border-top: 1px solid var(--border-strong);
+    font-family: var(--font-primary);
+    font-size: 9.5pt;
+    color: var(--text-tertiary);
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+}
+
+.naseej-cover__author { font-weight: 500; color: var(--text-secondary); }
+
+.naseej-cover__ref {
+    font-family: var(--font-mono, "JetBrains Mono", monospace);
+    letter-spacing: 0.04em;
+    font-size: 9pt;
+}
+
+/* ── image-background variant ──────────────────────────────────────────────
+ * Active when an `image` input is supplied. Full-bleeds the photo to the page
+ * edges (negative margin cancels the 20mm @page margin), lays a dark gradient
+ * over it for white-text legibility, and recolours the typographic layers. */
+.naseej-cover--image-background {
+    position: relative;
+    margin: -20mm;
+    padding: 20mm;
+    min-height: 297mm;
+    box-sizing: border-box;
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    color: #fff;
+    page-break-after: always;
+}
+
+.naseej-cover--image-background::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+        180deg,
+        rgba(8, 10, 18, 0.28) 0%,
+        rgba(8, 10, 18, 0.45) 50%,
+        rgba(6, 8, 14, 0.86) 100%
+    );
+    z-index: 0;
+}
+
+.naseej-cover--image-background > * {
+    position: relative;
+    z-index: 1;
+}
+
+.naseej-cover--image-background .naseej-cover__title {
+    color: #fff;
+}
+
+.naseej-cover--image-background .naseej-cover__subtitle {
+    color: rgba(255, 255, 255, 0.88);
+}
+
+.naseej-cover--image-background .naseej-cover__footer {
+    border-top-color: rgba(255, 255, 255, 0.28);
+    color: rgba(255, 255, 255, 0.72);
+}
+
+.naseej-cover--image-background .naseej-cover__author {
+    color: rgba(255, 255, 255, 0.9);
+}

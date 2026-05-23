@@ -1,0 +1,171 @@
+#!/usr/bin/env -S uv run python
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""claude-stub — fake `claude -p` for inline-llm-pass component tests.
+
+Mirrors the real CLI's argument shape and JSON envelope format so we can
+exercise every code path of run.mjs without making live API calls.
+
+Behaviours by prompt content:
+  starts with "OK:"       → returns envelope with prompt-echoed result, exit 0
+  starts with "ERROR:"    → returns envelope with is_error=true, exit 0 (CLI surface)
+  starts with "EXIT1:"    → exits 1 with empty stdout (CLI hard failure)
+  starts with "GARBAGE:"  → prints non-JSON garbage to stdout, exit 0
+  starts with "SLOW:"     → sleeps 10s then exits (longer than test budget_seconds)
+  starts with "MODEL:"    → echoes the resolved --model in result; useful for model-override test
+  starts with "SYS:"      → echoes the --append-system-prompt content; useful for system-prompt test
+  anything else           → returns envelope with result=prompt, exit 0
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("-p", dest="prompt", required=True)
+    p.add_argument("--output-format", default="json")
+    p.add_argument("--model", default="claude-sonnet-4-6")
+    p.add_argument("--append-system-prompt", dest="system_prompt", default="")
+    p.add_argument("--dangerously-skip-permissions", action="store_true")
+    p.add_argument("--setting-sources", dest="setting_sources", default=None)
+    p.add_argument("--exclude-dynamic-system-prompt-sections", action="store_true")
+    p.add_argument("--tools", dest="tools", default=None)
+    p.add_argument("--no-session-persistence", action="store_true")
+    p.add_argument("--session-id", dest="session_id", default=None)
+    p.add_argument("--resume", dest="resume", default=None)
+    p.add_argument("--max-budget-usd", dest="max_budget_usd", default=None)
+    p.add_argument("--json-schema", dest="json_schema", default=None)
+    ns = p.parse_args()
+
+    prompt = ns.prompt or ""
+
+    # The session id the real CLI echoes in the envelope: the explicit
+    # --session-id, else the --resume target, else a fixed stub id.
+    echoed_session_id = ns.session_id or ns.resume or "00000000-0000-0000-0000-0000000000ff"
+
+    if prompt.startswith("SLOW:"):
+        time.sleep(10)
+        envelope = {"result": "should have timed out", "is_error": False, "num_turns": 1, "total_cost_usd": 0.001, "model": ns.model}
+        print(json.dumps(envelope))
+        return 0
+
+    if prompt.startswith("EXIT1:"):
+        return 1
+
+    if prompt.startswith("GARBAGE:"):
+        print("this is not json at all")
+        return 0
+
+    if prompt.startswith("ERROR:"):
+        envelope = {
+            "result": "model refused the request: content filter triggered",
+            "is_error": True,
+            "num_turns": 1,
+            "total_cost_usd": 0.0,
+            "model": ns.model,
+        }
+        print(json.dumps(envelope))
+        return 0
+
+    if prompt.startswith("MODEL:"):
+        envelope = {
+            "result": f"resolved-model={ns.model}",
+            "is_error": False,
+            "num_turns": 1,
+            "total_cost_usd": 0.0012,
+            "model": ns.model,
+        }
+        print(json.dumps(envelope))
+        return 0
+
+    if prompt.startswith("SYS:"):
+        envelope = {
+            "result": f"system-prompt={ns.system_prompt}",
+            "is_error": False,
+            "num_turns": 1,
+            "total_cost_usd": 0.0008,
+            "model": ns.model,
+        }
+        print(json.dumps(envelope))
+        return 0
+
+    if prompt.startswith("BUDGET:"):
+        envelope = {
+            "result": f"max-budget-usd={ns.max_budget_usd}",
+            "is_error": False,
+            "num_turns": 1,
+            "total_cost_usd": 0.0005,
+            "model": ns.model,
+        }
+        print(json.dumps(envelope))
+        return 0
+
+    if prompt.startswith("SCHEMA:"):
+        envelope = {
+            "result": f"json-schema-len={len(ns.json_schema or '')}",
+            "is_error": False,
+            "num_turns": 1,
+            "total_cost_usd": 0.0006,
+            "model": ns.model,
+        }
+        print(json.dumps(envelope))
+        return 0
+
+    if prompt.startswith("FLAGS:"):
+        # Echo the cost-strip flag state so tests can verify they were passed.
+        flags = []
+        if ns.tools is not None:
+            flags.append(f"tools={ns.tools!r}")
+        if ns.no_session_persistence:
+            flags.append("no-session-persistence=true")
+        if ns.exclude_dynamic_system_prompt_sections:
+            flags.append("exclude-dynamic=true")
+        if ns.setting_sources is not None:
+            flags.append(f"setting-sources={ns.setting_sources!r}")
+        envelope = {
+            "result": "|".join(flags),
+            "is_error": False,
+            "num_turns": 1,
+            "total_cost_usd": 0.0004,
+            "model": ns.model,
+            "session_id": echoed_session_id,
+        }
+        print(json.dumps(envelope))
+        return 0
+
+    if prompt.startswith("SESSION:"):
+        # Echo session flag state so tests can verify start/continue wiring.
+        envelope = {
+            "result": (
+                f"session-id={ns.session_id}|resume={ns.resume}|"
+                f"persist-disabled={ns.no_session_persistence}"
+            ),
+            "is_error": False,
+            "num_turns": 1,
+            "total_cost_usd": 0.0007,
+            "model": ns.model,
+            "session_id": echoed_session_id,
+        }
+        print(json.dumps(envelope))
+        return 0
+
+    # Default OK path: echo the prompt as the result with a small cost.
+    envelope = {
+        "result": prompt,
+        "is_error": False,
+        "num_turns": 1,
+        "total_cost_usd": 0.0015,
+        "model": ns.model,
+        "session_id": echoed_session_id,
+    }
+    print(json.dumps(envelope))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

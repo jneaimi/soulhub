@@ -1,0 +1,33 @@
+name: text-correct-smoke
+version: 1.0.0
+project: naseej
+description: >
+  Genericity proof for text-correct (ADR-035 P3 falsifier — >=2 distinct ruleset
+  consumers). The peer-brief-rebuild recipe consumes text-correct with the
+  stop-slop ruleset; this recipe consumes the SAME component with a DIFFERENT,
+  prose-oriented ruleset (British-English spelling) that targets things stop-slop
+  never touches. A passing run (American spellings -> British) proves the
+  corrector follows whatever ruleset it is handed, so it is style-agnostic and
+  not peer-brief-specific. Doubles as a live regression smoke for the component.
+
+inputs:
+  - name: ruleset
+    type: string
+    default: "{{HOME}}/dev/soul-hub/catalog/recipes/text-correct-smoke/rulesets/british-english.md"
+    description: A non-stop-slop, prose-oriented ruleset, to prove the corrector follows whatever rules it is handed.
+  - name: model
+    type: string
+    default: claude-sonnet-4-6
+  - name: sample_text
+    type: string
+    default: "Our team will analyze the color data, optimize the rendering, and organize the travel logistics from our defense center."
+
+steps:
+  - id: correct
+    component: text-correct@1.0.0
+    inputs:
+      input_text: "{{inputs.sample_text}}"
+      ruleset: "{{inputs.ruleset}}"
+      model: "{{inputs.model}}"
+      max_budget_usd: 0.20
+      emdash_backstop: true

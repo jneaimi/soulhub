@@ -1,0 +1,67 @@
+# Naseej doc-render base tokens — lowest-priority defaults.
+# Vendored from katib core/tokens.base.yaml (ADR-030 CP2). Naseej owns this
+# copy now; no runtime dependency on ~/dev/katib.
+#
+# Three merge layers (lowest → highest priority):
+#   render_core/tokens.base.yaml   (this file — shipped defaults)
+#   brand override                 (token map or brand YAML file via the `brand` input)
+#   render-time overrides          (future: per-invocation override)
+#
+# Presentation components declare `tokens: [...]` in their BLOCK.md — the
+# publish gate (CP3) checks every declared token resolves after the merge.
+
+colors:
+  # Surface
+  page_bg: "#FFFFFF"
+  text: "#141414"
+  text_secondary: "#4A4A4A"
+  text_tertiary: "#7A7268"
+
+  # Accent (neutral default — brands override)
+  accent: "#1F3A68"
+  accent_2: "#D4A437"
+  accent_on: "#FFFFFF"
+
+  # Structure
+  border: "#E5DED1"
+  border_strong: "#CFC4AF"
+
+  # Inline tags / code / callouts
+  tag_bg: "#EFE5D6"
+  tag_fg: "#141414"
+  code_bg: "#F3EEE3"
+  code_fg: "#141414"
+
+  callout_info_bg: "#EAF1F4"
+  callout_info_accent: "#3A7D8B"
+  callout_warn_bg: "#F5EDDA"
+  callout_warn_accent: "#B8842A"
+  callout_danger_bg: "#F5E1E1"
+  callout_danger_accent: "#B53E3E"
+  callout_tip_bg: "#E8F0E2"
+  callout_tip_accent: "#5A8549"
+
+  step_circle_bg: "#1F3A68"
+  step_circle_fg: "#FFFFFF"
+
+fonts:
+  en:
+    primary: "Inter"
+    display: "Inter"
+    mono: "JetBrains Mono"
+    fallback: "system-ui, -apple-system, sans-serif"
+  ar:
+    primary: "Cairo"
+    display: "Cairo"
+    mono: "JetBrains Mono"
+    fallback: "Tahoma, sans-serif"
+
+identity:
+  author_name: ""
+  author_name_ar: ""
+  email: ""
+  phone: ""
+
+logo:
+  primary: null
+  max_height_mm: 18

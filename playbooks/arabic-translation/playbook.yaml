@@ -1,0 +1,171 @@
+name: Arabic Translation (Domain-Aware)
+type: playbook
+description: English → Modern Standard Arabic translation with domain detection, parallel specialist review, and human gate. Produces publication-ready Arabic tuned to the source document's domain (legal, medical, technical, academic, financial, marketing, social, blog, news).
+
+prerequisites:
+  - name: claude
+    check: "which claude"
+    install: "Install Claude Code CLI: https://docs.anthropic.com/en/docs/claude-code"
+    required: true
+  - name: python3
+    check: "which python3"
+    install: "brew install python3 (macOS) or apt install python3 (Linux)"
+    required: true
+
+hooks:
+  pre_run:
+    - id: brand-context
+      run: "python3 hooks/load-brand-context.py $inputs.domain_hint"
+      output: brand-context.json
+      timeout: 30
+
+timeout_strategy: static
+
+inputs:
+  - id: english_document
+    type: text
+    description: Source English document to translate (paste the full text — soft cap ~8,000 words; split longer documents)
+    required: true
+  - id: source_title
+    type: text
+    description: Short title for the document (used in file naming, e.g. "Q2 Product Launch")
+    required: false
+    default: ""
+  - id: domain_hint
+    type: select
+    description: Domain of the source document — pick "auto" to let the detector decide
+    required: false
+    default: auto
+    options:
+      - auto
+      - legal
+      - medical
+      - technical
+      - academic
+      - financial
+      - marketing
+      - social-media
+      - blog
+      - news
+
+roles:
+  - id: domain-detector
+    provider: claude
+    model: haiku
+    agent: roles/domain-detector.md
+
+  - id: translator
+    provider: claude
+    model: sonnet
+    agent: roles/translator.md
+
+  - id: linguistic-editor
+    provider: claude
+    model: sonnet
+    agent: roles/linguistic-editor.md
+
+  - id: domain-specialist
+    provider: claude
+    model: sonnet
+    agent: roles/domain-specialist.md
+
+  - id: cultural-reviewer
+    provider: claude
+    model: sonnet
+    agent: roles/cultural-reviewer.md
+
+  - id: consolidator
+    provider: claude
+    model: sonnet
+    agent: roles/consolidator.md
+
+phases:
+  - id: detect-domain
+    type: sequential
+    assignments:
+      - role: domain-detector
+        task: "Classify the domain of this English source document. User hint: $inputs.domain_hint (if not 'auto', weight it heavily but still verify). Source title: $inputs.source_title. Classify into one of: legal, medical, technical, academic, financial, marketing, social-media, blog, news. Emit a short report with: detected domain, confidence (high/medium/low), 2-sentence rationale, suggested MSA register (formal / business / conversational), and any domain-specific watchouts for the translator.\n\nSource document:\n$inputs.english_document"
+        output: detected-domain.md
+
+  - id: confirm-domain
+    type: human
+    depends_on: [detect-domain]
+    prompt: "Review the detected domain and suggested register. Type 'approved' to proceed, or type a correction (e.g. 'actually legal, not marketing' or 'switch register to formal'). Your response is passed to the translator."
+    assignments:
+      - role: domain-detector
+        task: "Prepare a concise one-page summary of the detection for human review: detected domain, confidence, rationale, register, and the key translation implications. Do not re-run detection — just summarise."
+        input: $phases.detect-domain.detected-domain
+        output: detection-summary.md
+
+  - id: translate-draft
+    type: sequential
+    depends_on: [confirm-domain]
+    assignments:
+      - role: translator
+        task: "Translate the English source into pan-Arab Modern Standard Arabic (فصحى). Read hooks/output/brand-context.md in full and apply: §1 Register by Domain (row matching the confirmed domain), §2 Domain Conventions (fidelity rules for legal/medical/technical/academic/financial; flow rules for marketing/social-media/blog/news). Always apply §3 anti-slop (all 7 subsections), §4 MSA grammar checklist (ARETA-based, with attention to §4.2 syntactic and §4.4 semantic — the LLM weak zones), §5 terminology & abbreviations (find-all on وكيل/وكلاء; gloss every English abbreviation on first use), §6 formatting & diacritics. Self-check against §7 quality gates before writing output — internal anti-slop score ≥35/50 and zero critical grammar errors. Preserve Markdown structure. Do not translate code, URLs, or numeric values. No dialect — not Khaleeji, Egyptian, Levantine, Maghrebi, or Iraqi. Treat human reply 'approved' as 'use detected domain'; otherwise follow the correction exactly.\n\nEnglish source:\n$inputs.english_document"
+        input:
+          - $phases.detect-domain.detected-domain
+          - hooks/output/brand-context.md
+        output: draft-ar.md
+
+  - id: specialist-review
+    type: parallel
+    depends_on: [translate-draft]
+    assignments:
+      - role: linguistic-editor
+        task: "Review the Arabic draft for linguistic quality using brand-context.md. Systematic scan in three passes: (1) §4 MSA grammar checklist — critical categories first (§4.2 syntactic and §4.4 semantic are LLM weak zones), then §4.6 translation-specific calques, then §4.1 orthographic, §4.3 morphological, §4.5 punctuation; (2) §3 anti-slop — all 7 subsections; (3) fidelity vs the English source and Markdown preservation. Each finding must cite its §-category. Compute both quality gates: §7.1 anti-slop score across 5 dimensions (threshold 35/50) and §7.2 grammar gate (0 critical XC/XG/XN/XF/SW/MT/§4.6 errors). Cap at 20 findings. No full rewrite — findings only. If no issues, return a 3-line 'no issues found' summary plus gate results.\n\nEnglish source for fidelity check:\n$inputs.english_document"
+        input:
+          - $phases.translate-draft.draft-ar
+          - hooks/output/brand-context.md
+        output: linguistic-review.md
+
+      - role: domain-specialist
+        task: "Review the Arabic draft for domain terminology, register, and semantic precision using brand-context.md. Systematic scan in four passes: (1) §2 domain conventions — terminology accuracy, register, preservation of domain-specific meaning (legal clauses, medical dosing, technical precision, financial figures); (2) §4.4 semantic precision (LLM weak zone) — verb-preposition pairings, false friends (متبادلة/المؤسسي/البياني/الفعّال/العمومي), tautological constructions, modifier attachment; (3) §5 terminology & abbreviations — polysemic-term qualification (find-all on وكيل/وكلاء/الذاكرة/الشبكة/السحابة), abbreviation introduction on first mention, proper nouns, numbers/currencies/units verbatim; (4) §4.6 compound-noun calques within the domain (senior/enterprise/institutional/general-purpose). Each finding cites its §-category. Cap at 20 findings. If no issues, return a 3-line 'no issues found' summary.\n\nEnglish source for terminology cross-check:\n$inputs.english_document"
+        input:
+          - $phases.detect-domain.detected-domain
+          - $phases.translate-draft.draft-ar
+          - hooks/output/brand-context.md
+        output: domain-review.md
+
+      - role: cultural-reviewer
+        task: "Review the Arabic draft for pan-Arab neutrality, literal Western carryover, tone/formality fit, and sensitivity. Four passes: (1) regional leakage — any Khaleeji, Egyptian, Levantine, Maghrebi, or Iraqi markers (flag aggressively — pan-Arab MSA only); (2) literal Western carryover — English idioms transliterated, culture-specific references, Western examples needing localisation or genericisation; (3) tone/formality mismatch for the genre; (4) religious/political/cultural sensitivities — flag and suggest neutralisation, never argue positions. Each finding cites its category. Do NOT suggest Gulf-specific replacements. Do not rewrite the draft — flag only. If no issues, return a 3-line 'no issues found' summary."
+        input:
+          - $phases.translate-draft.draft-ar
+        output: cultural-review.md
+
+  - id: consolidate
+    type: sequential
+    depends_on: [specialist-review]
+    assignments:
+      - role: consolidator
+        task: "Merge the three specialist reviews into the final Arabic translation. Read the draft and all three review files plus brand-context.md. Triage every finding by §-category and severity: always apply critical (XC/XG/XN/XF/SW/MT/§4.6 calques, §5.1 unqualified polysemic terms, §5.2 missing abbreviation gloss); apply major if rationale is sound; apply minor selectively. Resolve conflicts — fidelity beats style for legal/medical/technical/academic/financial, flow beats literal for marketing/social/blog/news. Final pass: §3 anti-slop (all subsections), §4 grammar (all categories, especially §4.2/§4.4 LLM weak zones), §5 terminology, §6 formatting. Verify §7 gates — §7.1 anti-slop score ≥35/50 and §7.2 zero critical grammar errors; if either still fails after consolidation, flag 'Residual risk' at top of review-notes. Output: (1) final-ar.md — publication-ready Arabic only, no commentary, no English; (2) consolidated-review-notes.md — log of what changed and why, plus residual-risk section if applicable."
+        input:
+          - $phases.translate-draft.draft-ar
+          - $phases.specialist-review.linguistic-review
+          - $phases.specialist-review.domain-review
+          - $phases.specialist-review.cultural-review
+        output: final-ar.md
+
+  - id: approve
+    type: gate
+    depends_on: [consolidate]
+    assignments:
+      - role: consolidator
+        task: "Prepare a final-approval summary: the Arabic translation, a brief list of notable choices (terminology, register, cultural adaptations), and anything the human should verify before publishing."
+        input:
+          - $phases.consolidate.final-ar
+        output: approval-summary.md
+
+output:
+  type: composite
+  vault_capture: true
+  items:
+    - type: artifact
+      file: final-ar.md
+    - type: knowledge
+      file: final-ar.md
+      vault_zone: content
+    - type: artifact
+      file: approval-summary.md
+  on_complete:
+    notify: true

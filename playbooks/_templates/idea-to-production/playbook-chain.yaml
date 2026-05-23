@@ -1,0 +1,36 @@
+name: Idea to Production
+type: playbook-chain
+description: End-to-end lifecycle from problem statement to delivered solution
+
+inputs:
+  - id: problem_statement
+    type: text
+    description: The problem to solve
+    required: true
+  - id: project_name
+    type: string
+    description: Name for the project
+    required: true
+
+nodes:
+  - id: design
+    playbook: solution-design
+    inputs:
+      problem_statement: $inputs.problem_statement
+      project_name: $inputs.project_name
+
+  - id: review
+    playbook: code-review
+    depends_on: [design]
+    inputs:
+      target_files: $nodes.design.output
+
+  - id: investigate
+    playbook: bug-investigation
+    depends_on: [review]
+    inputs:
+      bug_description: "Issues found in code review"
+      affected_area: $nodes.review.output
+
+on_failure:
+  strategy: halt-branch

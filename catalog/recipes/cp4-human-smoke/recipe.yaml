@@ -1,0 +1,22 @@
+name: cp4-human-smoke
+version: 1.0.0
+project: naseej
+description: |
+  CP4 smoke for ADR-023. Exercises the runner pause-intercept hook via
+  the new `human-form@1.0.0` component (component-syntax path, not the
+  legacy `human:` step type). Pauses until POST /api/recipes/runs/<id>/respond
+  fires with a matching response payload.
+
+inputs: []
+
+steps:
+  - id: ask
+    component: human-form@1.0.0
+    inputs:
+      prompt: "CP4 smoke — what is your favourite Naseej component slug?"
+      fields:
+        - name: slug
+          type: text
+          label: Component slug
+          required: true
+      timeout_sec: 120

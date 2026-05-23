@@ -1,0 +1,59 @@
+name: quality-check-and-log
+version: 1.0.0
+project: naseej
+description: |
+  Score a piece of prose against stop-slop and log the per-dimension breakdown
+  to the vault under a date-bucketed path. No notification step. Use for
+  reviewing drafts before sending without triggering Telegram noise.
+
+inputs:
+  - name: text
+    type: string
+    required: true
+  - name: label
+    type: string
+    default: untitled
+  - name: min_score
+    type: integer
+    default: 35
+
+steps:
+  - id: score
+    component: stop-slop@1.0.0
+    inputs:
+      text: "{{inputs.text}}"
+      min_score: "{{inputs.min_score}}"
+      block_on_fail: false
+
+  - id: log
+    component: vault-write@1.0.0
+    depends_on: [score]
+    inputs:
+      path: "inbox/_quality-checks/{{date}}-{{inputs.label}}-{{run_id}}.md"
+      frontmatter:
+        type: output
+        created: "{{date}}"
+        tags: [naseej, quality-check, stop-slop]
+        project: naseej
+        source_agent: naseej-runner
+      body: |
+        # Quality check — {{inputs.label}}
+
+        Score **{{steps.score.outputs.score}}/50** (passed against min_score={{inputs.min_score}}: {{steps.score.outputs.passed}})
+
+        **HARD violations**: {{steps.score.outputs.hard_violations.length}}
+        **Soft violations**: {{steps.score.outputs.soft_violation_count}}
+
+        ## Per-dimension
+
+        | dimension | score |
+        |---|---|
+        | directness | {{steps.score.outputs.per_dimension.directness}}/10 |
+        | rhythm | {{steps.score.outputs.per_dimension.rhythm}}/10 |
+        | trust | {{steps.score.outputs.per_dimension.trust}}/10 |
+        | authenticity | {{steps.score.outputs.per_dimension.authenticity}}/10 |
+        | density | {{steps.score.outputs.per_dimension.density}}/10 |
+
+        ## Source text
+
+        {{inputs.text}}

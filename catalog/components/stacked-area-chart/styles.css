@@ -1,0 +1,5 @@
+/* signal-trend-area — most styling is inline in the SVG/template (per-element
+   for WeasyPrint SVG fidelity). This sheet carries only the section spacing. */
+.naseej-stacked-area-chart {
+    margin: 1.4em 0;
+}

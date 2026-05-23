@@ -1,0 +1,26 @@
+{%- set has_head = (variant == 'numbered' and input.number) or input.eyebrow or input.title or input.intro %}
+<section class="naseej-section naseej-module naseej-module--{{ variant or 'plain' }}" lang="en">
+{%- if has_head %}
+    <div class="naseej-module__head">
+{%- if variant == 'numbered' and input.number %}
+        <div class="naseej-module__number">{{ input.number }}</div>
+{%- endif %}
+        <div class="naseej-module__headings">
+{%- if input.eyebrow %}
+            <div class="naseej-eyebrow naseej-eyebrow--accent" lang="en">{{ input.eyebrow }}</div>
+{%- endif %}
+{%- if input.title %}
+            <h2 class="naseej-module__title">{{ input.title }}</h2>
+{%- endif %}
+{%- if input.intro %}
+            <p class="naseej-module__intro">{{ input.intro }}</p>
+{%- endif %}
+        </div>
+    </div>
+{%- endif %}
+{%- if input.raw_body %}
+    <div class="naseej-module__body naseej-module__body--rich">{{ input.raw_body | safe }}</div>
+{%- elif input.body %}
+    <div class="naseej-module__body">{{ input.body }}</div>
+{%- endif %}
+</section>

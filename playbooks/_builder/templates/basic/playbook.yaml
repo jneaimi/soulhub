@@ -1,0 +1,28 @@
+name: "TODO: Playbook Name"
+type: playbook
+description: "TODO: What this playbook does"
+
+inputs:
+  - id: target
+    type: text
+    description: "TODO: What to provide"
+    required: true
+
+roles:
+  - id: agent
+    provider: claude
+    model: sonnet
+    agent: roles/agent.md
+
+phases:
+  - id: execute
+    type: sequential
+    assignments:
+      - role: agent
+        task: "TODO: What the agent should do with $inputs.target"
+        output: result.md
+
+output:
+  type: artifact
+  file: result.md
+  vault_capture: true

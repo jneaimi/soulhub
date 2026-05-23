@@ -1,0 +1,45 @@
+{%- set items = input.items or [] -%}
+{%- set values = items | map(attribute='value') | list -%}
+{%- set max_value = values | max if values else 1 -%}
+{%- set bar_count = items | length -%}
+{%- set row_height = 30 -%}
+{%- set chart_top = 32 -%}
+{%- set bottom_pad = 12 -%}
+{%- set svg_height = chart_top + (bar_count * row_height) + bottom_pad -%}
+{%- set baseline_y = chart_top + (bar_count * row_height) -%}
+{%- set bar_origin_x = 360 -%}
+{%- set bar_max_width = 290 -%}
+{%- set bar_min_width = 6 -%}
+<section class="naseej-section naseej-horizontal-bar-chart naseej-horizontal-bar-chart--rtl" lang="ar" dir="rtl">
+{%- if input.title %}
+    <h3 class="naseej-horizontal-bar-chart__title">{{ input.title }}</h3>
+{%- endif %}
+{%- if input.eyebrow %}
+    <div class="naseej-horizontal-bar-chart__eyebrow">{{ input.eyebrow }}</div>
+{%- endif %}
+    <figure class="naseej-horizontal-bar-chart__figure" role="group" aria-label="رسم كثافة الخطاب لكل تكتل">
+        <svg class="naseej-horizontal-bar-chart__svg" viewBox="0 0 600 {{ svg_height }}" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMinYMin meet">
+{%- if input.x_axis_label %}
+            <text x="{{ bar_origin_x }}" y="13" text-anchor="end" class="naseej-horizontal-bar-chart__axis-label">{{ input.x_axis_label }}</text>
+{%- endif %}
+            <line x1="{{ bar_origin_x }}" y1="20" x2="{{ bar_origin_x }}" y2="{{ baseline_y }}" class="naseej-horizontal-bar-chart__grid-line"/>
+            <line x1="{{ bar_origin_x }}" y1="{{ baseline_y }}" x2="{{ bar_origin_x - bar_max_width - 50 }}" y2="{{ baseline_y }}" class="naseej-horizontal-bar-chart__baseline"/>
+{%- for item in items %}
+{%- set ratio = (item.value | float) / (max_value | float) if max_value else 0 -%}
+{%- set computed = (ratio * bar_max_width) | round(0, 'common') | int -%}
+{%- set bar_width = [computed, bar_min_width] | max -%}
+{%- set y = chart_top + loop.index0 * row_height -%}
+{%- set text_y = y + 16 -%}
+{%- set bar_x = bar_origin_x - bar_width -%}
+{%- set value_x = bar_x - 8 -%}
+{%- set tier = item.intensity or 'mid' -%}
+            <rect x="{{ bar_x }}" y="{{ y }}" width="{{ bar_width }}" height="22" class="naseej-horizontal-bar-chart__bar naseej-horizontal-bar-chart__bar--{{ tier }}"/>
+            <text x="{{ bar_origin_x + 2 }}" y="{{ text_y }}" class="naseej-horizontal-bar-chart__label">{{ item.label }}</text>
+            <text x="{{ value_x }}" y="{{ text_y }}" text-anchor="end" class="naseej-horizontal-bar-chart__value">{{ item.value_display }}</text>
+{%- endfor %}
+        </svg>
+{%- if input.caption %}
+        <figcaption class="naseej-horizontal-bar-chart__caption">{{ input.caption }}</figcaption>
+{%- endif %}
+    </figure>
+</section>

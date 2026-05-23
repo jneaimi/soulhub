@@ -1,0 +1,35 @@
+name: agent-smoke-naseej
+version: 1.0.0
+project: naseej
+description: |
+  First live agent recipe (ADR-005 CP2 keystone). Drives the `inspector`
+  agent on a tiny verification task with a tight budget override to keep
+  end-to-end spend under $0.10 per run. Closes falsifier #1 (agent step
+  end-to-end via the runner).
+
+  The task asks inspector to check whether a known file exists in the
+  working directory and report one of two literal lines. The goal_condition
+  ends the session as soon as the verification line is written, so the
+  PTY backend exits gracefully via the goal-loop without burning the
+  600s default timeout.
+
+  Re-authored for ADR-023 CP5: `agent:` step type replaced with
+  `component: agent-dispatch@1.0.0`. Budget fields flattened into inputs.
+
+steps:
+  - id: verify
+    component: agent-dispatch@1.0.0
+    inputs:
+      agent: inspector
+      task: |
+        Verify that the file projects/naseej/index.md exists in the current
+        working directory (which is the vault root). Use the Read tool once.
+        Report a single line — either exactly "VERIFIED: naseej index exists"
+        or exactly "MISSING: naseej index not found". Do not iterate, do not
+        run tests, do not invoke any other tools, do not write any files,
+        do not load any vault context. This is a minimum-spend dispatch smoke,
+        not a real QA pass.
+      timeout_sec: 180
+      max_turns: 4
+      max_usd: 0.10
+      goal_condition: a verification line was written to stdout

@@ -1,0 +1,61 @@
+#!/usr/bin/env -S uv run python
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""claude-stub — fake `claude -p` for text-correct component tests.
+
+Emits the JSON envelope `claude -p --output-format json` produces, with the
+`result` set to a substitution-map array. Behaviour is driven by env vars the
+test sets (they propagate through run.py to here):
+
+  STUB_MODE=ok      (default) → envelope with result=$STUB_MAP, exit 0
+  STUB_MODE=exit1            → exit 1, empty stdout (CLI hard failure)
+  STUB_MODE=garbage          → non-JSON stdout, exit 0
+  STUB_MODE=error            → envelope is_error=true, exit 0
+  STUB_MAP='[...]'           → the substitution array echoed as result (default '[]')
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("-p", dest="prompt", required=True)
+    p.add_argument("--output-format", default="json")
+    p.add_argument("--model", default="claude-sonnet-4-6")
+    p.add_argument("--append-system-prompt", dest="system_prompt", default="")
+    p.add_argument("--dangerously-skip-permissions", action="store_true")
+    p.add_argument("--allowedTools", dest="allowed_tools", default=None)
+    p.add_argument("--setting-sources", dest="setting_sources", default=None)
+    p.add_argument("--exclude-dynamic-system-prompt-sections", action="store_true")
+    p.add_argument("--max-budget-usd", dest="max_budget_usd", default=None)
+    p.add_argument("--json-schema", dest="json_schema", default=None)
+    p.parse_args()
+
+    mode = os.environ.get("STUB_MODE", "ok")
+    if mode == "exit1":
+        return 1
+    if mode == "garbage":
+        print("this is not json at all")
+        return 0
+    if mode == "error":
+        print(json.dumps({"result": "filtered", "is_error": True, "total_cost_usd": 0.0}))
+        return 0
+
+    stub_map = os.environ.get("STUB_MAP", "[]")
+    print(json.dumps({
+        "result": stub_map,
+        "is_error": False,
+        "num_turns": 1,
+        "total_cost_usd": 0.0021,
+        "model": "claude-sonnet-4-6",
+    }))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

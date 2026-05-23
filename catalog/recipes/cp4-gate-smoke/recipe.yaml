@@ -1,0 +1,18 @@
+name: cp4-gate-smoke
+version: 1.0.0
+project: naseej
+description: |
+  CP4 smoke for ADR-023. Exercises the runner pause-intercept hook via
+  the new `approval-gate@1.0.0` component (component-syntax path, not the
+  legacy `gate:` step type). Pauses until POST /api/recipes/runs/<id>/respond
+  fires with a matching `{decision, comment?}` payload.
+
+inputs: []
+
+steps:
+  - id: approve
+    component: approval-gate@1.0.0
+    inputs:
+      prompt: "CP4 smoke — approve the ADR-023 component-first migration?"
+      allow_comment: true
+      timeout_sec: 120

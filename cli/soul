@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Soul Hub CLI shim — ADR-001 (soul-hub-cli), Phase 1.
+# Runs the TS entry under Node's experimental-strip-types so no build step
+# is needed. Resolves the real script dir even when invoked via symlink.
+set -e
+
+if command -v realpath >/dev/null 2>&1; then
+  SELF="$(realpath "$0")"
+else
+  SELF="$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$0")"
+fi
+DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+exec node --experimental-strip-types --no-warnings=ExperimentalWarning \
+  "$DIR/src/index.ts" "$@"

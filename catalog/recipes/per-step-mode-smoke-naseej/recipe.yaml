@@ -1,0 +1,48 @@
+name: per-step-mode-smoke-naseej
+version: 1.0.0
+project: naseej
+description: |
+  ADR-020 smoke. Two agent steps that explicitly request different dispatch
+  backends per step. Step 1 pins `mode: production` (claude-pty, goal-loop
+  active). Step 2 pins `mode: oneshot` (claude-cli-flag, no `/goal` line).
+  The recipe itself sets no top-level mode — the runner resolves each step's
+  override independently.
+
+  Verification — read the per-run stream:
+    - Step 1 logs `[agents/claude-pty] goal-mode active for verify-pty …`
+    - Step 2 logs `claude-cli-flag` backend dispatch, no `/goal` line, no PTY
+    - Both steps exit 0; total spend <$0.20
+
+  Invoke with mode unset (so recipe-wide defaults to 'production') — the
+  per-step `mode: oneshot` on step 2 must still flip the backend independently.
+
+  Re-authored for ADR-023 CP5: `agent:` step types replaced with
+  `component: agent-dispatch@1.0.0`. Per-step `mode:` moved into inputs.
+  Budget fields flattened into inputs.
+
+steps:
+  - id: verify-pty
+    component: agent-dispatch@1.0.0
+    inputs:
+      agent: inspector
+      mode: production
+      task: |
+        Single-line probe. Use no tools. Reply with exactly:
+        "MODE-A: production dispatch reached".
+      timeout_sec: 120
+      max_turns: 2
+      max_usd: 0.10
+      goal_condition: the MODE-A line was written to stdout
+
+  - id: verify-oneshot
+    component: agent-dispatch@1.0.0
+    depends_on: [verify-pty]
+    inputs:
+      agent: inspector
+      mode: oneshot
+      task: |
+        Single-line probe. Use no tools. Reply with exactly:
+        "MODE-B: oneshot dispatch reached".
+      timeout_sec: 120
+      max_turns: 2
+      max_usd: 0.10

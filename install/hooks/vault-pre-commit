@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""ADR-048 — Vault pre-commit link validator (third layer of defense).
+
+ADR-046 Pass 1 (Write/Edit/NotebookEdit hook) catches Claude Code's direct file
+tools. Pass 2 (Bash hook) catches shell-redirect/cp/sed -i/etc. Together they
+push AI writes through the soul-hub API, where ADR-047 enforces wikilink rules.
+
+Both PreToolUse hooks operate on tool *invocations*. They cannot see writes
+performed by an inline interpreter — `python -c 'open(p,"w").write(...)'` is
+one Bash call whose payload is opaque to a regex-based shell parser. This
+hook closes that gap by re-running the two REFUSE rules from ADR-047 against
+every staged .md file at commit time. The unresolved-target rule is omitted
+deliberately — it's a WARN in the API, not a REFUSE.
+
+Bypass: `git commit --no-verify` (explicit operator override) or
+`VAULT_SKIP_LINK_CHECK=1 git commit` (env override for batch operations).
+
+Exempt zones mirror the chokepoint: .vault/, .git/, .gitnexus/, .obsidian/.
+"""
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+VAULT_ROOT = Path(__file__).resolve().parents[2]
+
+EXEMPT_PREFIXES = (".vault/", ".git/", ".gitnexus/", ".obsidian/", ".trash/")
+
+# Mirrors src/lib/vault/link-validator.ts
+AUTO_MEMORY_RE = re.compile(r"^(?:feedback|project|user|reference)_[a-z][a-z0-9_-]*$")
+BARE_SLUG_RE = re.compile(r"^[a-z][a-z0-9-]+$")
+
+# Mirrors src/lib/vault/parser.ts WIKILINK_RE (post-strip).
+WIKILINK_RE = re.compile(
+    r"(!?)\[\[([^\]\n|#^]+?)(?:#([^\]\n|]+?))?(?:\^([^\]\n|]+?))?(?:\|([^\]\n]+?))?\]\]"
+)
+
+
+def staged_files():
+    """List staged .md files under the vault, excluding exempt zones."""
+    out = subprocess.run(
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM", "-z"],
+        cwd=VAULT_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    paths = [p for p in out.stdout.split("\0") if p]
+    return [
+        p for p in paths
+        if p.endswith(".md") and not any(p.startswith(ex) for ex in EXEMPT_PREFIXES)
+    ]
+
+
+def staged_content(path):
+    """Read the staged blob (what would actually be committed)."""
+    out = subprocess.run(
+        ["git", "show", f":{path}"],
+        cwd=VAULT_ROOT,
+        capture_output=True,
+        check=False,
+    )
+    if out.returncode != 0:
+        return None
+    try:
+        return out.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def strip_frontmatter(raw):
+    """Same logic as gray-matter: strip leading --- ... --- block."""
+    if not raw.startswith("---\n"):
+        return raw
+    end = raw.find("\n---\n", 4)
+    if end < 0:
+        return raw
+    return raw[end + 5:]
+
+
+def strip_code(content):
+    """Mirror parser.ts: fenced blocks first (`` `{3,}` `` or `~{3,}`), then
+    CommonMark variable-backtick inline (`+`...`\1`). Identical pre-strip to
+    keep this hook's findings in sync with the API validator."""
+    content = re.sub(r"(`{3,}|~{3,})[\s\S]*?\1", "", content)
+    content = re.sub(r"(`+)[\s\S]*?\1", "", content)
+    return content
+
+
+def has_project_index(slug):
+    """BARE_SLUG_RE rule needs to know if `projects/<slug>/index.md` exists.
+    Check the working tree (cheap, accurate for the operator's local state)."""
+    return (VAULT_ROOT / "projects" / slug / "index.md").is_file()
+
+
+def validate(path, raw):
+    """Return list of (rule, link, suggestion) violations for one file."""
+    body = strip_code(strip_frontmatter(raw))
+    issues = []
+    seen = set()
+    for m in WIKILINK_RE.finditer(body):
+        if m.group(1) == "!":
+            continue  # embed
+        link = m.group(2).strip()
+        if not link or link in seen:
+            continue
+
+        if AUTO_MEMORY_RE.match(link):
+            seen.add(link)
+            issues.append((
+                "auto-memory-wikilink",
+                link,
+                f"Wikilinks to auto-memory filenames are forbidden (CLAUDE.md). "
+                f"Use inline backticks: `{link}`",
+            ))
+            continue
+
+        if BARE_SLUG_RE.match(link) and has_project_index(link):
+            seen.add(link)
+            issues.append((
+                "bare-project-slug",
+                link,
+                f"Project references must use `[[{link}/index]]` "
+                f"(or `[[{link}/index|{link}]]` to preserve the bare display).",
+            ))
+            continue
+    return issues
+
+
+def main():
+    if os.environ.get("VAULT_SKIP_LINK_CHECK") == "1":
+        sys.stderr.write("[vault-pre-commit] skipped via VAULT_SKIP_LINK_CHECK=1\n")
+        return 0
+
+    files = staged_files()
+    if not files:
+        return 0
+
+    failures = []  # list of (path, [issues])
+    for path in files:
+        raw = staged_content(path)
+        if raw is None:
+            continue
+        issues = validate(path, raw)
+        if issues:
+            failures.append((path, issues))
+
+    if not failures:
+        return 0
+
+    sys.stderr.write("\n")
+    sys.stderr.write("╭─ vault pre-commit: wikilink validation failed ─╮\n")
+    sys.stderr.write("│ ADR-048 backstop blocked the commit. The same rules\n")
+    sys.stderr.write("│ as ADR-047 (write-time API) ran against staged blobs.\n")
+    sys.stderr.write("╰─────────────────────────────────────────────────╯\n\n")
+    for path, issues in failures:
+        sys.stderr.write(f"  {path}\n")
+        for rule, link, suggestion in issues:
+            sys.stderr.write(f"    ✗ [{rule}] [[{link}]]\n")
+            sys.stderr.write(f"      → {suggestion}\n")
+        sys.stderr.write("\n")
+    sys.stderr.write("Fix the links and re-stage, OR bypass with:\n")
+    sys.stderr.write("  • git commit --no-verify        (one-shot explicit override)\n")
+    sys.stderr.write("  • VAULT_SKIP_LINK_CHECK=1 ...   (env-scoped override)\n\n")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

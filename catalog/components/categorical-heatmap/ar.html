@@ -1,0 +1,43 @@
+{%- set rows = input.rows or [] -%}
+{%- set columns = input.columns or [] -%}
+<section class="naseej-section naseej-categorical-heatmap naseej-categorical-heatmap--rtl" lang="ar" dir="rtl">
+{%- if input.title %}
+    <h3 style="margin: 0 0 0.4em 0; font-size: 14pt; line-height: 1.3;">{{ input.title }}</h3>
+{%- endif %}
+{%- if input.eyebrow %}
+    <div style="font-size: 9pt; letter-spacing: 0.08em; color: var(--accent); font-weight: 700; margin-bottom: 0.6em;">{{ input.eyebrow }}</div>
+{%- endif %}
+    <figure style="margin: 0; page-break-inside: avoid;" role="group" aria-label="خريطة حرارية تصنيفية">
+        <table style="width: 100%; border-collapse: collapse; font-size: 9.5pt;">
+            <thead>
+                <tr style="border-bottom: 0.6pt solid #A1A1AA;">
+                    <th style="text-align: right; padding: 6pt 4pt; font-size: 8pt; letter-spacing: 0.04em; color: var(--text-secondary); font-weight: 600;"></th>
+{%- for col in columns %}
+                    <th style="text-align: center; padding: 6pt 4pt; font-size: 8pt; letter-spacing: 0.04em; color: var(--text-secondary); font-weight: 600;">{{ col }}</th>
+{%- endfor %}
+                </tr>
+            </thead>
+            <tbody>
+{%- for row in rows %}
+                <tr>
+                    <td style="padding: 8pt 4pt; color: #18181B;">{{ row.label }}</td>
+{%- for cell in row.cells %}
+{%- set tier = cell | upper -%}
+{%- if tier == 'HIGH' -%}
+{%- set bg = '#F59E0B' -%}{% set fg = '#FFFFFF' %}{% set ar_label = 'عالي' %}
+{%- elif tier == 'MED' or tier == 'MEDIUM' -%}
+{%- set bg = '#FCD34D' -%}{% set fg = '#18181B' %}{% set ar_label = 'متوسط' %}
+{%- else -%}
+{%- set bg = '#FED7AA' -%}{% set fg = '#18181B' %}{% set ar_label = 'منخفض' %}
+{%- endif %}
+                    <td style="padding: 6pt 4pt; text-align: center;"><span style="display: inline-block; padding: 2pt 8pt; background: {{ bg }}; color: {{ fg }}; font-weight: 700; font-size: 8pt;">{{ ar_label }}</span></td>
+{%- endfor %}
+                </tr>
+{%- endfor %}
+            </tbody>
+        </table>
+{%- if input.caption %}
+        <figcaption style="font-size: 8.5pt; color: var(--text-secondary); font-style: italic; margin-top: 10pt; line-height: 1.45;">{{ input.caption }}</figcaption>
+{%- endif %}
+    </figure>
+</section>

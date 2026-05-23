@@ -1,0 +1,48 @@
+{%- set bands = input.bands or [] -%}
+{%- set x_ticks = input.x_ticks or [] -%}
+{%- set y_ticks = input.y_ticks or [] -%}
+{%- set geo = input.chart_geometry or {} -%}
+{%- set view_w = geo.view_w | default(600) -%}
+{%- set view_h = geo.view_h | default(240) -%}
+{%- set chart_top = geo.chart_top | default(20) -%}
+{%- set chart_bottom = geo.chart_bottom | default(210) -%}
+{%- set chart_left = geo.chart_left | default(40) -%}
+{%- set chart_right = geo.chart_right | default(580) -%}
+<section class="naseej-section naseej-stacked-area-chart" lang="en">
+{%- if input.title %}
+    <h3 style="margin: 0 0 0.4em 0; font-size: 14pt; line-height: 1.3;">{{ input.title }}</h3>
+{%- endif %}
+{%- if input.eyebrow %}
+    <div style="font-size: 9pt; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); font-weight: 700; margin-bottom: 0.6em;">{{ input.eyebrow }}</div>
+{%- endif %}
+    <figure style="margin: 0; page-break-inside: avoid;" role="group" aria-label="Signal volume trend chart">
+        <svg viewBox="0 0 {{ view_w }} {{ view_h }}" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMinYMin meet" style="width: 100%; height: auto; display: block;">
+{%- for tick in y_ticks %}
+            <line x1="{{ chart_left }}" y1="{{ tick.y }}" x2="{{ chart_right }}" y2="{{ tick.y }}" stroke="#E4E4E7" stroke-width="0.4"/>
+            <text x="{{ chart_left - 6 }}" y="{{ tick.y + 3 }}" font-size="8" fill="#71717A" text-anchor="end">{{ tick.label }}</text>
+{%- endfor %}
+{%- if input.today_x is defined and input.today_x is not none %}
+            <line x1="{{ input.today_x }}" y1="{{ chart_top }}" x2="{{ input.today_x }}" y2="{{ chart_bottom }}" stroke="#F59E0B" stroke-width="1" stroke-dasharray="3,2" opacity="0.7"/>
+{%- endif %}
+{%- for band in bands %}
+            <polygon points="{{ band.points }}" fill="{{ band.color }}" stroke="#FFFFFF" stroke-width="0.4"/>
+{%- endfor %}
+            <line x1="{{ chart_left }}" y1="{{ chart_bottom }}" x2="{{ chart_right }}" y2="{{ chart_bottom }}" stroke="#A1A1AA" stroke-width="0.75"/>
+{%- for tick in x_ticks %}
+            <line x1="{{ tick.x }}" y1="{{ chart_bottom }}" x2="{{ tick.x }}" y2="{{ chart_bottom + 3 }}" stroke="#A1A1AA" stroke-width="0.5"/>
+            <text x="{{ tick.x }}" y="{{ chart_bottom + 14 }}" font-size="8" fill="#3F3F46" text-anchor="middle">{{ tick.label }}</text>
+{%- endfor %}
+{%- if input.today_x is defined and input.today_x is not none %}
+            <text x="{{ input.today_x }}" y="{{ chart_top - 6 }}" font-size="8" fill="#F59E0B" font-weight="700" text-anchor="middle" letter-spacing="0.08em">TODAY</text>
+{%- endif %}
+        </svg>
+        <div style="display: flex; flex-wrap: wrap; gap: 8pt 16pt; margin-top: 6pt; font-size: 8.5pt; color: #3F3F46;">
+{%- for band in bands %}
+            <span style="display: inline-flex; align-items: center; gap: 4pt;"><span style="display: inline-block; width: 9pt; height: 9pt; background: {{ band.color }};"></span>{{ band.cluster }}{%- if band.today_value %} <span style="color: #71717A;">· {{ band.today_value }} today</span>{%- endif %}</span>
+{%- endfor %}
+        </div>
+{%- if input.caption %}
+        <figcaption style="font-size: 8.5pt; color: var(--text-secondary); font-style: italic; margin-top: 8pt; line-height: 1.45;">{{ input.caption }}</figcaption>
+{%- endif %}
+    </figure>
+</section>

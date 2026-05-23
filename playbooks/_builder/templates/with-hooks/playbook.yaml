@@ -1,0 +1,38 @@
+name: "TODO: Playbook with Hooks"
+type: playbook
+description: "TODO: What this playbook does"
+
+prerequisites:
+  - claude
+  - python3
+
+pre_run:
+  - hook: hooks/scan.py
+    timeout: 30
+
+timeout_strategy: auto
+
+inputs:
+  - id: target
+    type: text
+    description: "TODO: What to review"
+    required: true
+
+roles:
+  - id: reviewer
+    provider: claude
+    model: sonnet
+    agent: roles/reviewer.md
+
+phases:
+  - id: review
+    type: parallel
+    assignments:
+      - role: reviewer
+        task: "TODO: Review $inputs.target using scan results"
+        output: review.md
+
+output:
+  type: artifact
+  file: review.md
+  vault_capture: true

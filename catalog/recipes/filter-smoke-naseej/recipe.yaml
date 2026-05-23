@@ -1,0 +1,66 @@
+name: filter-smoke-naseej
+version: 1.0.0
+project: naseej
+description: |
+  ADR-006 S2 precursor smoke. Verifies the templating engine's new context
+  globals (HOME, work_dir) + the four filters (basename, dirname,
+  human_bytes, date_fmt) all interpolate cleanly through input defaults +
+  step inputs. Composes existing Tier-2 components only — the full
+  shell-smoke-naseej lands in S3 alongside shell-exec.
+
+inputs:
+  - name: text
+    type: string
+    default: "ADR-006 S2 templating smoke. HOME, work_dir, and four filters all wired up."
+  - name: today_short
+    type: string
+    default: "{{date | date_fmt:DD/MM/YYYY}}"
+  - name: work_basename
+    type: string
+    default: "{{work_dir | basename}}"
+
+steps:
+  - id: score
+    component: stop-slop@1.0.0
+    inputs:
+      text: "{{inputs.text}}"
+      rubric: default
+      min_score: 0
+      block_on_fail: false
+
+  - id: log
+    component: vault-write@1.0.0
+    depends_on: [score]
+    inputs:
+      path: "inbox/_naseej-runs/{{date}}-{{run_id}}-filter-smoke.md"
+      frontmatter:
+        type: output
+        created: "{{date}}"
+        tags: [naseej, filter-smoke, adr-006-s2, auto-generated]
+        project: naseej
+        run_id: "{{run_id}}"
+        source_agent: naseej-runner
+      body: |
+        # filter-smoke run {{run_id}}
+
+        ADR-006 S2 verification. Filters resolved at recipe-start (defaults)
+        and at step-time (this body), all against the same ctx.
+
+        ## Context globals (ADR-006 D2)
+
+        - `HOME`: `{{HOME}}`
+        - `work_dir`: `{{work_dir}}`
+        - `work_dir | basename`: `{{work_dir | basename}}`
+        - `work_dir | dirname`: `{{work_dir | dirname}}`
+        - `date`: `{{date}}`
+        - `date | date_fmt:DD/MM/YYYY`: `{{date | date_fmt:DD/MM/YYYY}}`
+
+        ## Default-time filter resolution (ADR-006 S2)
+
+        - `inputs.today_short`: `{{inputs.today_short}}` (resolved from default `date_fmt:DD/MM/YYYY`)
+        - `inputs.work_basename`: `{{inputs.work_basename}}` (resolved from default `work_dir | basename`)
+
+        ## Step output filter resolution (ADR-006 D3)
+
+        - `steps.score.outputs.score`: `{{steps.score.outputs.score}}`
+        - `steps.score.outputs.score | human_bytes`: `{{steps.score.outputs.score | human_bytes}}` (filter applied to integer — 49 → 49B)

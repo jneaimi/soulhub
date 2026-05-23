@@ -1,0 +1,14 @@
+name: timeout-smoke-naseej
+version: 1.0.0
+project: naseej
+description: |
+  ADR-011 timeout test — 2s pause, no responder, expect fail.
+
+  Re-authored for ADR-023 CP5: `human:` block replaced with
+  `component: human-form@1.0.0`.
+steps:
+  - id: ask
+    component: human-form@1.0.0
+    inputs:
+      prompt: "anyone home?"
+      timeout_sec: 2

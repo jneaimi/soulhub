@@ -1,0 +1,183 @@
+name: Content Creation
+type: playbook
+description: Research-driven content creation with brand voice, editorial review, and human feedback
+
+prerequisites:
+  - name: claude
+    check: "which claude"
+    install: "Install Claude Code CLI: https://docs.anthropic.com/en/docs/claude-code"
+    required: true
+  - name: python3
+    check: "which python3"
+    install: "brew install python3 (macOS) or apt install python3 (Linux)"
+    required: true
+  - name: APIDIRECT_API_KEY
+    check: "test -n \"$APIDIRECT_API_KEY\""
+    install: "Set APIDIRECT_API_KEY in environment for live social signal research. Without it, the researcher uses training knowledge only."
+    required: false
+
+hooks:
+  pre_run:
+    - id: gather-signals
+      run: "python3 hooks/gather-signals.py \"$inputs.topic\" \"$inputs.format\""
+      output: signals-result.json
+      timeout: 45
+    - id: load-brand-context
+      run: "python3 hooks/load-brand-context.py \"$inputs.brand_voice\" \"$inputs.format\" \"$inputs.audience\""
+      output: brand-context.json
+      timeout: 10
+
+inputs:
+  - id: topic
+    type: text
+    description: The topic or subject to write about
+    required: true
+  - id: format
+    type: select
+    description: Content format
+    required: true
+    options: [blog-post, newsletter, linkedin-post, technical-article]
+    default: blog-post
+  - id: audience
+    type: text
+    description: Target audience
+    required: false
+    default: "professionals and decision-makers"
+  - id: brand_voice
+    type: text
+    description: Brand voice description (leave empty for default professional tone)
+    required: false
+    default: ""
+  - id: reference_urls
+    type: text
+    description: Optional reference URLs for the researcher to check (comma-separated)
+    required: false
+    default: ""
+  - id: enable_critic
+    type: select
+    description: Enable audience critic review (adds an AI reader who evaluates from the audience perspective)
+    required: false
+    options: ["true", "false"]
+    default: "true"
+
+roles:
+  - id: researcher
+    provider: claude
+    model: sonnet
+    agent: roles/researcher.md
+  - id: writer
+    provider: claude
+    model: sonnet
+    agent: roles/writer.md
+  - id: editor
+    provider: claude
+    model: sonnet
+    agent: roles/editor.md
+  - id: critic
+    provider: claude
+    model: sonnet
+    agent: roles/critic.md
+
+phases:
+  - id: research
+    type: sequential
+    assignments:
+      - role: researcher
+        task: "Research the topic: $inputs.topic. Read the social signals report at hooks/output/signals-report.md for trending data. Target audience: $inputs.audience. Content format: $inputs.format. Reference URLs to check: $inputs.reference_urls"
+        input: hooks/output/signals-report.md
+        output: research-brief.md
+
+  - id: draft
+    type: sequential
+    depends_on: [research]
+    assignments:
+      - role: writer
+        task: "Write a $inputs.format about: $inputs.topic. Read the research brief for data and insights. Read the brand context at hooks/output/brand-context.md for voice, format rules, and anti-slop guidelines. Target audience: $inputs.audience"
+        input:
+          - $phases.research.research-brief
+          - hooks/output/brand-context.md
+        output: first-draft.md
+
+  - id: edit
+    type: handoff
+    depends_on: [draft]
+    between: [writer, editor]
+    loop_until: "review contains 'APPROVED'"
+    max_iterations: 2
+    assignments:
+      - role: writer
+        task: "Revise the draft based on editorial feedback. Keep the brand voice and anti-slop rules from hooks/output/brand-context.md"
+        input:
+          - $phases.draft.first-draft
+          - hooks/output/brand-context.md
+        output: revised-draft.md
+      - role: editor
+        task: "Review the content against the brand context at hooks/output/brand-context.md. Check: clarity, accuracy, tone match, anti-slop compliance, format guidelines. If it meets standards, write APPROVED at the top. If not, provide specific actionable feedback."
+        input: hooks/output/brand-context.md
+        output: editorial-review.md
+
+  - id: critic-review
+    type: sequential
+    depends_on: [edit]
+    skip_if: "$inputs.enable_critic == false"
+    assignments:
+      - role: critic
+        task: "Read this draft as if you're the target audience ($inputs.audience). Answer the 5 audience questions in your role instructions. Be honest — would you keep reading, share this, or scroll past?"
+        input:
+          - $phases.edit.revised-draft
+          - $phases.research.research-brief
+        output: audience-review.md
+
+  - id: human-review
+    type: human
+    depends_on: [edit, critic-review]
+    prompt: "Review the draft below. Type your feedback (e.g. 'Make the intro shorter, add a real-world example in section 2') or type 'approved' if ready to publish."
+    assignments:
+      - role: editor
+        task: "Prepare the current draft for human review. Present: the final draft, a brief editor summary of what was changed, any remaining concerns, and the audience critic's review if available."
+        input:
+          - $phases.edit.revised-draft
+          - $phases.edit.editorial-review
+          - $phases.critic-review.audience-review
+        output: review-package.md
+
+  - id: final-revision
+    type: sequential
+    depends_on: [human-review]
+    assignments:
+      - role: writer
+        task: "Apply the human reviewer's feedback to produce the final version. Read their feedback carefully and address every point. Keep the brand voice from hooks/output/brand-context.md"
+        input:
+          - $phases.edit.revised-draft
+          - $phases.human-review.human-response
+          - hooks/output/brand-context.md
+        output: final-content.md
+
+  - id: approve
+    type: gate
+    depends_on: [final-revision]
+    prompt: "Final approval: Review the revised content. Approve to publish or reject to end the run."
+    assignments:
+      - role: editor
+        task: "Provide a final one-paragraph summary: what was written, key changes from feedback, and publication readiness."
+        input: $phases.final-revision.final-content
+        output: publish-summary.md
+
+output:
+  type: composite
+  vault_capture: true
+  items:
+    - type: artifact
+      file: final-content.md
+    - type: knowledge
+      file: final-content.md
+      vault_zone: content
+      description: Final published content
+    - type: knowledge
+      file: research-brief.md
+      vault_zone: knowledge/research
+      description: Research brief for content creation
+    - type: artifact
+      file: publish-summary.md
+  on_complete:
+    notify: true

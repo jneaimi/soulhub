@@ -1,0 +1,44 @@
+name: "TODO: Parallel Review Name"
+type: playbook
+description: "TODO: What this parallel review does"
+
+inputs:
+  - id: target
+    type: text
+    description: "TODO: What to review"
+    required: true
+
+roles:
+  - id: reviewer-a
+    provider: claude
+    model: sonnet
+    agent: roles/reviewer-a.md
+
+  - id: reviewer-b
+    provider: claude
+    model: sonnet
+    agent: roles/reviewer-b.md
+
+phases:
+  - id: review
+    type: parallel
+    assignments:
+      - role: reviewer-a
+        task: "TODO: First reviewer's focus on $inputs.target"
+        output: review-a.md
+      - role: reviewer-b
+        task: "TODO: Second reviewer's focus on $inputs.target"
+        output: review-b.md
+
+  - id: consolidate
+    type: sequential
+    depends_on: [review]
+    assignments:
+      - role: reviewer-a
+        task: "TODO: Merge findings from $phases.review.review-a and $phases.review.review-b"
+        output: consolidated.md
+
+output:
+  type: artifact
+  file: consolidated.md
+  vault_capture: true

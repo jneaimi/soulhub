@@ -1,0 +1,23 @@
+<section class="naseej-cover {% if input.image %}naseej-cover--image-background{% else %}naseej-cover--minimalist-typographic{% endif %}" lang="en"
+{%- if input.image %} style="background-image: url('{{ input.image }}');"{% endif %}>
+{%- if logo and logo.primary %}
+    <img class="naseej-cover__logo" src="{{ logo.primary }}" alt="{{ name or '' }}" style="max-height: {{ logo.max_height_mm or 18 }}mm;">
+{%- endif %}
+    <div class="naseej-cover__body">
+{%- if input.eyebrow %}
+        <div class="naseej-cover__eyebrow">{{ input.eyebrow }}</div>
+{%- endif %}
+        <h1 class="naseej-cover__title">{{ input.title }}</h1>
+{%- if input.subtitle %}
+        <p class="naseej-cover__subtitle">{{ input.subtitle }}</p>
+{%- endif %}
+    </div>
+    <div class="naseej-cover__footer">
+{%- if identity and identity.author_name %}
+        <span class="naseej-cover__author">{{ identity.author_name }}</span>
+{%- endif %}
+{%- if input.reference_code %}
+        <span class="naseej-cover__ref">{{ input.reference_code }}</span>
+{%- endif %}
+    </div>
+</section>

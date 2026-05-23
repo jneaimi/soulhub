@@ -1,0 +1,36 @@
+node_modules
+build
+.svelte-kit
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# Runtime state — Soul Hub now stores user state under ~/.soul-hub/.
+# These entries are kept as a safety net against legacy paths.
+.pids/
+settings.json
+settings.json.pre-home.bak
+.data/
+.data.pre-home.bak/
+
+# Python
+__pycache__/
+*.pyc
+.gitnexus
+
+# Accidental home-dir expansion
+~
+
+# Runtime output
+logs/
+output/
+
+# playwright-cli / browser-automation scratch dumps (page/console/network
+# snapshots + ARIA accessibility trees) — regenerable, not source.
+.playwright-cli/
+aiag.yaml

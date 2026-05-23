@@ -1,0 +1,9 @@
+{
+  "name": "@soul-hub/cli",
+  "version": "0.2.0",
+  "description": "Thin agent-facing CLI for the Soul Hub API. ADR-001 + ADR-002 (soul-hub-cli) — read + write verbs.",
+  "type": "module",
+  "private": true,
+  "bin": { "soul": "./soul" },
+  "engines": { "node": ">=22.6" }
+}

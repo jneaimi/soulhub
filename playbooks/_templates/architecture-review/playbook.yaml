@@ -1,0 +1,60 @@
+name: Architecture Review
+type: playbook
+description: Iterative architecture design with review feedback loop
+
+inputs:
+  - id: requirements
+    type: text
+    description: System requirements and constraints
+    required: true
+  - id: context
+    type: text
+    description: Additional context (existing system, team, timeline)
+    required: false
+    default: ""
+
+roles:
+  - id: architect
+    provider: claude
+    model: sonnet
+    agent: roles/architect.md
+  - id: reviewer
+    provider: claude
+    model: sonnet
+    agent: roles/reviewer.md
+
+phases:
+  - id: design
+    type: handoff
+    between: [architect, reviewer]
+    loop_until: "review contains 'APPROVED'"
+    max_iterations: 3
+    assignments:
+      - role: architect
+        task: "Design a system architecture for the following requirements: $inputs.requirements. Context: $inputs.context"
+        output: architecture.md
+      - role: reviewer
+        task: "Review the proposed architecture for completeness, scalability, and maintainability. If satisfied, include 'APPROVED' in your response. Otherwise, provide specific feedback for improvement."
+        output: review.md
+
+  - id: approval
+    type: gate
+    depends_on: [design]
+    prompt: "Review the final architecture design. Approve to proceed or reject with feedback."
+    assignments:
+      - role: architect
+        task: "Provide a final summary of the architecture design"
+        input: $phases.design.architect
+        output: summary.md
+
+output:
+  type: composite
+  vault_capture: true
+  items:
+    - type: knowledge
+      file: summary.md
+      vault_zone: knowledge/decisions
+    - type: artifact
+      file: architecture.md
+  on_complete:
+    notify: true

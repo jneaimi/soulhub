@@ -1,0 +1,37 @@
+name: artifact-smoke-naseej
+version: 1.0.0
+project: naseej
+description: |
+  ARTIFACT marker exercise (ADR-005 D7, CP3). Drives inspector to write
+  a tiny file via Bash + emit the `===ARTIFACT===\n<path>\n===END===`
+  marker. Verifies the runner's regex (src/lib/naseej/runner.ts line 56)
+  surfaces `artifact_path` on the step result.
+
+  Writes to /tmp/ (not the vault) to keep the file outside the ADR-046
+  chokepoint — the marker convention is path-agnostic at the runner
+  layer, this just keeps the smoke deterministic.
+
+  Re-authored for ADR-023 CP5: `agent:` step type replaced with
+  `component: agent-dispatch@1.0.0`. Budget fields flattened into inputs.
+
+steps:
+  - id: write-and-mark
+    component: agent-dispatch@1.0.0
+    inputs:
+      agent: inspector
+      task: |
+        Use the Bash tool to write the literal text "naseej-cp3-artifact"
+        to /tmp/naseej-cp3-artifact.txt (single `echo` + redirect is fine).
+        Then output EXACTLY these three lines and nothing after them:
+
+        ===ARTIFACT===
+        /tmp/naseej-cp3-artifact.txt
+        ===END===
+
+        Do not read any other file. Do not invoke any other tool. Do not
+        load vault context. This is a marker-format smoke, not a real
+        artifact write.
+      timeout_sec: 180
+      max_turns: 4
+      max_usd: 0.10
+      goal_condition: the ARTIFACT marker block was written
