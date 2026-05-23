@@ -9,7 +9,7 @@
 	// (operator default is all-true; the public export seeds them false).
 	const NAV: { href: string; label: string; matchPrefix: string; feature?: keyof FeaturesConfig }[] = [
 		{ href: '/orchestration', label: 'Orchestration', matchPrefix: '/orchestration' },
-		{ href: '/projects', label: 'Projects', matchPrefix: '/projects', feature: 'workspaces' },
+		{ href: '/projects', label: 'Projects', matchPrefix: '/projects' },
 		{ href: '/workspaces', label: 'Workspaces', matchPrefix: '/workspace', feature: 'workspaces' },
 		{ href: '/inbox', label: 'Inbox', matchPrefix: '/inbox' },
 		{ href: '/scheduler', label: 'Scheduler', matchPrefix: '/scheduler' },

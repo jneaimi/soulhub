@@ -263,6 +263,11 @@ export const GET: RequestHandler = async ({ url }) => {
 	try {
 		entries = await readdir(projectsDir);
 	} catch (err) {
+		// A fresh vault has no projects/ zone yet — that's "no projects", not an
+		// error. Only a missing dir (ENOENT) is benign; anything else is real.
+		if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+			return json({ projects: [], statusCounts: {}, queueCount: 0 });
+		}
 		return json(
 			{ error: `Cannot read projects dir: ${err instanceof Error ? err.message : String(err)}` },
 			{ status: 500 },

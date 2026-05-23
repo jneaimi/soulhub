@@ -414,7 +414,10 @@ function featureGuardRedirect(pathname: string): string | null {
 	const hits = (prefixes: string[]) =>
 		prefixes.some((p) => pathname === p || pathname.startsWith(p + '/'));
 	if (!f.naseej && hits(['/naseej'])) return '/';
-	if (!f.workspaces && hits(['/workspaces', '/workspace', '/projects', '/project'])) return '/';
+	// `/projects` is vault project tracking — core vault surface, always visible.
+	// Only the code-WORKSPACES launcher (`/workspaces`, `/workspace`) is gated;
+	// `/project/*` is 301'd to `/workspace/*` upstream and caught there.
+	if (!f.workspaces && hits(['/workspaces', '/workspace'])) return '/';
 	if (!f.playbook && hits(['/playbooks'])) return '/';
 	return null;
 }
