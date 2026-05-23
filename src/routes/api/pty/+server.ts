@@ -128,6 +128,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			shell: !!shell,
 		});
 	} catch (err) {
+		console.error('[pty] spawn failed:', err);
 		return json(
 			{ error: err instanceof Error ? err.message : 'Failed to start terminal session' },
 			{ status: 422 },

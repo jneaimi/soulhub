@@ -468,7 +468,14 @@
 			signal: abortController.signal,
 		}).then(async (res) => {
 			if (!res.ok || !res.body) {
-				error = `Request failed: ${res.status}`;
+				// Surface the server's reason (e.g. "Claude Code CLI not found …",
+				// node-pty spawn failure) instead of a bare status code.
+				let detail = '';
+				try {
+					const body = await res.json();
+					if (body?.error) detail = ` — ${body.error}`;
+				} catch { /* non-JSON body */ }
+				error = `Request failed: ${res.status}${detail}`;
 				running = false;
 				return;
 			}
