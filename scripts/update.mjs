@@ -92,8 +92,15 @@ if (before && before === after) {
 }
 
 // ── 2. Install (honours .npmrc legacy-peer-deps) ────────────────────
-step('Installing dependencies');
-run('npm install');
+// `--include=dev` is REQUIRED: the one-click update endpoint (ADR-011) spawns
+// this script from the server process, which runs under NODE_ENV=production.
+// Under that env `npm install` omits devDependencies — including vite and
+// svelte-kit, which step 3's `npm run build` needs — so the build would fail
+// with "vite: command not found". Forcing the dev group keeps the build able
+// to run regardless of the inherited NODE_ENV. (Caught by live one-click test
+// 2026-05-24.)
+step('Installing dependencies (incl. dev — build needs vite/svelte-kit)');
+run('npm install --include=dev');
 ok('dependencies installed');
 
 // ── 3. Build ────────────────────────────────────────────────────────
