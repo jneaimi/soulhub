@@ -4,6 +4,11 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] — 2026-05-24
+
+Maintenance release — validates the v2.2.0 one-click update path end to end
+(an install on v2.2.0 updates itself to this release). No functional changes.
+
 ## [2.2.0] — 2026-05-24
 
 ### Added
@@ -82,6 +87,7 @@ command center, orchestrated by Claude Code.
   development) and the **Playbook** engine (being decommissioned). Enable them
   via `features` in `~/.soul-hub/settings.json` at your own risk.
 
+[2.2.1]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.1
 [2.2.0]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.0
 [2.1.0]: https://github.com/jneaimi/soulhub/releases/tag/v2.1.0
 [2.0.0]: https://github.com/jneaimi/soulhub/releases/tag/v2.0.0
