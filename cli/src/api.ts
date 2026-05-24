@@ -77,3 +77,7 @@ export function apiPost<T = unknown>(path: string, body: unknown): Promise<T> {
 export function apiPut<T = unknown>(path: string, body: unknown): Promise<T> {
   return request<T>('PUT', path, { body });
 }
+
+export function apiPatch<T = unknown>(path: string, body: unknown): Promise<T> {
+  return request<T>('PATCH', path, { body });
+}

@@ -1,0 +1,20 @@
+{
+  "//": "Standalone typecheck config for the soul CLI (ADR-011, soul-hub-cli).",
+  "//2": "The CLI runs via `node --experimental-strip-types` (no compile step, no",
+  "//3": "type checking at runtime), and the SvelteKit tsconfig at the repo root",
+  "//4": "does not include cli/src — so CLI type errors were invisible. This config",
+  "//5": "is consumed by `npm run typecheck:cli`, enforced strict-zero in the gate.",
+  "compilerOptions": {
+    "noEmit": true,
+    "strict": true,
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2022",
+    "lib": ["es2023"],
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"]
+}

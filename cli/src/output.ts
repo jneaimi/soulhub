@@ -19,9 +19,9 @@ function jsonSafe(json: string): string {
 // `projects`, `contacts`, …) as a non-breaking back-compat alias. No-op if the
 // response already has `results` (the 5 verbs already on it) or lacks the
 // domain key. Pretty-printers receive the augmented object unchanged.
-export function withCanonical<T extends Record<string, unknown>>(data: T, domainKey: string): T {
+export function withCanonical<T extends object>(data: T, domainKey: string): T {
   if (!data || typeof data !== 'object' || 'results' in data || !(domainKey in data)) return data;
-  return { ...data, results: data[domainKey] };
+  return { ...data, results: (data as Record<string, unknown>)[domainKey] };
 }
 
 export function emit(value: unknown, opts: OutputOpts, prettyFn?: (v: any) => string): void {

@@ -74,6 +74,14 @@ WRITE VERBS (each supports --dry-run)
   soul recipe cancel RUN_ID
   soul scheduler run-now TASK_ID
   soul inbox digest-telegram [--since EPOCH_MS] [--inputs-json '{...}']
+  soul crm add      --name "..." [--company …] [--role …] [--stage …] [--source …] [--email …] [--phone …] [--deal-type …] [--deal-value N] [--notes …]
+  soul crm stage    <id> <stage> [--reason "..."]                          (Lead|Contacted|In Conversation|Proposal|Won|Lost)
+  soul crm followup <id> (--due YYYY-MM-DD | --in <Nd> | --clear)
+  soul crm log      <id> --channel <c> --summary "..." [--direction inbound|outbound] [--at YYYY-MM-DD]
+  soul crm note     <id> <vault-path> [--kind K] [--label "..."] [--source-url URL]   (attaches an EXISTING vault note)
+  soul crm update   <id> [--name …] [--company …] [--role …] [--deal-type …] [--deal-value N] [--notes …] [--source …]
+  soul crm email    <id> <address> [--label …] [--primary]
+  soul crm phone    <id> <number> [--label …] [--primary]
 
 GLOBAL FLAGS
   --json     Emit raw API JSON (composable with jq).
@@ -134,6 +142,14 @@ const USAGE: Record<string, string> = {
   'catalog index': 'soul catalog index [--freshness]',
   'crm find': 'soul crm find   [-q QUERY] [--stage S] [--limit N]',
   'crm followups': 'soul crm followups',
+  'crm add': 'soul crm add      --name "..." [--company …] [--role …] [--stage …] [--source …] [--email …] [--phone …] [--deal-type …] [--deal-value N] [--deal-currency …] [--notes …] [--dry-run]',
+  'crm stage': 'soul crm stage    <id> <stage> [--reason "..."] [--dry-run]   (stage: Lead|Contacted|In Conversation|Proposal|Won|Lost)',
+  'crm followup': 'soul crm followup <id> (--due YYYY-MM-DD | --in <Nd> | --clear) [--dry-run]',
+  'crm log': 'soul crm log      <id> --channel <c> --summary "..." [--direction inbound|outbound] [--at YYYY-MM-DD] [--dry-run]   (channel: email|call|meeting|social|whatsapp|other)',
+  'crm note': 'soul crm note     <id> <vault-path> [--kind transcript|document|reference|other] [--label "..."] [--source-url URL] [--dry-run]   (note must already exist)',
+  'crm update': 'soul crm update   <id> [--name …] [--company …] [--role …] [--deal-type …] [--deal-value N] [--deal-currency …] [--notes …] [--source …] [--dry-run]',
+  'crm email': 'soul crm email    <id> <address> [--label …] [--primary] [--dry-run]',
+  'crm phone': 'soul crm phone    <id> <number> [--label …] [--primary] [--dry-run]',
   'scheduler tasks': 'soul scheduler tasks',
   'scheduler run-now': 'soul scheduler run-now TASK_ID',
   'inbox queued': 'soul inbox queued [--limit N] [--account A]',
@@ -177,7 +193,7 @@ const dispatch: Dispatch = {
   component: { list: naseej.componentList, get: naseej.componentGet },
   naseej:    { audit: naseej.naseejAudit },
   catalog:   { index: catalogIndex },
-  crm:       { find: crm.find, followups: crm.followups },
+  crm:       { find: crm.find, followups: crm.followups, add: crm.add, stage: crm.stage, followup: crm.followup, log: crm.log, note: crm.note, update: crm.update, email: crm.email, phone: crm.phone },
   scheduler: { tasks: scheduler.tasks, 'run-now': scheduler.runNow },
   inbox:     { queued: inbox.queued, accounts: inbox.accounts, status: inbox.status, 'digest-telegram': inbox.digestTelegram },
   intent:    { metrics: intent.metrics },
@@ -317,6 +333,27 @@ function buildArgs(tail: string[]): Record<string, string | undefined> {
       // logs flags (ADR-008)
       tail:        { type: 'string' },
       grep:        { type: 'string' },
+      // crm write flags (ADR-010)
+      name:        { type: 'string' },
+      company:     { type: 'string' },
+      role:        { type: 'string' },
+      source:      { type: 'string' },
+      email:       { type: 'string' },
+      phone:       { type: 'string' },
+      'deal-type': { type: 'string' },
+      'deal-value':{ type: 'string' },
+      'deal-currency': { type: 'string' },
+      channel:     { type: 'string' },
+      summary:     { type: 'string' },
+      direction:   { type: 'string' },
+      at:          { type: 'string' },
+      due:         { type: 'string' },
+      in:          { type: 'string' },
+      kind:        { type: 'string' },
+      label:       { type: 'string' },
+      'source-url':{ type: 'string' },
+      clear:       { type: 'boolean' },
+      primary:     { type: 'boolean' },
       'dry-run':   { type: 'boolean' },
       freshness:   { type: 'boolean' },
       errors:      { type: 'boolean' },

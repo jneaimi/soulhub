@@ -60,4 +60,23 @@ elif (( count < baseline )); then
 fi
 
 echo "✅ typecheck-gate: $count == baseline. OK to push."
+
+# ── CLI strict-zero gate (ADR-011, soul-hub-cli) ─────────────────────────────
+# The soul CLI runs via `node --experimental-strip-types` (no compile, no type
+# check) and is NOT in svelte-check's scope, so its type errors were invisible.
+# It started clean, so it gets a strict-zero gate (not a ratcheting baseline):
+# any tsc error under cli/src blocks the push.
+if [[ -f "cli/tsconfig.json" ]]; then
+	echo "[typecheck-gate] running tsc over cli/src (strict-zero)…"
+	if cli_out="$(npx tsc --noEmit -p cli/tsconfig.json 2>&1)"; then
+		echo "✅ typecheck-gate: cli/src typechecks clean."
+	else
+		echo ""
+		echo "❌ CLI TYPE ERRORS — cli/src must be 0 (no baseline slack)."
+		printf '%s\n' "$cli_out" | grep -E 'error TS' | head -20
+		echo "   Fix them, then push again. (Run 'npm run typecheck:cli' to see all.)"
+		exit 1
+	fi
+fi
+
 exit 0

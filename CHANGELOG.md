@@ -4,6 +4,40 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] — 2026-05-25
+
+### Added
+- **`soul crm` write verbs** — the CRM is no longer read-only from the CLI:
+  - `soul crm add --name "…"` (+ company/role/stage/source/email/phone/deal
+    fields) — create a contact.
+  - `soul crm stage <id> <stage> [--reason …]` — move a contact along the
+    pipeline (Lead → Contacted → In Conversation → Proposal → Won → Lost).
+  - `soul crm followup <id> (--due YYYY-MM-DD | --in <Nd> | --clear)` — set or
+    clear the next follow-up; human dates convert to the stored timestamp for
+    you.
+  - `soul crm log <id> --channel <c> --summary "…"` — log an interaction
+    (email/call/meeting/social/whatsapp/other).
+  - `soul crm note <id> <vault-path>` — attach an existing vault note to a
+    contact.
+  - `soul crm update <id> [field flags]`, `soul crm email <id> <addr>`,
+    `soul crm phone <id> <num>` — edit identity details.
+
+  Every write verb supports `--dry-run` (prints the request it would send) and
+  `--json`. They call the same governed `/api/crm/*` endpoints the chat
+  assistant uses, so validation is identical. There is intentionally **no CLI
+  delete** — removing a contact stays a UI action.
+
+### Fixed
+- **Clear CRM errors from the CLI** — a rejected CRM write (bad pipeline stage,
+  duplicate email, a follow-up on a contact that doesn't exist) now prints a
+  one-line `✗ <reason>` and exits non-zero, instead of a raw HTTP dump.
+
+### Internal
+- **The `soul` CLI is now type-checked in CI.** It runs without a compile step,
+  so its type errors were previously invisible; a pre-push gate now type-checks
+  the CLI and blocks any error. (Caught and fixed 8 latent type issues in the
+  process.)
+
 ## [2.6.0] — 2026-05-25
 
 ### Added

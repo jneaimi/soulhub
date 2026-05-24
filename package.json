@@ -1,6 +1,6 @@
 {
 	"name": "soul-hub",
-	"version": "2.6.0",
+	"version": "2.7.0",
 	"description": "A local-first, single-user ambient AI command center \u2014 chat (WhatsApp/Telegram), a unified inbox, a governed knowledge vault, terminal, scheduler, and pipelines, powered by Claude Code",
 	"license": "MIT",
 	"author": "Jasem Al Neaimi",
@@ -22,6 +22,7 @@
 		"postinstall": "npm rebuild node-pty || true",
 		"prepare": "svelte-kit sync || echo '' ; git config core.hooksPath .githooks 2>/dev/null || true",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"typecheck:cli": "tsc --noEmit -p cli/tsconfig.json",
 		"typecheck:gate": "bash scripts/typecheck-gate.sh",
 		"prod:start": "npx pm2 start ecosystem.config.cjs",
 		"prod:stop": "npx pm2 stop ecosystem.config.cjs",
