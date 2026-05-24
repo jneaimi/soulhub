@@ -2,7 +2,7 @@
 // Thin wrappers over /api/inbox/messages + /api/inbox/digest-telegram.
 
 import { apiGet, apiPost } from '../api.ts';
-import { emit, fail, type OutputOpts } from '../output.ts';
+import { emit, fail, withCanonical, type OutputOpts } from '../output.ts';
 
 interface InboxMessage {
   id: number;
@@ -26,7 +26,7 @@ export async function queued(args: Record<string, string | undefined>, opts: Out
     limit: args.limit ?? '50',
     account: args.account,
   });
-  emit(data, opts, (d: MessagesResp) => {
+  emit(withCanonical(data, 'messages'), opts, (d: MessagesResp) => {
     const s = d.stats ?? {};
     const head = `Queued: ${d.total ?? d.messages.length}    (total queued in stats: ${s.queued ?? '—'})`;
     if (d.messages.length === 0) return `${head}\n\n(no messages)`;
@@ -75,7 +75,7 @@ function ageShort(epochMs: number | null | undefined): string {
 /** ADR-005 — read-only account listing over /api/inbox/accounts. */
 export async function accounts(_args: Record<string, string | undefined>, opts: OutputOpts) {
   const data = await apiGet<AccountsResp>('/api/inbox/accounts');
-  emit(data, opts, (d: AccountsResp) => {
+  emit(withCanonical(data, 'accounts'), opts, (d: AccountsResp) => {
     if (d.accounts.length === 0) return '(no accounts)';
     return d.accounts
       .map((a) => {

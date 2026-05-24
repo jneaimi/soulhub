@@ -1,5 +1,5 @@
 import { apiGet } from '../api.ts';
-import { emit, type OutputOpts } from '../output.ts';
+import { emit, withCanonical, type OutputOpts } from '../output.ts';
 
 interface Contact {
   id: string;
@@ -18,7 +18,7 @@ export async function find(args: Record<string, string | undefined>, opts: Outpu
     stage: args.stage,
     limit: args.limit ?? '20',
   });
-  emit(data, opts, (d: ContactsResp) =>
+  emit(withCanonical(data, 'contacts'), opts, (d: ContactsResp) =>
     d.contacts.length === 0
       ? '(no contacts)'
       : d.contacts

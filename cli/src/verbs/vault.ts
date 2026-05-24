@@ -1,5 +1,5 @@
 import { apiGet, apiPost } from '../api.ts';
-import { emit, fail, ageDays, type OutputOpts } from '../output.ts';
+import { emit, fail, ageDays, withCanonical, type OutputOpts } from '../output.ts';
 
 interface Hit { path: string; title?: string; score?: number; meta?: Record<string, unknown>; }
 interface SearchResp { results: Hit[]; total?: number; }
@@ -40,7 +40,7 @@ interface RecentResp { notes: Array<{ path: string; title?: string; mtime?: numb
 
 export async function recent(args: Record<string, string | undefined>, opts: OutputOpts) {
   const data = await apiGet<RecentResp>('/api/vault/recent', { limit: args.limit ?? '20' });
-  emit(data, opts, (d: RecentResp) =>
+  emit(withCanonical(data, 'notes'), opts, (d: RecentResp) =>
     d.notes.map((n) => `${n.path}  —  ${n.title ?? ''}`).join('\n')
   );
 }
@@ -110,7 +110,7 @@ export async function writes(args: Record<string, string | undefined>, opts: Out
     zone: args.zone,
     limit: args.limit ?? '50',
   });
-  emit(data, opts, (d: WritesResp) => {
+  emit(withCanonical(data, 'entries'), opts, (d: WritesResp) => {
     if (d.entries.length === 0) return '(no writes in window)';
     return d.entries
       .map((e) => {
@@ -134,7 +134,7 @@ interface UnresolvedResp { unresolved: UnresolvedRow[] }
 
 export async function unresolved(_args: Record<string, string | undefined>, opts: OutputOpts) {
   const data = await apiGet<UnresolvedResp>('/api/vault/unresolved');
-  emit(data, opts, (d: UnresolvedResp) => {
+  emit(withCanonical(data, 'unresolved'), opts, (d: UnresolvedResp) => {
     const rows = d.unresolved ?? [];
     if (rows.length === 0) return '(no unresolved links)';
     const grouped = new Map<string, string[]>();

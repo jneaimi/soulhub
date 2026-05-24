@@ -4,6 +4,18 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] — 2026-05-25
+
+### Added
+- **Consistent `--json` list shape** — every record-list verb now exposes its
+  collection under a stable top-level `results` array, so
+  `soul <verb> --json | jq '.results[]'` works the same across `vault recent`,
+  `project list`, `crm find`, `scheduler tasks`, `inbox queued/accounts`, and the
+  verbs already using `results`. The original per-verb keys (`notes`, `projects`,
+  `contacts`, …) are **kept as aliases**, so existing pipelines are unaffected.
+  Dashboard/summary verbs (`vault hygiene`, `intent metrics`, `crm followups`,
+  `inbox status`, `logs`) are unchanged.
+
 ## [2.5.0] — 2026-05-25
 
 ### Added

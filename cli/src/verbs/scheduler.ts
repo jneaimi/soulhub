@@ -1,5 +1,5 @@
 import { apiGet, apiPost } from '../api.ts';
-import { emit, fail, type OutputOpts } from '../output.ts';
+import { emit, fail, withCanonical, type OutputOpts } from '../output.ts';
 
 interface SchedTask {
   id?: string;
@@ -14,7 +14,7 @@ interface TasksResp { tasks: SchedTask[]; }
 
 export async function tasks(_args: Record<string, string | undefined>, opts: OutputOpts) {
   const data = await apiGet<TasksResp>('/api/scheduler/tasks');
-  emit(data, opts, (d: TasksResp) =>
+  emit(withCanonical(data, 'tasks'), opts, (d: TasksResp) =>
     d.tasks.length === 0
       ? '(no scheduler tasks)'
       : d.tasks

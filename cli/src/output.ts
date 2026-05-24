@@ -13,6 +13,17 @@ function jsonSafe(json: string): string {
   return json.replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
 }
 
+// ADR-009 — additive canonical collection key. Record-list verbs expose their
+// list under a stable top-level `results` so `… --json | jq '.results[]'` works
+// across every list verb, while KEEPING the original domain key (`notes`,
+// `projects`, `contacts`, …) as a non-breaking back-compat alias. No-op if the
+// response already has `results` (the 5 verbs already on it) or lacks the
+// domain key. Pretty-printers receive the augmented object unchanged.
+export function withCanonical<T extends Record<string, unknown>>(data: T, domainKey: string): T {
+  if (!data || typeof data !== 'object' || 'results' in data || !(domainKey in data)) return data;
+  return { ...data, results: data[domainKey] };
+}
+
 export function emit(value: unknown, opts: OutputOpts, prettyFn?: (v: any) => string): void {
   if (opts.json) {
     process.stdout.write(jsonSafe(JSON.stringify(value)) + '\n');

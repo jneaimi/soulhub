@@ -1,5 +1,5 @@
 import { apiGet, apiPost, apiPut } from '../api.ts';
-import { emit, fail, ageDays, todayIso, exitIfApiFailure, type OutputOpts } from '../output.ts';
+import { emit, fail, ageDays, todayIso, exitIfApiFailure, withCanonical, type OutputOpts } from '../output.ts';
 
 /** Shared write-response shape used by next-actions / similar / propose-adr /
  *  ship-slice and label-falsifier. The API surfaces { success, error?, ... }. */
@@ -34,7 +34,7 @@ interface ProjectsResp { projects: ProjectRow[]; total: number; }
 
 export async function list(_args: Record<string, string | undefined>, opts: OutputOpts) {
   const data = await apiGet<ProjectsResp>('/api/vault/projects');
-  emit(data, opts, (d: ProjectsResp) => {
+  emit(withCanonical(data, 'projects'), opts, (d: ProjectsResp) => {
     if (d.projects.length === 0) return '(no projects)';
     const rows = d.projects
       .slice()
