@@ -39,7 +39,8 @@ export class TemplateLoader {
 				name,
 				raw,
 				requiredFields,
-				expectedSections
+				expectedSections,
+				requiresH1: hasTopLevelH1(content)
 			});
 		}
 	}
@@ -60,6 +61,14 @@ export class TemplateLoader {
 			const re = new RegExp(`^##\\s+${escapeRegex(section)}\\s*$`, 'im');
 			return !re.test(content);
 		});
+
+		// A template that leads with an H1 (e.g. `# {{title}}`) requires the note
+		// to carry a top-level H1. The project graph derives node labels from it;
+		// a body starting at `## Status` renders as a slug fallback (the ADR-012
+		// symptom). This is the fail-closed net behind the CLI's H1 auto-inject.
+		if (template.requiresH1 && !hasTopLevelH1(content)) {
+			missing.push('# <title> (top-level H1 heading)');
+		}
 
 		return { valid: missing.length === 0, missing };
 	}
@@ -83,7 +92,7 @@ export class TemplateLoader {
 		while ((match = sectionRe.exec(content)) !== null) {
 			expectedSections.push(match[1].trim());
 		}
-		const template: VaultTemplate = { name, raw, requiredFields, expectedSections };
+		const template: VaultTemplate = { name, raw, requiredFields, expectedSections, requiresH1: hasTopLevelH1(content) };
 		this.templates.set(name, template);
 		return template;
 	}
@@ -103,4 +112,11 @@ export class TemplateLoader {
 
 function escapeRegex(s: string): string {
 	return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** True when the markdown body contains a top-level `# ` heading (H1) —
+ *  `# Title` matches, `## Status` does not. Used to detect templates that
+ *  mandate a title H1 and to validate notes against that. */
+function hasTopLevelH1(content: string): boolean {
+	return /^#\s+\S/m.test(content);
 }

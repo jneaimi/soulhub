@@ -434,6 +434,11 @@ export interface VaultTemplate {
 	requiredFields: string[];
 	/** Section headings expected in the content */
 	expectedSections: string[];
+	/** True when the template's body leads with a top-level `# ` H1 (e.g.
+	 *  `# {{title}}`). Notes of this type must then carry an H1 — the project
+	 *  graph derives node labels from it, and a body starting at `## Status`
+	 *  falls back to an ugly slug-derived label. */
+	requiresH1: boolean;
 }
 
 // ── Zone color mapping ──────────────────────────────────────

@@ -61,10 +61,18 @@ export async function propose(args: Record<string, string | undefined>, opts: Ou
     }
   }
 
-  // Compose minimal decision-template skeleton if the caller didn't supply one.
-  const content = /^##\s*Status/m.test(args.content)
+  // Compose a minimal decision-template skeleton if the caller didn't supply
+  // the section structure. Either way, guarantee the template H1 (# ADR-N —
+  // Title): a fully-authored body that starts at "## Status" passes the
+  // skeleton check but lacks the H1, and the project graph then renders it as
+  // an ugly slug-derived label (the ADR-012 symptom). Fail-closed mirror lives
+  // in the vault template validator (requiresH1).
+  let content = /^##\s*Status/m.test(args.content)
     ? args.content
     : `# ${args.title}\n\n## Status\n\nProposed ${today}\n\n## Context\n\n${args.content}\n\n## Decision\n\n(fill in)\n\n## Consequences\n\n(fill in)\n`;
+  if (!/^#\s+\S/m.test(content)) {
+    content = `# ${args.title}\n\n${content.replace(/^\s+/, '')}`;
+  }
 
   const filename = args.slug.endsWith('.md') ? args.slug : `${args.slug}.md`;
   const body = { zone: `projects/${args.project}`, filename, meta, content };
