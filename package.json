@@ -28,7 +28,7 @@
 		"prod:reload": "npx pm2 reload soul-hub",
 		"prod:status": "npx pm2 status",
 		"prod:logs": "npx pm2 logs",
-		"prod:startup": "npx pm2 startup && npx pm2 save"
+		"prod:startup": "bash scripts/start_prod.sh startup"
 	},
 	"devDependencies": {
 		"@sveltejs/adapter-node": "^5.5.4",

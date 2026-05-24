@@ -290,6 +290,62 @@ try {
   }
 }
 
+// ── 13b. macOS boot-time FD limit (node-pty posix_spawnp trap) ─
+// node-pty opens a pty pair + spawn-helper per terminal session. A PM2 daemon
+// launched at boot inherits launchd's default 256-FD soft limit and eventually
+// fails posix_spawn with the opaque "posix_spawnp failed." (in-app Terminal →
+// 422). Interactive-shell starts inherit ~1M so they don't hit it — which is
+// why the failure only shows up after a reboot. `start_prod.sh startup` injects
+// SoftResourceLimits into the pm2 plist to escape this; warn if that's missing.
+if (platform() === 'darwin') {
+  try {
+    const raw = execSync('launchctl limit maxfiles', {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).toString();
+    // e.g. "\tmaxfiles    256            unlimited"
+    const m = raw.match(/maxfiles\s+(\d+)/);
+    const soft = m ? parseInt(m[1], 10) : null;
+
+    // Find a pm2 boot plist (LaunchAgent = user, LaunchDaemon = system).
+    let plist = null;
+    let patched = false;
+    const globDirs = [
+      join(HOME, 'Library', 'LaunchAgents'),
+      '/Library/LaunchDaemons',
+    ];
+    for (const dir of globDirs) {
+      try {
+        const hit = execSync(`ls ${dir}/pm2.*.plist 2>/dev/null | head -1`, {
+          stdio: ['ignore', 'pipe', 'ignore'],
+          shell: '/bin/bash',
+        }).toString().trim();
+        if (hit) { plist = hit; break; }
+      } catch { /* none */ }
+    }
+    if (plist) {
+      try {
+        patched = readFileSync(plist, 'utf8').includes('SoftResourceLimits');
+      } catch { /* unreadable */ }
+    }
+
+    if (!plist) {
+      add('macOS FD limit', 'ok', `launchctl soft=${soft ?? '?'}; no PM2 boot persistence (shell starts inherit a high limit)`);
+    } else if (patched) {
+      add('macOS FD limit', 'ok', 'PM2 boot plist carries SoftResourceLimits');
+    } else if (soft !== null && soft <= 1024) {
+      add(
+        'macOS FD limit',
+        'warn',
+        `PM2 boots with launchd soft=${soft} — node-pty Terminal will fail after reboot. Run: bash scripts/start_prod.sh startup`,
+      );
+    } else {
+      add('macOS FD limit', 'ok', `launchctl soft=${soft}`);
+    }
+  } catch {
+    add('macOS FD limit', 'warn', 'unable to read launchctl limit maxfiles');
+  }
+}
+
 // ── 14. Vault chokepoint (ADR-046 / 048 / 050) ────────────────
 // Verifies the four out-of-repo artifacts are deployed. L3 + L5 are
 // code-resident and don't have a doctor check (they're either present
