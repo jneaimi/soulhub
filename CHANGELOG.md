@@ -4,6 +4,13 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.3] — 2026-05-24
+
+### Added
+- **Files in the header** — a folder icon now sits in the global header next to
+  Terminal and Settings, so the file browser (`/files`) is reachable from any
+  page instead of only the homepage card.
+
 ## [2.2.2] — 2026-05-24
 
 ### Fixed
@@ -91,6 +98,7 @@ command center, orchestrated by Claude Code.
   development) and the **Playbook** engine (being decommissioned). Enable them
   via `features` in `~/.soul-hub/settings.json` at your own risk.
 
+[2.2.3]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.3
 [2.2.2]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.2
 [2.2.0]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.0
 [2.1.0]: https://github.com/jneaimi/soulhub/releases/tag/v2.1.0

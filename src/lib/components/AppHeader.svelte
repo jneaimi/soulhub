@@ -67,6 +67,18 @@
 
 		<div class="flex items-center gap-1">
 			<a
+				href="/files"
+				class="p-1.5 rounded-md text-hub-dim hover:text-hub-text hover:bg-hub-card transition-colors"
+				class:text-hub-text={path === '/files' || path.startsWith('/files/')}
+				class:bg-hub-card={path === '/files' || path.startsWith('/files/')}
+				aria-label="Files"
+				title="Files"
+			>
+				<svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+				</svg>
+			</a>
+			<a
 				href="/terminal"
 				class="p-1.5 rounded-md text-hub-dim hover:text-hub-text hover:bg-hub-card transition-colors"
 				aria-label="Terminal"

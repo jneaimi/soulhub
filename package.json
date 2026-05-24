@@ -1,6 +1,6 @@
 {
 	"name": "soul-hub",
-	"version": "2.2.2",
+	"version": "2.2.3",
 	"description": "A local-first, single-user ambient AI command center \u2014 chat (WhatsApp/Telegram), a unified inbox, a governed knowledge vault, terminal, scheduler, and pipelines, powered by Claude Code",
 	"license": "MIT",
 	"author": "Jasem Al Neaimi",
