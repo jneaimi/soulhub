@@ -3,6 +3,15 @@
 
 	let { update }: { update?: UpdateState | null } = $props();
 
+	// The layout's server load() computes `update` only on navigation, so an
+	// operator who keeps Soul Hub open between daily scheduler ticks wouldn't see
+	// a freshly-published release until they next navigate. `polled` holds a
+	// client-side refresh (see the poller below); the banner reads the effective
+	// state = polled ?? server-provided. No layout invalidate() — this updates in
+	// place, so it never re-runs the app's other server loads.
+	let polled = $state<UpdateState | null>(null);
+	const eff = $derived(polled ?? update ?? null);
+
 	// ── Dismissal (ADR-010) — per-browser, per-version localStorage flag. A newer
 	//    release re-surfaces the banner automatically. Zero server state. ───────
 	const DISMISS_KEY = 'soulhub:update-dismissed';
@@ -17,25 +26,55 @@
 	});
 
 	const showBanner = $derived(
-		!!update?.updateAvailable &&
-			!!update?.latestVersion &&
-			dismissedVersion !== update.latestVersion,
+		!!eff?.updateAvailable &&
+			!!eff?.latestVersion &&
+			dismissedVersion !== eff.latestVersion,
 	);
 
 	function dismiss(): void {
-		if (!update?.latestVersion) return;
+		if (!eff?.latestVersion) return;
 		try {
-			localStorage.setItem(DISMISS_KEY, update.latestVersion);
+			localStorage.setItem(DISMISS_KEY, eff.latestVersion);
 		} catch {
 			/* private mode — banner just reappears next load */
 		}
-		dismissedVersion = update.latestVersion;
+		dismissedVersion = eff.latestVersion;
 	}
 
 	// ── One-click update (ADR-011) — confirm modal → POST → poll version ───────
 	type Phase = 'idle' | 'confirm' | 'updating' | 'done' | 'error';
 	let phase = $state<Phase>('idle');
 	let errorMsg = $state('');
+
+	// ── Freshness poller (ADR-010) — only when the feature is active (the server
+	//    sends `update` only when updateCheck is on; private/flag-off instances
+	//    get null → no polling). Slow cadence: releases are daily, so 10 min is
+	//    ample and keeps request volume negligible. Skips while an update is in
+	//    flight. Updates `polled` in place so the banner appears without a
+	//    navigation. ───────────────────────────────────────────────────────────
+	const POLL_MS = 10 * 60 * 1000;
+	$effect(() => {
+		if (!update) return; // flag off → never poll
+		const id = setInterval(async () => {
+			if (phase !== 'idle') return; // don't churn mid-update (untracked read)
+			try {
+				const res = await fetch('/api/system/version', { cache: 'no-store' });
+				if (!res.ok) return;
+				const d = await res.json();
+				if (d?.updateAvailable && typeof d.latestVersion === 'string') {
+					polled = {
+						latestVersion: d.latestVersion,
+						releaseUrl: d.releaseUrl ?? null,
+						checkedAt: d.checkedAt ?? null,
+						updateAvailable: true,
+					};
+				}
+			} catch {
+				/* offline / transient — try again next tick */
+			}
+		}, POLL_MS);
+		return () => clearInterval(id);
+	});
 
 	function openConfirm(): void {
 		phase = 'confirm';
@@ -48,20 +87,20 @@
 	const strip = (v: string | null | undefined) => (v ?? '').replace(/^v/, '');
 
 	async function startUpdate(): Promise<void> {
-		if (!update?.latestVersion) return;
+		if (!eff?.latestVersion) return;
 		phase = 'updating';
 		errorMsg = '';
 		try {
 			const res = await fetch('/api/system/update', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ confirm: true, expectedVersion: update.latestVersion }),
+				body: JSON.stringify({ confirm: true, expectedVersion: eff.latestVersion }),
 			});
 			if (!res.ok) {
 				const data = await res.json().catch(() => ({}));
 				throw new Error(data?.error || data?.reason || `HTTP ${res.status}`);
 			}
-			pollForNewVersion(update.latestVersion);
+			pollForNewVersion(eff.latestVersion);
 		} catch (err) {
 			phase = 'error';
 			errorMsg = err instanceof Error ? err.message : String(err);
@@ -107,18 +146,18 @@
 		{#if phase === 'updating'}
 			<span class="flex items-center gap-2">
 				<span class="inline-block w-3 h-3 border-2 border-hub-info/40 border-t-hub-info rounded-full animate-spin"></span>
-				Updating to {update?.latestVersion}… Soul Hub will restart.
+				Updating to {eff?.latestVersion}… Soul Hub will restart.
 			</span>
 		{:else if phase === 'done'}
-			<span class="font-medium text-hub-cta">Updated to {update?.latestVersion} — reloading…</span>
+			<span class="font-medium text-hub-cta">Updated to {eff?.latestVersion} — reloading…</span>
 		{:else if phase === 'error'}
 			<span class="text-hub-warning">Update issue: {errorMsg}</span>
 			<button type="button" onclick={() => (phase = 'idle')} class="text-hub-muted hover:text-hub-text transition-colors">Dismiss</button>
 		{:else}
-			<span class="font-medium">Soul Hub {update?.latestVersion} is available</span>
-			{#if update?.releaseUrl}
+			<span class="font-medium">Soul Hub {eff?.latestVersion} is available</span>
+			{#if eff?.releaseUrl}
 				<a
-					href={update.releaseUrl}
+					href={eff.releaseUrl}
 					target="_blank"
 					rel="noopener noreferrer"
 					class="underline decoration-dotted hover:text-hub-info transition-colors"
@@ -149,7 +188,7 @@
 	<!-- Confirm modal (ADR-011 §2b) — no auto-dismiss -->
 	<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" role="dialog" aria-modal="true">
 		<div class="bg-hub-card border border-hub-border rounded-lg shadow-xl max-w-md w-full mx-4 p-5">
-			<h2 class="text-sm font-semibold text-hub-text mb-2">Update Soul Hub to {update?.latestVersion}?</h2>
+			<h2 class="text-sm font-semibold text-hub-text mb-2">Update Soul Hub to {eff?.latestVersion}?</h2>
 			<p class="text-xs text-hub-muted leading-relaxed mb-4">
 				This will restart Soul Hub. Active terminal sessions and in-flight pipelines
 				will be interrupted. The update runs <code class="text-hub-dim">git pull → install → build → reload</code>

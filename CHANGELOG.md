@@ -4,6 +4,15 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.5] — 2026-05-24
+
+### Changed
+- **Update banner refreshes itself** — the "update available" banner now checks
+  for a new release every ~10 minutes in the background, so it appears for
+  operators who keep Soul Hub open without needing to refresh or navigate.
+  Updates in place (no full reload), only runs when update notifications are
+  enabled, and pauses while an update is in progress.
+
 ## [2.2.4] — 2026-05-24
 
 ### Fixed
@@ -108,6 +117,7 @@ command center, orchestrated by Claude Code.
   development) and the **Playbook** engine (being decommissioned). Enable them
   via `features` in `~/.soul-hub/settings.json` at your own risk.
 
+[2.2.5]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.5
 [2.2.4]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.4
 [2.2.3]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.3
 [2.2.2]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.2
