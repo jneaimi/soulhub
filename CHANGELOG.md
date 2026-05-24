@@ -4,6 +4,17 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] — 2026-05-25
+
+### Added
+- **`soul logs`** — tail the local PM2 logs from the CLI:
+  `soul logs [SERVICE] [--errors] [--tail N] [--grep PATTERN] [--json]`, where
+  SERVICE is `soul-hub` (default), `whatsapp`, or `tunnel`. `--grep` is applied
+  before `--tail`, so `soul logs --grep inbox-sync --tail 20` means "last 20
+  matching lines." It reads the log files directly from `~/.soul-hub/logs/`, so
+  it works even when the server is down — which is exactly when you need the
+  error log.
+
 ## [2.4.0] — 2026-05-25
 
 ### Added

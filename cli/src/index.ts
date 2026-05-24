@@ -15,6 +15,7 @@ import * as inbox from './verbs/inbox.ts';
 import * as contracts from './verbs/contracts.ts';
 import { catalogIndex } from './verbs/catalog.ts';
 import { doctor } from './verbs/doctor.ts';
+import { logs } from './verbs/logs.ts';
 
 const HELP = `soul — Soul Hub CLI (ADR-001 + ADR-002 + ADR-003 Phase 3a)
 
@@ -49,6 +50,7 @@ READ VERBS
   soul contracts touching PATH        (governance ADR-002 — what contracts a change touches)
   soul contracts check                (registry self-falsifier: resolution + cache freshness)
   soul doctor
+  soul logs [SERVICE] [--errors] [--tail N] [--grep PATTERN]   (local PM2 log tail; works when :2400 is down)
 
 WRITE VERBS (each supports --dry-run)
   soul note create   --zone Z --filename F --type T [--meta-json JSON] (--content STR | --content-file PATH | --content -)
@@ -147,6 +149,7 @@ const USAGE: Record<string, string> = {
   'contracts touching': 'soul contracts touching PATH        (governance ADR-002 — what contracts a change touches)',
   'contracts check': 'soul contracts check                (registry self-falsifier: resolution + cache freshness)',
   doctor: 'soul doctor',
+  logs: 'soul logs [SERVICE: soul-hub|whatsapp|tunnel] [--errors] [--tail N] [--grep PATTERN] [--json]',
 };
 
 function isHelpFlag(s: string | undefined): boolean {
@@ -217,6 +220,17 @@ async function main() {
     return;
   }
 
+  // logs is a top-level verb (no noun) — ADR-008. Reads local files, not the API.
+  if (rest[0] === 'logs') {
+    if (rest.slice(1).some(isHelpFlag)) { process.stdout.write(USAGE.logs + '\n'); return; }
+    try {
+      await logs(buildArgs(rest.slice(1)), opts);
+    } catch (err) {
+      fail(err instanceof Error ? err.message : String(err), 1);
+    }
+    return;
+  }
+
   const [noun, verb, ...tail] = rest;
   if (!noun || !dispatch[noun]) fail(`unknown noun "${noun ?? ''}". Run \`soul --help\`.`);
 
@@ -237,6 +251,19 @@ async function main() {
     return;
   }
 
+  const args = buildArgs(tail);
+
+  try {
+    await dispatch[noun][verb](args, opts);
+  } catch (err) {
+    fail(err instanceof Error ? err.message : String(err), 1);
+  }
+}
+
+// Shared argv→args parser (ADR-008: reused by the top-level `logs` verb and the
+// `<noun> <verb>` dispatch path). Coerces booleans to '1'|undefined and exposes
+// positionals as `_` (join) plus `_0`,`_1`,… (individual).
+function buildArgs(tail: string[]): Record<string, string | undefined> {
   const parsed = parseArgs({
     args: tail,
     options: {
@@ -287,8 +314,12 @@ async function main() {
       input:       { type: 'string' },
       'run-id':    { type: 'string' },
       since:       { type: 'string' },
+      // logs flags (ADR-008)
+      tail:        { type: 'string' },
+      grep:        { type: 'string' },
       'dry-run':   { type: 'boolean' },
       freshness:   { type: 'boolean' },
+      errors:      { type: 'boolean' },
     },
     allowPositionals: true,
     strict: false,
@@ -306,12 +337,7 @@ async function main() {
     args._ = parsed.positionals.join('/');
     parsed.positionals.forEach((p, i) => { args['_' + i] = p; });
   }
-
-  try {
-    await dispatch[noun][verb](args, opts);
-  } catch (err) {
-    fail(err instanceof Error ? err.message : String(err), 1);
-  }
+  return args;
 }
 
 main();
