@@ -1,5 +1,6 @@
 import type { Handle } from '@sveltejs/kit';
-import { config } from '$lib/config.js';
+import { config, reloadConfig } from '$lib/config.js';
+import { migrateFeatureFlags } from '$lib/settings-migration.js';
 import {
 	initSchedulerCore,
 	shutdownScheduler,
@@ -43,6 +44,24 @@ import '$lib/secrets.js'; // Load platform secrets into process.env at startup
 import { existsSync } from 'node:fs';
 
 const DATA_DIR = soulHubDataDir();
+
+// ADR-055 P3 — settings migration. Back-fill distribution feature-flag defaults
+// (e.g. the public `updateCheck: true`) that an install set up on an older
+// version never received on `git pull`. Runs BEFORE the scheduler reconcile +
+// config-dependent boot steps so a newly-enabled flag-gated task (update-check)
+// is registered this boot. reloadConfig() refreshes the in-memory singleton so
+// every downstream consumer sees the back-filled value without a restart.
+// No-op on the operator's instance (private settings.example.json has no
+// `features` block).
+try {
+	const migrated = migrateFeatureFlags();
+	if (Object.keys(migrated.added).length > 0) {
+		reloadConfig();
+		console.log('[settings-migration] config reloaded after feature-flag back-fill');
+	}
+} catch (err) {
+	console.error('[settings-migration] boot step failed (non-fatal):', err);
+}
 
 // Seed file-explorer roots on first run with the previously-hardcoded paths
 // so existing flows (vault attachments, project file browsers) keep working

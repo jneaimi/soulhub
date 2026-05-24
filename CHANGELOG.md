@@ -4,6 +4,16 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.4] — 2026-05-24
+
+### Fixed
+- **Feature flags now survive upgrades** — flags added in a newer version are
+  back-filled into your `settings.json` on boot, instead of staying absent
+  (and stuck at their schema default) after a `git pull`. In particular,
+  installs created before v2.2.0 now pick up `updateCheck`, so the update
+  banner starts working without hand-editing settings. Strictly additive — an
+  explicit value you've set is never overwritten.
+
 ## [2.2.3] — 2026-05-24
 
 ### Added
@@ -98,6 +108,7 @@ command center, orchestrated by Claude Code.
   development) and the **Playbook** engine (being decommissioned). Enable them
   via `features` in `~/.soul-hub/settings.json` at your own risk.
 
+[2.2.4]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.4
 [2.2.3]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.3
 [2.2.2]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.2
 [2.2.0]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.0
