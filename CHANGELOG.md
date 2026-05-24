@@ -4,6 +4,38 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] — 2026-05-25
+
+### Added
+- **`soul inbox accounts` / `soul inbox status`** — see email-account sync health
+  from the CLI: per-account provider, status, last-sync age, and last error.
+  `inbox status` flags any connected account whose last sync is older than 30
+  minutes and exits non-zero, so it composes in health-check chains.
+- **`soul doctor` now probes inbox staleness** — a stale connected account
+  surfaces as a note alongside the existing API and catalog-index checks.
+- **`--content-file PATH` and `--content -` (stdin)** on `note create`,
+  `note update`, and `adr propose` — author multi-line note/ADR bodies from a
+  file or a pipe instead of an inline `--content` string, avoiding shell quoting
+  hazards and argument-length limits.
+- **Per-verb `--help`** — `soul <noun> <verb> --help` (and `soul <noun> --help`)
+  now prints usage for that verb instead of running it with missing arguments.
+
+### Fixed
+- **`--json` output is now safe to pipe to `jq` in all cases** — line/paragraph
+  separator characters (U+2028/U+2029) in note bodies are escaped, so
+  `soul vault get … --json | jq` no longer fails on certain notes.
+
+## [2.2.9] — 2026-05-24
+
+### Fixed
+- **Inbox "synced Xh ago" label no longer freezes** — the timestamp tracks the
+  actual sync again. The label reads `accounts.last_sync`, but that field was
+  only refreshed when an account reconnected or recovered from an error. Once
+  the IMAP IDLE + poll fix made background syncing work without reconnects, the
+  label stuck at the initial-connect time while mail kept arriving. Routine
+  syncs now stamp `accounts.last_sync` on every cycle, including the common
+  "no new messages" poll.
+
 ## [2.2.8] — 2026-05-24
 
 ### Changed

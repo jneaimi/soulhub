@@ -1,5 +1,6 @@
 import { apiGet, apiPost } from '../api.ts';
 import { emit, fail, todayIso, exitIfApiFailure, type OutputOpts } from '../output.ts';
+import { resolveContent } from '../content-input.ts';
 
 interface AdrHit {
   path: string;
@@ -42,7 +43,8 @@ export async function propose(args: Record<string, string | undefined>, opts: Ou
   if (!args.project) fail('adr propose: --project SLUG is required');
   if (!args.slug) fail('adr propose: --slug (e.g. adr-003-some-name) is required');
   if (!args.title) fail('adr propose: --title is required');
-  if (!args.content) fail('adr propose: --content is required');
+  const rawContent = resolveContent(args);
+  if (rawContent === undefined) fail('adr propose: one of --content / --content-file / --content - is required');
 
   const today = todayIso();
   const meta: Record<string, unknown> = {
@@ -67,9 +69,9 @@ export async function propose(args: Record<string, string | undefined>, opts: Ou
   // skeleton check but lacks the H1, and the project graph then renders it as
   // an ugly slug-derived label (the ADR-012 symptom). Fail-closed mirror lives
   // in the vault template validator (requiresH1).
-  let content = /^##\s*Status/m.test(args.content)
-    ? args.content
-    : `# ${args.title}\n\n## Status\n\nProposed ${today}\n\n## Context\n\n${args.content}\n\n## Decision\n\n(fill in)\n\n## Consequences\n\n(fill in)\n`;
+  let content = /^##\s*Status/m.test(rawContent)
+    ? rawContent
+    : `# ${args.title}\n\n## Status\n\nProposed ${today}\n\n## Context\n\n${rawContent}\n\n## Decision\n\n(fill in)\n\n## Consequences\n\n(fill in)\n`;
   if (!/^#\s+\S/m.test(content)) {
     content = `# ${args.title}\n\n${content.replace(/^\s+/, '')}`;
   }

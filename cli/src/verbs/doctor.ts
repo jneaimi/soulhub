@@ -14,6 +14,19 @@ interface CatalogIndexFreshness {
   ageSeconds: number | null;
 }
 
+interface InboxAccountHealth {
+  id: string;
+  email: string;
+  status: string;
+  lastSync: number | null;
+  ageMs: number | null;
+  stale: boolean;
+}
+interface InboxHealth {
+  accounts: InboxAccountHealth[];
+  stale_count: number;
+}
+
 interface DoctorReport {
   ok: boolean;
   baseUrl: string;
@@ -21,7 +34,23 @@ interface DoctorReport {
   cli: { version: string; path: string };
   hooks: { writeGuard: boolean; bashGuard: boolean; soulCliGuard: boolean; vaultWriteSkill: boolean };
   catalogIndex: CatalogIndexFreshness | { probed: false; reason: string };
+  inbox: InboxHealth | { probed: false; reason: string };
   notes: string[];
+}
+
+const INBOX_STALE_THRESHOLD_MS = 30 * 60 * 1000;
+
+function ageShort(epochMs: number | null | undefined): string {
+  if (!epochMs) return 'never';
+  const ms = Date.now() - epochMs;
+  if (ms < 0) return '0s ago';
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
 }
 
 function pkgVersion(): string {
@@ -45,6 +74,7 @@ export async function doctor(_args: Record<string, string | undefined>, opts: Ou
       vaultWriteSkill: existsSync(join(homedir(), '.claude/skills/vault-write/SKILL.md')),
     },
     catalogIndex: { probed: false, reason: 'not probed' },
+    inbox: { probed: false, reason: 'not probed' },
     notes: [],
   };
 
@@ -87,6 +117,32 @@ export async function doctor(_args: Record<string, string | undefined>, opts: Ou
     }
   }
 
+  // ADR-005 — inbox sync-staleness. Same reachable-gate + non-fatal-note
+  // pattern as catalog-index above: a stale account is a note, not a failure,
+  // and a failed fetch surfaces as a note too (doesn't flip overall ok).
+  if (report.api.reachable) {
+    try {
+      const data = (await apiGet('/api/inbox/accounts')) as { accounts: Array<{ id: string; email?: string; label?: string; status?: string; lastSync?: number | null }> };
+      const now = Date.now();
+      const accts: InboxAccountHealth[] = data.accounts.map((a) => {
+        const lastSync = a.lastSync ?? null;
+        const ageMs = lastSync ? now - lastSync : null;
+        const stale = a.status === 'connected' && ageMs !== null && ageMs > INBOX_STALE_THRESHOLD_MS;
+        return { id: a.id, email: a.email ?? a.label ?? a.id, status: a.status ?? '?', lastSync, ageMs, stale };
+      });
+      const stale_count = accts.filter((x) => x.stale).length;
+      report.inbox = { accounts: accts, stale_count };
+      for (const a of accts) {
+        if (a.stale) report.notes.push(`inbox: ${a.email} connected but last sync ${ageShort(a.lastSync)} (stale)`);
+      }
+    } catch (err) {
+      report.inbox = {
+        probed: false,
+        reason: err instanceof ApiError ? `api ${err.status}` : 'network-error',
+      };
+    }
+  }
+
   if (!report.hooks.writeGuard || !report.hooks.bashGuard) {
     report.notes.push('Vault write-guard hook(s) missing — run `bash scripts/install-chokepoint.sh` from soul-hub.');
   }
@@ -122,6 +178,20 @@ export async function doctor(_args: Record<string, string | undefined>, opts: Ou
         const ageStr = ci.ageSeconds !== null ? `${Math.abs(ci.ageSeconds)}s behind` : 'stale';
         lines.push(`  catalog-index.json         ⚠  stale (${ageStr})`);
         if (ci.newestSource) lines.push(`    newest source            ${ci.newestSource}`);
+      }
+    }
+    lines.push(`Inbox:`);
+    if ('probed' in r.inbox && r.inbox.probed === false) {
+      lines.push(`  accounts                   ✗  (${r.inbox.reason})`);
+    } else {
+      const inb = r.inbox as InboxHealth;
+      if (inb.accounts.length === 0) {
+        lines.push(`  accounts                   —  (none configured)`);
+      } else {
+        for (const a of inb.accounts) {
+          const mark = a.stale ? '⚠' : '✓';
+          lines.push(`  ${(a.email ?? a.id).padEnd(27)}${mark}  ${a.status} (${ageShort(a.lastSync)})`);
+        }
       }
     }
     if (r.notes.length > 0) {

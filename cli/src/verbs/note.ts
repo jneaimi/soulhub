@@ -1,5 +1,6 @@
 import { apiPost, apiPut } from '../api.ts';
 import { emit, fail, exitIfApiFailure, type OutputOpts } from '../output.ts';
+import { resolveContent } from '../content-input.ts';
 
 interface WriteResp {
   success?: boolean;
@@ -39,7 +40,8 @@ function dryRunEmit(method: string, path: string, body: unknown, opts: OutputOpt
 export async function create(args: Record<string, string | undefined>, opts: OutputOpts) {
   if (!args.zone) fail('note create: --zone is required');
   if (!args.filename) fail('note create: --filename is required');
-  if (!args.content) fail('note create: --content is required');
+  const content = resolveContent(args);
+  if (content === undefined) fail('note create: one of --content / --content-file / --content - is required');
 
   const meta = parseMetaJson(args['meta-json']);
   // CLI shorthand: --type X promotes to meta.type if not already in --meta-json.
@@ -49,7 +51,7 @@ export async function create(args: Record<string, string | undefined>, opts: Out
     zone: args.zone,
     filename: args.filename,
     meta,
-    content: args.content,
+    content,
   };
 
   if (args['dry-run']) return dryRunEmit('POST', '/api/vault/notes', body, opts);
@@ -68,7 +70,7 @@ export async function update(args: Record<string, string | undefined>, opts: Out
   if (!path) fail('note update: missing PATH (e.g. soul note update projects/foo/index.md)');
 
   const meta = args['meta-json'] ? parseMetaJson(args['meta-json']) : undefined;
-  const content = args.content;
+  const content = resolveContent(args);
 
   if (meta === undefined && content === undefined) {
     fail('note update: at least one of --meta-json or --content is required');

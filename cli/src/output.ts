@@ -5,16 +5,24 @@ export interface OutputOpts {
   json: boolean;
 }
 
+// U+2028 (LINE SEPARATOR) / U+2029 (PARAGRAPH SEPARATOR) are valid JSON per spec
+// but emitted raw by JSON.stringify, and break some jq/JS consumers. A note body
+// can contain them. Escape them so every --json line is robustly parseable.
+// (C0 control chars are already escaped by JSON.stringify.)
+function jsonSafe(json: string): string {
+  return json.replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+}
+
 export function emit(value: unknown, opts: OutputOpts, prettyFn?: (v: any) => string): void {
   if (opts.json) {
-    process.stdout.write(JSON.stringify(value) + '\n');
+    process.stdout.write(jsonSafe(JSON.stringify(value)) + '\n');
     return;
   }
   if (prettyFn) {
     process.stdout.write(prettyFn(value) + '\n');
     return;
   }
-  process.stdout.write(JSON.stringify(value, null, 2) + '\n');
+  process.stdout.write(jsonSafe(JSON.stringify(value, null, 2)) + '\n');
 }
 
 export function fail(msg: string, code = 1): never {

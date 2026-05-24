@@ -43,21 +43,23 @@ READ VERBS
   soul crm followups
   soul scheduler tasks
   soul inbox queued [--limit N] [--account A]
+  soul inbox accounts                 (email accounts + sync age)
+  soul inbox status                   (sync-health summary; exits 1 if any account stale)
   soul intent metrics
   soul contracts touching PATH        (governance ADR-002 — what contracts a change touches)
   soul contracts check                (registry self-falsifier: resolution + cache freshness)
   soul doctor
 
 WRITE VERBS (each supports --dry-run)
-  soul note create   --zone Z --filename F --type T [--meta-json JSON] --content STR
-  soul note update   PATH [--meta-json JSON] [--content STR]
+  soul note create   --zone Z --filename F --type T [--meta-json JSON] (--content STR | --content-file PATH | --content -)
+  soul note update   PATH [--meta-json JSON] [--content STR | --content-file PATH | --content -]
   soul project create --slug S [--parent P] [--title T] [--meta-json JSON]
   soul project label-shape SLUG --shape SHAPE
   soul project label-falsifier SLUG --on YYYY-MM-DD [--text TEXT]
   soul project propose-adr SLUG --input-json '{...}' (or --title T --tier "Tier 2" --problem STR)
   soul project ship-slice SLUG --adr X --slice S<N> --status STATUS [--commit SHA]
   soul vault reindex
-  soul adr propose   --project P --slug S --title T --content STR [--meta-json JSON]
+  soul adr propose   --project P --slug S --title T (--content STR | --content-file PATH | --content -) [--meta-json JSON]
   soul adr accept    PATH
   soul adr ship      PATH
   soul adr park      PATH --review-after YYYY-MM-DD
@@ -86,6 +88,71 @@ Backed by the Soul Hub HTTP API. Governance + chokepoints (ADR-046/047/048/050)
 fire at the API layer; this CLI is a dumb pipe. Errors surface verbatim.
 `;
 
+// Per-verb usage lines, keyed by "<noun> <verb>" (matching the dispatch table)
+// plus the top-level "doctor". Sourced verbatim from the corresponding HELP line
+// so per-verb --help and the full HELP stay consistent. (ADR-007)
+const USAGE: Record<string, string> = {
+  'vault search': 'soul vault search [-q QUERY] [--zone Z] [--project P] [--type T] [--limit N]',
+  'vault get': 'soul vault get   PATH',
+  'vault recent': 'soul vault recent [--limit N]',
+  'vault hygiene': 'soul vault hygiene',
+  'vault reindex': 'soul vault reindex',
+  'vault writes': 'soul vault writes [--limit N] [--agent A] [--actor-prefix P] [--zone Z]',
+  'vault unresolved': 'soul vault unresolved',
+  'project list': 'soul project list',
+  'project get': 'soul project get   SLUG',
+  'project graph': 'soul project graph [--format json|adjacency-list|dot]',
+  'project edges': 'soul project edges SLUG [--format json|adjacency-list]',
+  'project create': 'soul project create --slug S [--parent P] [--title T] [--meta-json JSON]',
+  'project label-shape': 'soul project label-shape SLUG --shape SHAPE',
+  'project label-falsifier': 'soul project label-falsifier SLUG --on YYYY-MM-DD [--text TEXT]',
+  'project next-actions': 'soul project next-actions SLUG [--limit N]',
+  'project worklist': 'soul project worklist SLUG    [--json]',
+  'project similar': 'soul project similar --slug NEWSLUG [--title T] [--description D]',
+  'project propose-adr': `soul project propose-adr SLUG --input-json '{...}' (or --title T --tier "Tier 2" --problem STR)`,
+  'project ship-slice': 'soul project ship-slice SLUG --adr X --slice S<N> --status STATUS [--commit SHA]',
+  'adr list': 'soul adr list   --project SLUG [--status STATUS]',
+  'adr propose': 'soul adr propose   --project P --slug S --title T --content STR [--meta-json JSON]',
+  'adr accept': 'soul adr accept    PATH',
+  'adr ship': 'soul adr ship      PATH',
+  'adr park': 'soul adr park      PATH --review-after YYYY-MM-DD',
+  'adr reject': 'soul adr reject    PATH --reason "..."',
+  'recipe list': 'soul recipe list [--project P] [-q QUERY]',
+  'recipe get': 'soul recipe get SLUG',
+  'recipe run': `soul recipe run SLUG [--mode test|production|oneshot] [--input k=v] [--inputs-json '{...}'] [--run-id ID]`,
+  'recipe cancel': 'soul recipe cancel RUN_ID',
+  'component list': 'soul component list [--category C] [--runtime R] [-q QUERY]',
+  'component get': 'soul component get SLUG',
+  'naseej audit': 'soul naseej audit [--type runs|publishes] [--limit N] [--recipe R] [--status S]',
+  'catalog index': 'soul catalog index [--freshness]',
+  'crm find': 'soul crm find   [-q QUERY] [--stage S] [--limit N]',
+  'crm followups': 'soul crm followups',
+  'scheduler tasks': 'soul scheduler tasks',
+  'scheduler run-now': 'soul scheduler run-now TASK_ID',
+  'inbox queued': 'soul inbox queued [--limit N] [--account A]',
+  'inbox digest-telegram': `soul inbox digest-telegram [--since EPOCH_MS] [--inputs-json '{...}']`,
+  'intent metrics': 'soul intent metrics',
+  'note create': 'soul note create   --zone Z --filename F --type T [--meta-json JSON] --content STR',
+  'note update': 'soul note update   PATH [--meta-json JSON] [--content STR]',
+  'contracts touching': 'soul contracts touching PATH        (governance ADR-002 — what contracts a change touches)',
+  'contracts check': 'soul contracts check                (registry self-falsifier: resolution + cache freshness)',
+  doctor: 'soul doctor',
+};
+
+function isHelpFlag(s: string | undefined): boolean {
+  return s === '-h' || s === '--help';
+}
+
+// Print every usage line belonging to a noun (for `soul <noun> --help`).
+// Falls back to full HELP if the noun has no registered verbs.
+function printNounUsage(noun: string): void {
+  const prefix = `${noun} `;
+  const lines = Object.keys(USAGE)
+    .filter((k) => k.startsWith(prefix))
+    .map((k) => USAGE[k]);
+  process.stdout.write(lines.length > 0 ? lines.join('\n') + '\n' : HELP);
+}
+
 type Verb = (args: Record<string, string | undefined>, opts: OutputOpts) => Promise<void>;
 interface Dispatch { [noun: string]: { [verb: string]: Verb }; }
 
@@ -99,7 +166,7 @@ const dispatch: Dispatch = {
   catalog:   { index: catalogIndex },
   crm:       { find: crm.find, followups: crm.followups },
   scheduler: { tasks: scheduler.tasks, 'run-now': scheduler.runNow },
-  inbox:     { queued: inbox.queued, 'digest-telegram': inbox.digestTelegram },
+  inbox:     { queued: inbox.queued, accounts: inbox.accounts, status: inbox.status, 'digest-telegram': inbox.digestTelegram },
   intent:    { metrics: intent.metrics },
   note:      { create: note.create, update: note.update },
   contracts: { touching: contracts.touching, check: contracts.check },
@@ -135,13 +202,30 @@ async function main() {
 
   // doctor is a top-level verb (no noun).
   if (rest[0] === 'doctor') {
+    if (rest.slice(1).some(isHelpFlag)) { process.stdout.write(USAGE.doctor + '\n'); return; }
     await doctor({}, opts);
     return;
   }
 
   const [noun, verb, ...tail] = rest;
   if (!noun || !dispatch[noun]) fail(`unknown noun "${noun ?? ''}". Run \`soul --help\`.`);
+
+  // Per-verb --help interception (ADR-007). Must run BEFORE parseArgs (which would
+  // swallow the flag) and BEFORE the unknown-verb fail (so `soul vault --help` and
+  // `soul note create --help` print usage instead of erroring). No API call.
+  const helpInTail = tail.some(isHelpFlag);
+  if (isHelpFlag(verb) || (helpInTail && (!verb || !dispatch[noun][verb]))) {
+    printNounUsage(noun);
+    return;
+  }
+
   if (!verb || !dispatch[noun][verb]) fail(`unknown verb "${noun} ${verb ?? ''}". Run \`soul --help\`.`);
+
+  if (helpInTail) {
+    const u = USAGE[`${noun} ${verb}`];
+    process.stdout.write(u ? u + '\n' : HELP);
+    return;
+  }
 
   const parsed = parseArgs({
     args: tail,
@@ -169,6 +253,7 @@ async function main() {
       title:       { type: 'string' },
       filename:    { type: 'string' },
       content:     { type: 'string' },
+      'content-file': { type: 'string' },
       reason:      { type: 'string' },
       shape:       { type: 'string' },
       format:      { type: 'string' },
