@@ -35,6 +35,45 @@ function cachePath(): string {
 	return soulHubDataFile('update-check.json');
 }
 
+/** Live status written by scripts/update.mjs during a one-click update (ADR-011),
+ *  surfaced to the banner so it can show progress + an explicit failure reason. */
+export interface UpdateStatus {
+	phase: 'started' | 'pulling' | 'installing' | 'building' | 'resyncing' | 'reloading' | 'done' | 'failed' | 'aborted';
+	startedAt?: string;
+	updatedAt?: string;
+	version?: string;
+	error?: string;
+	files?: string[];
+	reloaded?: boolean;
+}
+
+/** Read the in-progress/last update status, or null if no update has run. Never throws. */
+export function readUpdateStatus(): UpdateStatus | null {
+	try {
+		const raw = readFileSync(soulHubDataFile('update-status.json'), 'utf-8');
+		const parsed = JSON.parse(raw) as Partial<UpdateStatus>;
+		return typeof parsed.phase === 'string' ? (parsed as UpdateStatus) : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Reset the status to a fresh `started` before spawning the updater, so the UI
+ *  can never read a stale `done`/`failed` from a previous run during the brief
+ *  window before update.mjs writes its own first status. Best-effort. */
+export function resetUpdateStatus(): void {
+	try {
+		const now = new Date().toISOString();
+		writeFileSync(
+			soulHubDataFile('update-status.json'),
+			JSON.stringify({ phase: 'started', startedAt: now, updatedAt: now }, null, 2) + '\n',
+			'utf-8',
+		);
+	} catch {
+		/* best-effort */
+	}
+}
+
 /**
  * Read the cached latest-release info. Returns `null` when the cache is cold
  * (never written) or unreadable/corrupt — callers treat null as "unknown",

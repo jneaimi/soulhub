@@ -45,6 +45,17 @@
 	type Phase = 'idle' | 'confirm' | 'updating' | 'done' | 'error';
 	let phase = $state<Phase>('idle');
 	let errorMsg = $state('');
+	let progress = $state(''); // live updater phase label (Pulling…/Building…/…)
+
+	// Human labels for the updater's status-file phases (ADR-011 status signal).
+	const PHASE_LABEL: Record<string, string> = {
+		started: 'starting',
+		pulling: 'pulling latest',
+		installing: 'installing dependencies',
+		building: 'building',
+		resyncing: 'finishing up',
+		reloading: 'restarting',
+	};
 
 	// ── Freshness poller (ADR-010) — only when the feature is active (the server
 	//    sends `update` only when updateCheck is on; private/flag-off instances
@@ -90,6 +101,7 @@
 		if (!eff?.latestVersion) return;
 		phase = 'updating';
 		errorMsg = '';
+		progress = '';
 		try {
 			const res = await fetch('/api/system/update', {
 				method: 'POST',
@@ -107,9 +119,10 @@
 		}
 	}
 
-	/** Poll GET /api/system/version every 3s for up to 120s. When the running
-	 *  version matches the target tag, the reload landed — full-page reload to
-	 *  pick up the new bundle. On timeout, tell the operator to check the log. */
+	/** Poll GET /api/system/version every 3s for up to 120s. Surfaces the live
+	 *  updater phase (ADR-011 status signal) and fails FAST on an explicit
+	 *  aborted/failed status instead of waiting out the timeout. When the running
+	 *  version matches the target tag, the reload landed → full-page reload. */
 	function pollForNewVersion(targetTag: string): void {
 		const target = strip(targetTag);
 		const deadline = Date.now() + 120_000;
@@ -123,6 +136,18 @@
 				const res = await fetch('/api/system/version', { cache: 'no-store' });
 				if (res.ok) {
 					const data = await res.json();
+					const st = data?.updateStatus;
+					// Explicit failure from the updater → surface immediately.
+					if (st && (st.phase === 'failed' || st.phase === 'aborted')) {
+						phase = 'error';
+						errorMsg =
+							st.error ||
+							(st.phase === 'aborted' ? 'Update could not start' : 'Update failed') +
+								' — check ~/.soul-hub/logs/update.log';
+						return;
+					}
+					// Live progress label.
+					if (st && PHASE_LABEL[st.phase]) progress = PHASE_LABEL[st.phase];
 					if (strip(data?.version) === target) {
 						phase = 'done';
 						setTimeout(() => location.reload(), 2000);
@@ -146,7 +171,7 @@
 		{#if phase === 'updating'}
 			<span class="flex items-center gap-2">
 				<span class="inline-block w-3 h-3 border-2 border-hub-info/40 border-t-hub-info rounded-full animate-spin"></span>
-				Updating to {eff?.latestVersion}… Soul Hub will restart.
+				Updating to {eff?.latestVersion}{progress ? ` — ${progress}` : ''}… Soul Hub will restart.
 			</span>
 		{:else if phase === 'done'}
 			<span class="font-medium text-hub-cta">Updated to {eff?.latestVersion} — reloading…</span>

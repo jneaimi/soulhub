@@ -4,6 +4,15 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.7] — 2026-05-24
+
+### Added
+- **Live update progress** — when you click "Update now", the banner now shows
+  the real step in progress ("pulling latest", "installing dependencies",
+  "building", "restarting") and surfaces an explicit failure reason the moment
+  something goes wrong, instead of spinning until a 120-second timeout. Powered
+  by a status file the updater writes and `/api/system/version` reports.
+
 ## [2.2.6] — 2026-05-24
 
 ### Fixed
@@ -129,6 +138,7 @@ command center, orchestrated by Claude Code.
   development) and the **Playbook** engine (being decommissioned). Enable them
   via `features` in `~/.soul-hub/settings.json` at your own risk.
 
+[2.2.7]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.7
 [2.2.6]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.6
 [2.2.5]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.5
 [2.2.4]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.4

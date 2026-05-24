@@ -7,7 +7,7 @@ import { config } from '$lib/config.js';
 import { APP_VERSION } from '$lib/version.js';
 import { soulHubHome } from '$lib/paths.js';
 import { checkUpdateAccess } from '$lib/update-check/access-guard.js';
-import { readUpdateCache } from '$lib/update-check/index.js';
+import { readUpdateCache, resetUpdateStatus } from '$lib/update-check/index.js';
 
 /**
  * POST /api/system/update — the ADR-011 guarded one-click update.
@@ -86,7 +86,7 @@ export const POST: RequestHandler = async ({ request }) => {
 				{
 					error:
 						'Update blocked: the install has uncommitted changes. Commit or stash them, then retry.',
-					files: blocking.map((l) => l.slice(3)),
+					files: blocking.map((l) => l.replace(/^\s*\S+\s+/, '')),
 				},
 				{ status: 409 },
 			);
@@ -103,6 +103,10 @@ export const POST: RequestHandler = async ({ request }) => {
 	mkdirSync(logDir, { recursive: true });
 	const logPath = resolve(logDir, 'update.log');
 	const logFd = openSync(logPath, 'a');
+
+	// Reset the status to a fresh `started` so the UI's progress poll can't read a
+	// stale outcome from a previous update during the spawn window.
+	resetUpdateStatus();
 
 	try {
 		const child = spawn(

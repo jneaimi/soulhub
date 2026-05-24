@@ -1,7 +1,7 @@
 import type { RequestHandler } from './$types';
 import { json } from '@sveltejs/kit';
 import { APP_NAME, APP_VERSION } from '$lib/version.js';
-import { getUpdateState } from '$lib/update-check/index.js';
+import { getUpdateState, readUpdateStatus } from '$lib/update-check/index.js';
 
 /**
  * GET /api/system/version — report the running build's name + semver, plus the
@@ -25,5 +25,7 @@ export const GET: RequestHandler = async () => {
 		releaseUrl: update.releaseUrl,
 		checkedAt: update.checkedAt,
 		updateAvailable: update.updateAvailable,
+		// ADR-011 — live one-click-update progress/outcome (null when none has run).
+		updateStatus: readUpdateStatus(),
 	});
 };

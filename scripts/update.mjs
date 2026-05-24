@@ -13,6 +13,43 @@
 // you with a server you didn't ask for.
 
 import { execSync, spawnSync } from 'node:child_process';
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { homedir } from 'node:os';
+
+// ── Update status signal (ADR-011) — the endpoint spawns this script detached,
+// so the browser can't see stdout. Write each phase to a small JSON file the
+// server surfaces via GET /api/system/version, so the UI shows live progress
+// ("Pulling…/Building…/Reloading…") and an EXPLICIT failure reason instead of
+// waiting out the 120s version-poll timeout. Honors SOUL_HUB_HOME. Best-effort:
+// a write failure never derails the update.
+function statusPath() {
+  const envHome = process.env.SOUL_HUB_HOME;
+  const home = envHome
+    ? (envHome.startsWith('~') ? resolve(homedir(), envHome.slice(1).replace(/^\/+/, '')) : resolve(envHome))
+    : resolve(homedir(), '.soul-hub');
+  const dir = resolve(home, 'data');
+  try { mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
+  return resolve(dir, 'update-status.json');
+}
+const STATUS_PATH = statusPath();
+const STARTED_AT = new Date().toISOString();
+function writeStatus(phase, extra = {}) {
+  try {
+    writeFileSync(
+      STATUS_PATH,
+      JSON.stringify({ phase, startedAt: STARTED_AT, updatedAt: new Date().toISOString(), ...extra }, null, 2) + '\n',
+      'utf-8',
+    );
+  } catch { /* best-effort — never derail the update on a status-write error */ }
+}
+// Any unhandled throw (a failing execSync at pull/install/build) records a
+// `failed` status with the message, so the UI surfaces it instead of timing out.
+process.on('uncaughtException', (err) => {
+  writeStatus('failed', { error: String((err && err.message) || err) });
+  console.error(red(String((err && err.stack) || err)));
+  process.exit(1);
+});
 
 const TTY = process.stdout.isTTY;
 const c = (code, s) => (TTY ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -57,6 +94,7 @@ function capture(cmd) {
 }
 
 console.log(bold('Soul Hub updater'));
+writeStatus('started');
 
 // ── 0. Refuse on a dirty tree — never clobber local changes ────────
 // EXCEPT package-lock.json: a plain `npm install` rewrites its version field,
@@ -76,6 +114,7 @@ if (dirty) {
     console.error(red('\nWorking tree has uncommitted changes — refusing to pull.'));
     console.error(dim('Commit or stash them first, then re-run `npm run update`.'));
     console.error(dim(nonLock.join('\n')));
+    writeStatus('aborted', { error: 'Uncommitted changes in the working tree', files: nonLock.map((l) => l.replace(/^\s*\S+\s+/, '')) });
     process.exit(1);
   }
 }
@@ -88,6 +127,7 @@ if (verifyRemote) {
     console.error(dim(`  expected origin: ${verifyRemote}`));
     console.error(dim(`  actual origin:   ${origin || '(none)'}`));
     console.error(dim('  A mismatched remote could execute arbitrary code under your account.'));
+    writeStatus('aborted', { error: `Remote pin mismatch (expected ${verifyRemote}, got ${origin || 'none'})` });
     process.exit(2);
   }
   ok(`remote pin verified (origin → ${origin})`);
@@ -97,6 +137,7 @@ const before = capture('git rev-parse --short HEAD');
 
 // ── 1. Pull ────────────────────────────────────────────────────────
 step('Pulling latest from origin');
+writeStatus('pulling');
 run('git pull --ff-only');
 const after = capture('git rev-parse --short HEAD');
 if (before && before === after) {
@@ -114,11 +155,13 @@ if (before && before === after) {
 // to run regardless of the inherited NODE_ENV. (Caught by live one-click test
 // 2026-05-24.)
 step('Installing dependencies (incl. dev — build needs vite/svelte-kit)');
+writeStatus('installing', { version: after });
 run('npm install --include=dev');
 ok('dependencies installed');
 
 // ── 3. Build ────────────────────────────────────────────────────────
 step('Building');
+writeStatus('building', { version: after });
 run('npm run build');
 ok('build complete');
 
@@ -128,6 +171,7 @@ ok('build complete');
 //        not go stale on a pull. Idempotent; non-fatal — a failed resync warns
 //        but never blocks the update (the running server matters more). ───────
 step('Re-syncing vault-write chokepoint (skill + hooks)');
+writeStatus('resyncing', { version: after });
 const resync = spawnSync('bash', ['scripts/install-chokepoint.sh', '--quiet'], { stdio: 'inherit' });
 if (resync.status === 0) {
   ok('chokepoint re-synced to this checkout');
@@ -138,6 +182,7 @@ if (resync.status === 0) {
 // ── 4. Reload only if a production process is already online ────────
 if (noReload) {
   warn('--no-reload set — not touching any running process');
+  writeStatus('done', { version: after, reloaded: false });
   console.log(`\n${green('Update complete.')} Run ${bold('npm run prod:reload')} to apply.`);
   process.exit(0);
 }
@@ -155,10 +200,13 @@ if (pm2List.status === 0) {
 
 if (online) {
   step('Reloading running production process (zero-downtime)');
+  writeStatus('reloading', { version: after });
   run('npm run prod:reload');
   ok('soul-hub reloaded');
+  writeStatus('done', { version: after, reloaded: true });
   console.log(`\n${green('Update complete and live.')}`);
 } else {
   warn('no online `soul-hub` process found — skipping reload');
+  writeStatus('done', { version: after, reloaded: false });
   console.log(`\n${green('Update complete.')} Start it with ${bold('npm run prod:start')} (production) or ${bold('npm run dev')}.`);
 }
