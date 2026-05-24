@@ -24,10 +24,20 @@ Options:
   --remote URL       public remote (default: https://github.com/jneaimi/soulhub.git)
   --target DIR       export staging dir (default: /tmp/soulhub-release)
   --message MSG      public commit message (default: derived from version + sha)
+  --bump LEVEL       cut a versioned release: bump package.json (patch|minor|
+                     major), commit+push it to private main, then publish +
+                     tag v<new> + create the GitHub Release. Implies --gh-release.
   --gh-release       after push, create a GitHub Release for v<version> if the
                      tag does not already exist on the remote (needs `gh` auth)
   --dry-run          assemble + show what WOULD be pushed; make no remote changes
   -h, --help         this help
+
+Versioning (ADR-006 semver):
+  Plain `npm run release` syncs public main with NO version change (rolling
+  main). Cut a versioned release with --bump when it's a milestone:
+    patch = bug fixes   minor = new backward-compatible features   major = breaking
+  update-check (ADR-010) reads the latest GitHub *Release*, so only --bump
+  releases are visible to users' "update available" banner.
 """
 from __future__ import annotations
 import argparse
@@ -58,9 +68,44 @@ def git_out(args: list[str], cwd: Path) -> str:
     return run(["git", *args], cwd=cwd, capture=True).stdout.strip()
 
 
+def next_version(old: str, level: str) -> str:
+    """Pure semver increment. patch|minor|major."""
+    import re
+    if not re.fullmatch(r"\d+\.\d+\.\d+", old):
+        die(f"package.json version {old!r} is not semver X.Y.Z — bump manually.")
+    major, minor, patch = (int(x) for x in old.split("."))
+    if level == "major":
+        return f"{major + 1}.0.0"
+    if level == "minor":
+        return f"{major}.{minor + 1}.0"
+    return f"{major}.{minor}.{patch + 1}"
+
+
+def apply_bump(old: str, new: str) -> str:
+    """Rewrite package.json version, commit + push to private main. Returns new."""
+    import re
+    pkg = REPO_ROOT / "package.json"
+    text = pkg.read_text()
+    rewritten, count = re.subn(r'("version":\s*")' + re.escape(old) + r'(")',
+                               r"\g<1>" + new + r"\g<2>", text, count=1)
+    if count != 1:
+        die(f'could not rewrite "version": "{old}" in package.json')
+    pkg.write_text(rewritten)
+    step(f"Bumped version {old} → {new}")
+    run(["git", "add", "package.json"], cwd=REPO_ROOT)
+    run(["git", "commit", "-m", f"chore(release): v{new}"], cwd=REPO_ROOT)
+    run(["git", "push", "origin", "main"], cwd=REPO_ROOT)
+    ok("committed + pushed bump to private main")
+    cl = REPO_ROOT / "CHANGELOG.md"
+    if cl.exists() and new not in cl.read_text():
+        warn(f"CHANGELOG.md has no v{new} entry — the GitHub Release notes auto-generate, but CHANGELOG is the in-repo record. Add one.")
+    return new
+
+
 def main() -> None:
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--yes", action="store_true")
+    p.add_argument("--bump", choices=["patch", "minor", "major"], default=None)
     p.add_argument("--remote", default=DEFAULT_REMOTE)
     p.add_argument("--target", default=DEFAULT_TARGET)
     p.add_argument("--message", default=None)
@@ -91,6 +136,29 @@ def main() -> None:
             print(unpushed, file=sys.stderr)
     except subprocess.CalledProcessError:
         pass  # no upstream configured; ignore
+
+    # Versioned release: bump first (commit+push private), then the publish flow
+    # carries the new version into the export + tag + GitHub Release.
+    confirmed = False
+    if args.bump:
+        new = next_version(version, args.bump)
+        if args.dry_run:
+            warn(f"--dry-run: would bump {version}→{new} ({args.bump}), commit+push private, publish, create GitHub Release v{new}.")
+            version = new  # reflect intended version in the preview; no writes
+            args.gh_release = True
+        else:
+            if not args.yes:
+                try:
+                    ans = input(f"\n{B}RELEASE v{new}{X} (bump {version}→{new}, {args.bump}): "
+                                f"commit+push private main, publish to public, create GitHub Release v{new}. Continue? [y/N] ")
+                except EOFError:
+                    ans = ""
+                if ans.strip().lower() not in ("y", "yes"):
+                    die("aborted (release not confirmed).")
+            version = apply_bump(version, new)
+            args.gh_release = True
+            confirmed = True
+            short_sha = git_out(["rev-parse", "--short", "HEAD"], REPO_ROOT)
 
     step(f"Publishing Soul Hub v{version} (canonical {short_sha}) → {args.remote}")
 
@@ -123,8 +191,9 @@ def main() -> None:
         warn(f"--dry-run: would commit ({msg!r}) and push to {args.remote}; stopping.")
         return
 
-    # 3. Confirmation gate — this writes to a PUBLIC remote.
-    if not args.yes:
+    # 3. Confirmation gate — this writes to a PUBLIC remote. (Skipped when a
+    #    --bump release was already confirmed up front.)
+    if not args.yes and not confirmed:
         try:
             ans = input(f"\n{B}Push the above to the PUBLIC repo {args.remote}? [y/N] {X}")
         except EOFError:

@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **soul-hub** (21958 symbols, 29613 relationships, 269 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **soul-hub** (21994 symbols, 29679 relationships, 269 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -58,6 +58,14 @@ npm run release             # 2. assemble public surface + push to soulhub (asks
 `npm run release` → `uv run scripts/release-publish.py`. It runs `release-export.sh` (copies tracked files minus personal content, seeds feature flags off, runs the fail-closed export gate), then pushes the delta to the public repo **history-preserving** (never force-push). It **refuses to push without confirmation** (`--yes` to skip the prompt) because it writes to a public remote. `--dry-run` shows what would ship without pushing; `--gh-release` also cuts a GitHub Release (needed for ADR-010's update-check). It never touches the live `:2400` instance.
 
 ⚠️ `release-export.sh` copies tracked files from the **working tree**, so uncommitted edits to tracked files WILL ship — commit first for a reproducible release.
+
+**Versioning (semver — ADR-006).** Plain `npm run release` syncs public main with **no version change** (rolling main — fine for docs/minor syncs). Cut a *versioned* release at milestones:
+
+```bash
+npm run release -- --bump minor    # bumps package.json, commits+pushes private, publishes, tags v<new>, creates the GitHub Release
+```
+
+`patch` = bug fixes · `minor` = new backward-compatible features · `major` = breaking changes. The update-check banner (ADR-010) compares the installed version to the **latest GitHub Release**, so only `--bump` releases are visible to users — continuous unbumped pushes stay invisible until the next versioned release.
 
 ## Reading or writing Soul Hub state? The `soul` CLI is first-choice.
 

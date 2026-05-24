@@ -4,6 +4,34 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] — 2026-05-24
+
+### Added
+- **One-command public release** — `npm run release` assembles the public
+  surface and publishes it to the public repo (history-preserving, never
+  force-push); `--bump patch|minor|major` cuts a versioned GitHub Release
+  (bump → tag → release). (ADR-013)
+- **uv-first Python runtime** — `bootstrap.sh` now installs `uv`, and
+  Soul-Hub Python scripts run via `uv run` with inline (PEP 723) dependencies;
+  `doctor` checks for `uv`. (ADR-012)
+- **Built-in daily vault backup** — the `vault-backup-daily` git-snapshot
+  safety net is now a code-default scheduler task, so every install has it
+  without hand-editing `settings.json`. (ADR-012)
+
+### Changed
+- **Quieter, more accurate fresh-install doctor** — `curl_cffi` is probed via
+  yt-dlp (where it actually lives), `SOUL_HUB_PUBLIC_URL` only warns when the
+  remote tunnel is enabled, and the operator-only `soul-hub-backup-daily` check
+  is now informational. A correctly-set-up local install reports no spurious
+  warnings. (ADR-012)
+- **Guaranteed ADR titles** — `soul adr propose` injects the `# ADR-N — Title`
+  H1 and the vault template validator enforces it.
+
+### Fixed
+- **Unified Inbox** — new IMAP mail is now fetched promptly via an IDLE
+  `exists` handler plus a 5-minute poll fallback (previously sync could stall
+  while the connection still showed "connected").
+
 ## [2.0.0] — 2026-05-23
 
 First public release of Soul Hub — a local-first, single-user ambient AI
@@ -34,4 +62,5 @@ command center, orchestrated by Claude Code.
   development) and the **Playbook** engine (being decommissioned). Enable them
   via `features` in `~/.soul-hub/settings.json` at your own risk.
 
+[2.1.0]: https://github.com/jneaimi/soulhub/releases/tag/v2.1.0
 [2.0.0]: https://github.com/jneaimi/soulhub/releases/tag/v2.0.0

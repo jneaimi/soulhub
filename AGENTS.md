@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **soul-hub** (21958 symbols, 29613 relationships, 269 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **soul-hub** (21994 symbols, 29679 relationships, 269 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -54,6 +54,8 @@ npm run release             # assemble public surface + push to soulhub (confirm
 ```
 
 `npm run release` → `uv run scripts/release-publish.py`: runs `release-export.sh` (tracked files minus personal content, flags off, fail-closed gate), then history-preserving push to the public repo (never force-push). Refuses to push without confirmation (`--yes` to skip); `--dry-run` previews; `--gh-release` cuts a GitHub Release. `release-export.sh` copies the **working tree**, so commit first for a reproducible release.
+
+**Versioning (semver — ADR-006):** plain `npm run release` syncs main with no version change. Cut a versioned release with `npm run release -- --bump patch|minor|major` (bumps package.json, commits+pushes private, publishes, tags `v<new>`, creates the GitHub Release). PATCH = fixes · MINOR = new features · MAJOR = breaking. update-check (ADR-010) only sees `--bump` releases.
 
 ## Tools Quick Reference
 
