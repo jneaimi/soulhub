@@ -632,6 +632,26 @@ export const CORE_SCHEDULER_TASKS: z.infer<typeof SchedulerTaskSchema>[] = [
 		description: 'Once-daily batched vault-health digest (silent on clean days).',
 		params: {},
 	},
+	{
+		// ADR-012 Fix 1 — code-default so every install gets the daily vault git
+		// safety-net snapshot even when settings.json predates it (the seed-only
+		// path in bootstrap.sh is skipped when settings.json already exists). The
+		// `<REPO_ROOT>` cwd placeholder is resolved to process.cwd() at merge time
+		// in applyAdditiveSchemaDefaults (settings.json gets it substituted at
+		// seed time instead). Safe on any machine: vault-backup-daily.sh commits
+		// locally and pushes only if an origin remote exists (soft-fails otherwise).
+		id: 'vault-backup-daily',
+		type: 'shell-script',
+		cron: '0 23 * * *',
+		enabled: true,
+		noOverlap: true,
+		description: 'Daily vault git snapshot (+ push if origin set) — safety net under event-driven commits (ADR-019).',
+		params: {
+			command: ['bash', 'scripts/vault-backup-daily.sh'],
+			cwd: '<REPO_ROOT>',
+			timeoutMs: 60000,
+		},
+	},
 ];
 
 export const SchedulerSchema = z.object({

@@ -371,6 +371,37 @@ else
   warn "starter-agent installer reported issues — run: bash install/agents/install.sh"
 fi
 
+# ── 8e. uv — Python runtime for PEP 723 scripts (ADR-012) ───────
+# Soul-Hub-authored Python scripts (scripts/peer-brief/*.py, etc.) run via
+# `uv run` with inline deps. uv must be present or those scripts fail. Install
+# once; skip if already on PATH. Library deps live in the scripts (PEP 723);
+# this only provisions the uv runtime itself.
+step "Installing uv (Python runtime for scripts)"
+if command -v uv >/dev/null 2>&1; then
+  ok "uv $(uv --version 2>/dev/null | awk '{print $2}') (already installed)"
+else
+  case "$(uname -s)" in
+    Darwin)
+      if command -v brew >/dev/null 2>&1; then
+        if brew install uv >/dev/null 2>&1; then ok "uv installed (brew)"
+        else warn "brew install uv failed — install manually: https://docs.astral.sh/uv/"; fi
+      else
+        warn "Homebrew not found — install uv manually: https://docs.astral.sh/uv/"
+      fi
+      ;;
+    Linux)
+      if curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1; then
+        ok "uv installed (astral installer — restart shell or source ~/.local/bin to use)"
+      else
+        warn "uv install failed — install manually: https://docs.astral.sh/uv/"
+      fi
+      ;;
+    *)
+      warn "Unknown platform — install uv manually: https://docs.astral.sh/uv/"
+      ;;
+  esac
+fi
+
 # ── 9. Optional: TikTok transcription deps (ADR-024) ────────────
 step "Optional: TikTok transcription deps"
 if command -v yt-dlp >/dev/null 2>&1 \

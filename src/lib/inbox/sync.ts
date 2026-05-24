@@ -39,6 +39,12 @@ const INITIAL_RECONNECT_DELAY = 3_000; // 3 sec
 const IDLE_TIMEOUT = 15 * 60 * 1000; // 15 min (RFC max is 29)
 const INITIAL_SYNC_DAYS = 30;
 const FETCH_BATCH_SIZE = 100;
+// Safety-net poll for IMAP accounts, mirroring OUTLOOK_POLL_INTERVAL. IDLE push
+// ('exists' handler below) is the primary path; this catches half-open TCP
+// connections that never fire 'close' and any 'exists' event we miss. Without
+// it, a silently-dead IDLE socket leaves an account "connected" but stale for
+// hours — the 2026-05-24 "synced 23h ago" bug.
+const IMAP_POLL_INTERVAL = 5 * 60 * 1000; // 5 min
 
 interface AccountWorker {
 	accountId: string;
@@ -46,6 +52,11 @@ interface AccountWorker {
 	reconnectTimer: ReturnType<typeof setTimeout> | null;
 	reconnectDelay: number;
 	stopping: boolean;
+	// IMAP-only: periodic re-sync fallback (see IMAP_POLL_INTERVAL).
+	pollTimer: ReturnType<typeof setInterval> | null;
+	// Re-entrancy guard so overlapping 'exists' + poll triggers don't stack
+	// getMailboxLock acquisitions on the same connection.
+	resyncing: boolean;
 }
 
 let workers: Map<string, AccountWorker> = new Map();
@@ -95,6 +106,7 @@ export async function stopSync(): Promise<void> {
 
 	for (const [, worker] of workers) {
 		worker.stopping = true;
+		clearPollTimer(worker);
 		if (worker.reconnectTimer) {
 			clearTimeout(worker.reconnectTimer);
 			worker.reconnectTimer = null;
@@ -123,6 +135,7 @@ export function startAccountSync(account: InboxAccount): void {
 	const existing = workers.get(account.id);
 	if (existing) {
 		existing.stopping = true;
+		clearPollTimer(existing);
 		if (existing.reconnectTimer) {
 			clearTimeout(existing.reconnectTimer);
 			existing.reconnectTimer = null;
@@ -139,6 +152,8 @@ export function startAccountSync(account: InboxAccount): void {
 		reconnectTimer: null,
 		reconnectDelay: INITIAL_RECONNECT_DELAY,
 		stopping: false,
+		pollTimer: null,
+		resyncing: false,
 	};
 	workers.set(account.id, worker);
 
@@ -150,6 +165,7 @@ export function stopAccountSync(accountId: string): void {
 	const worker = workers.get(accountId);
 	if (!worker) return;
 	worker.stopping = true;
+	clearPollTimer(worker);
 	if (worker.reconnectTimer) {
 		clearTimeout(worker.reconnectTimer);
 		worker.reconnectTimer = null;
@@ -164,8 +180,46 @@ export function stopAccountSync(accountId: string): void {
 	clearAccountAlert(accountId);
 }
 
+/** Stop the IMAP safety-net poll for a worker (idempotent). */
+function clearPollTimer(worker: AccountWorker): void {
+	if (worker.pollTimer) {
+		clearInterval(worker.pollTimer);
+		worker.pollTimer = null;
+	}
+}
+
+/**
+ * Re-run the incremental sync on the live connection. Triggered by the 'exists'
+ * push event and the periodic poll. The `resyncing` guard collapses overlapping
+ * triggers so they don't queue competing getMailboxLock() acquisitions. Errors
+ * are swallowed here — the client's 'close'/'error' handlers own reconnection,
+ * so we must NOT call scheduleReconnect from this path (that double-schedules
+ * and reproduces the 2026-05-04 reconnect storm).
+ */
+async function triggerResync(
+	worker: AccountWorker,
+	account: InboxAccount,
+	reason: 'exists' | 'poll',
+): Promise<void> {
+	if (worker.stopping || worker.resyncing) return;
+	const client = worker.client;
+	if (!client) return;
+	worker.resyncing = true;
+	try {
+		await syncInbox(worker, account, client);
+		getSyncEmitter().emit('synced', account.id);
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		console.warn(`[inbox-sync:${account.id}] Re-sync (${reason}) failed: ${msg}`);
+	} finally {
+		worker.resyncing = false;
+	}
+}
+
 async function connectWorker(worker: AccountWorker, account: InboxAccount): Promise<void> {
 	if (worker.stopping) return;
+	// Defensive: a stale poll timer must never outlive a (re)connect attempt.
+	clearPollTimer(worker);
 
 	// Outlook uses Graph API, not IMAP
 	if (account.provider === 'outlook') {
@@ -246,10 +300,25 @@ async function connectWorker(worker: AccountWorker, account: InboxAccount): Prom
 	updateAccountStatus(account.id, 'syncing');
 
 	client.on('close', () => {
+		clearPollTimer(worker);
 		if (worker.stopping) return;
 		console.log(`[inbox-sync:${account.id}] Connection closed, scheduling reconnect (${worker.reconnectDelay}ms)`);
 		updateAccountStatus(account.id, 'disconnected');
 		scheduleReconnect(worker, account);
+	});
+
+	// IMAP push: imapflow emits 'exists' when the server reports the open
+	// mailbox grew. The connection IDLEs after the initial sync releases its
+	// lock, so this is how near-real-time delivery actually happens. Before
+	// this handler existed, new mail was only pulled on (re)connect — leaving
+	// accounts "connected" but stale (2026-05-24 bug).
+	client.on('exists', (data: { count?: number; prevCount?: number }) => {
+		if (worker.stopping) return;
+		// Only resync on growth; imapflow also emits 'exists' on expunge renumber.
+		if (typeof data?.count === 'number' && typeof data?.prevCount === 'number' && data.count <= data.prevCount) {
+			return;
+		}
+		void triggerResync(worker, account, 'exists');
 	});
 
 	client.on('error', (err: Error) => {
@@ -271,8 +340,13 @@ async function connectWorker(worker: AccountWorker, account: InboxAccount): Prom
 		markAccountRecovered(account);
 		getSyncEmitter().emit('synced', account.id);
 
-		// IDLE for push — client stays open listening for new messages
-		// imapflow auto-starts IDLE when the mailbox is open and no commands are active
+		// Primary delivery is IDLE push via the 'exists' handler above (imapflow
+		// auto-IDLEs once the mailbox is open and no command is in flight).
+		// The poll below is the safety net for missed events / half-open sockets.
+		clearPollTimer(worker);
+		worker.pollTimer = setInterval(() => {
+			void triggerResync(worker, account, 'poll');
+		}, IMAP_POLL_INTERVAL);
 
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
@@ -287,6 +361,8 @@ async function connectWorker(worker: AccountWorker, account: InboxAccount): Prom
 
 function scheduleReconnect(worker: AccountWorker, account: InboxAccount): void {
 	if (worker.stopping) return;
+	// The connection is dying — stop polling a dead socket until reconnect.
+	clearPollTimer(worker);
 	// Idempotent: a single failed connect attempt fires both the 'close' event
 	// AND rejects the connect() promise, so two paths race to schedule. Without
 	// this guard, both stick — each spawns a new client on a fresh schedule,

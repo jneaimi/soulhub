@@ -129,7 +129,19 @@ function applyAdditiveSchemaDefaults(cfg: SoulHubConfig): SoulHubConfig {
 	const userTaskIds = new Set(cfg.scheduler.tasks.map((t) => t.id));
 	for (const coreTask of defaults.scheduler.tasks) {
 		if (!userTaskIds.has(coreTask.id)) {
-			cfg.scheduler.tasks.push(coreTask);
+			// Shell-script core tasks (e.g. vault-backup-daily, ADR-012) carry a
+			// `<REPO_ROOT>` cwd placeholder. settings.json gets it substituted at
+			// seed time by bootstrap.sh; code-defaults must resolve it here to the
+			// running repo root so the task's cwd is a real path, not the literal.
+			const cwd = (coreTask.params as Record<string, unknown> | undefined)?.cwd;
+			if (typeof cwd === 'string' && cwd.includes('<REPO_ROOT>')) {
+				cfg.scheduler.tasks.push({
+					...coreTask,
+					params: { ...coreTask.params, cwd: cwd.replace(/<REPO_ROOT>/g, process.cwd()) },
+				});
+			} else {
+				cfg.scheduler.tasks.push(coreTask);
+			}
 		}
 	}
 

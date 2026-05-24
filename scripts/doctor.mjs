@@ -54,6 +54,16 @@ try {
   add('better-sqlite3', 'fail', e.message.split('\n')[0]);
 }
 
+// ── 3b. uv (PEP 723 Python runtime — ADR-012) ──────────────────
+// Soul-Hub-authored Python scripts (peer-brief/*.py, etc.) run via `uv run`
+// with inline deps. uv must be on PATH or those scripts fail.
+try {
+  const v = execSync('uv --version', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+  add('uv', 'ok', v);
+} catch {
+  add('uv', 'warn', 'not found — uv-run Python scripts (peer-brief, etc.) will fail; re-run: bash scripts/bootstrap.sh');
+}
+
 // ── 4. ~/.soul-hub writable ────────────────────────────────────
 try {
   if (!existsSync(SOUL_HUB_HOME)) {
@@ -92,15 +102,28 @@ try {
   else add('SOUL_HUB_SECRET', 'warn', 'unset — required for Unified Inbox only');
 }
 
-// ── 6b. SOUL_HUB_PUBLIC_URL (ADR-055) ──────────────────────────
+// ── 6b. SOUL_HUB_PUBLIC_URL (ADR-055 / ADR-012 Fix 4) ──────────
+// Unset is correct on a local-only install (ADR-006 localhost default). It is
+// only a problem when remote access (the Cloudflare tunnel) is active — then
+// deeplinks would wrongly point at localhost. So WARN only when the tunnel is
+// enabled and the URL is unset; otherwise report OK/informational.
 {
   const envFile = join(SOUL_HUB_HOME, '.env');
-  let hasPublicUrl = !!process.env.SOUL_HUB_PUBLIC_URL;
-  if (!hasPublicUrl && existsSync(envFile)) {
-    hasPublicUrl = readFileSync(envFile, 'utf8').split(/\r?\n/).some((l) => /^SOUL_HUB_PUBLIC_URL=.+/.test(l));
-  }
+  const envText = existsSync(envFile) ? readFileSync(envFile, 'utf8') : '';
+  const envLines = envText.split(/\r?\n/);
+  let hasPublicUrl = !!process.env.SOUL_HUB_PUBLIC_URL || envLines.some((l) => /^SOUL_HUB_PUBLIC_URL=.+/.test(l));
+
+  // Mirrors ecosystem.config.cjs TUNNEL_ENABLED: SOUL_HUB_TUNNEL !== '0' && cloudflared present.
+  const tunnelOptOut = process.env.SOUL_HUB_TUNNEL === '0' || envLines.some((l) => /^SOUL_HUB_TUNNEL=0\s*$/.test(l));
+  const cloudflaredPresent = (process.env.PATH || '')
+    .split(':')
+    .concat(['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin'])
+    .some((d) => { try { return d && existsSync(join(d, 'cloudflared')); } catch { return false; } });
+  const tunnelEnabled = !tunnelOptOut && cloudflaredPresent;
+
   if (hasPublicUrl) add('SOUL_HUB_PUBLIC_URL', 'ok', 'set');
-  else add('SOUL_HUB_PUBLIC_URL', 'warn', 'unset — deeplinks default to http://localhost:2400 (set in ~/.soul-hub/.env for remote access)');
+  else if (tunnelEnabled) add('SOUL_HUB_PUBLIC_URL', 'warn', 'tunnel enabled but URL unset — remote deeplinks point to localhost. Set SOUL_HUB_PUBLIC_URL in ~/.soul-hub/.env');
+  else add('SOUL_HUB_PUBLIC_URL', 'ok', 'localhost (set SOUL_HUB_PUBLIC_URL only for remote access)');
 }
 
 // ── 7. Vault dir ──────────────────────────────────────────────
@@ -175,23 +198,24 @@ try {
   }
 }
 
-// ── 11. vault-backup-daily scheduler task (ADR-019) ────────────
+// ── 11. vault-backup-daily scheduler task (ADR-019 / ADR-012 Fix 1) ─
+// vault-backup-daily is a CORE_SCHEDULER_TASKS code-default — it is merged into
+// the running config even when settings.json omits it, so it is always
+// scheduled. Report the source rather than warning on absence.
 {
   const tasks = settings?.scheduler?.tasks ?? [];
-  const found = Array.isArray(tasks) && tasks.some((t) => t?.id === 'vault-backup-daily');
-  if (found) add('vault-backup task', 'ok', 'scheduler task registered');
-  else add('vault-backup task', 'warn', 'not in settings.json — re-run: bash scripts/bootstrap.sh, or copy from settings.example.json');
+  const inSettings = Array.isArray(tasks) && tasks.some((t) => t?.id === 'vault-backup-daily');
+  add('vault-backup task', 'ok', inSettings ? 'settings.json (operator override)' : 'code-default (always scheduled)');
 }
 
-// ── 11.5 soul-hub-backup-daily scheduler task ──────────────────
-// Sibling of #11: pushes committed-but-unpushed main commits to
-// origin nightly. Push-only (no auto-stage) since soul-hub is
-// operator-driven, unlike vault's event-driven commit pattern.
+// ── 11.5 soul-hub-backup-daily scheduler task (ADR-012 Fix 2) ──
+// Pushes committed-but-unpushed main commits to origin nightly. Operator /
+// primary-machine-only — on a secondary or public install you do NOT want a
+// second machine auto-pushing. Absent is correct, not a warning: report OK.
 {
   const tasks = settings?.scheduler?.tasks ?? [];
   const found = Array.isArray(tasks) && tasks.some((t) => t?.id === 'soul-hub-backup-daily');
-  if (found) add('soul-hub-backup task', 'ok', 'scheduler task registered');
-  else add('soul-hub-backup task', 'warn', 'not in settings.json — copy soul-hub-backup-daily entry from settings.example.json');
+  add('soul-hub-backup task', 'ok', found ? 'scheduler task registered' : 'not configured — opt-in for the primary machine; safe to skip elsewhere');
 }
 
 // ── 12. TikTok transcription deps (ADR-024) ──────────────────
@@ -211,12 +235,20 @@ try {
     const hasYtDlp = hasBin('yt-dlp');
     const hasFfmpeg = hasBin('ffmpeg');
     const hasWhisperCli = hasBin('whisper-cli');
+    // curl_cffi lives in yt-dlp's OWN venv (its impersonation backend), never in
+    // system python3 — so probe yt-dlp itself, the same check install-tiktok-deps.sh
+    // uses to self-verify (ADR-012 Fix 3). Only meaningful when yt-dlp is present.
     let hasCurlCffi = false;
-    try {
-      execSync('python3 -c "import curl_cffi"', { stdio: 'ignore' });
-      hasCurlCffi = true;
-    } catch {
-      hasCurlCffi = false;
+    if (hasYtDlp) {
+      try {
+        execSync('yt-dlp --list-impersonate-targets 2>/dev/null | grep -q curl_cffi', {
+          stdio: 'ignore',
+          shell: '/bin/bash',
+        });
+        hasCurlCffi = true;
+      } catch {
+        hasCurlCffi = false;
+      }
     }
     const modelDir = process.env.WHISPER_MODEL_BASE_DIR
       ? process.env.WHISPER_MODEL_BASE_DIR.replace(/^~/, HOME)
