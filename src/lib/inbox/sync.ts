@@ -20,7 +20,7 @@ import { ImapFlow } from 'imapflow';
 import { EventEmitter } from 'node:events';
 import {
 	getAccountCredential, listAccounts, updateAccountStatus,
-	upsertMessages, getSyncState,
+	upsertMessages, getSyncState, updateAccountLastSync,
 	upsertSyncState, getMessageCount, getInboxDb,
 	getAccount, pruneOldMessages, deleteMessagesByFolder,
 } from './db.js';
@@ -444,6 +444,11 @@ async function syncInbox(
 				uidValidity: Number(uidValidity),
 				lastSync: Date.now(),
 			});
+			// Keep accounts.last_sync (the column powering the "synced Xh ago"
+			// UI label + getInboxStats MAX) in lockstep with sync_state. The
+			// no-new-messages path is the common case for the 5-min poll, so
+			// without this the label freezes at the initial-connect time.
+			updateAccountLastSync(account.id);
 			return;
 		}
 
@@ -559,6 +564,8 @@ async function syncInbox(
 			uidValidity: Number(uidValidity),
 			lastSync: Date.now(),
 		});
+		// Mirror into accounts.last_sync (UI label + stats source).
+		updateAccountLastSync(account.id);
 
 		// Prune old messages based on retention policy
 		const accountData = getAccount(account.id);
