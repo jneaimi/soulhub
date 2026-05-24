@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **soul-hub** (21946 symbols, 29584 relationships, 264 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **soul-hub** (21958 symbols, 29613 relationships, 269 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -43,6 +43,17 @@ This project is indexed by GitNexus as **soul-hub** (21946 symbols, 29584 relati
 <!-- gitnexus:end -->
 
 <!-- operator-curated: survives `gitnexus analyze` because it lives outside the marker block above. -->
+
+## Releasing to the public repo (two-repo distribution — ADR-008 / ADR-013)
+
+This repo (`jneaimi/soul-hub`) is **PRIVATE**. A separate **PUBLIC** repo (`jneaimi/soulhub`) gets a clean minimal surface. Editing soul-hub does NOT update the public repo — publishing is explicit:
+
+```bash
+git push origin main        # land on private main first (pre-push gates run)
+npm run release             # assemble public surface + push to soulhub (confirms before pushing)
+```
+
+`npm run release` → `uv run scripts/release-publish.py`: runs `release-export.sh` (tracked files minus personal content, flags off, fail-closed gate), then history-preserving push to the public repo (never force-push). Refuses to push without confirmation (`--yes` to skip); `--dry-run` previews; `--gh-release` cuts a GitHub Release. `release-export.sh` copies the **working tree**, so commit first for a reproducible release.
 
 ## Tools Quick Reference
 

@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **soul-hub** (21946 symbols, 29584 relationships, 264 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **soul-hub** (21958 symbols, 29613 relationships, 269 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -43,6 +43,21 @@ This project is indexed by GitNexus as **soul-hub** (21946 symbols, 29584 relati
 <!-- gitnexus:end -->
 
 <!-- operator-curated: survives `gitnexus analyze` because it lives outside the marker block above. -->
+
+## Releasing to the public repo (two-repo distribution — ADR-008 / ADR-013)
+
+This repo (`jneaimi/soul-hub`) is **PRIVATE** — the operator's command center. A separate **PUBLIC** repo (`jneaimi/soulhub`) receives only a clean, minimal surface. Editing soul-hub does NOT update the public repo; publishing is an explicit, separate step.
+
+**To publish a change to the public repo:**
+
+```bash
+git push origin main        # 1. land it on private main first (pre-push gates run)
+npm run release             # 2. assemble public surface + push to soulhub (asks to confirm)
+```
+
+`npm run release` → `uv run scripts/release-publish.py`. It runs `release-export.sh` (copies tracked files minus personal content, seeds feature flags off, runs the fail-closed export gate), then pushes the delta to the public repo **history-preserving** (never force-push). It **refuses to push without confirmation** (`--yes` to skip the prompt) because it writes to a public remote. `--dry-run` shows what would ship without pushing; `--gh-release` also cuts a GitHub Release (needed for ADR-010's update-check). It never touches the live `:2400` instance.
+
+⚠️ `release-export.sh` copies tracked files from the **working tree**, so uncommitted edits to tracked files WILL ship — commit first for a reproducible release.
 
 ## Reading or writing Soul Hub state? The `soul` CLI is first-choice.
 
