@@ -145,6 +145,17 @@ function applyAdditiveSchemaDefaults(cfg: SoulHubConfig): SoulHubConfig {
 		}
 	}
 
+	// ADR-010 F1 — the `update-check` task is public-distribution only and is the
+	// schema default for `scheduler.tasks` (so it's seeded even when settings.json
+	// omits an explicit task list). The `updateCheck` feature flag is the master
+	// switch: when it's off (the operator's private-instance default), strip the
+	// task entirely so it is never reconciled — no task, no scheduler_runs, no
+	// banner. Post-merge filter, not an add-skip, because the schema default has
+	// already placed it in the list by the time we get here.
+	if (cfg.features.updateCheck !== true) {
+		cfg.scheduler.tasks = cfg.scheduler.tasks.filter((t) => t.id !== 'update-check');
+	}
+
 	return cfg;
 }
 

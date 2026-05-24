@@ -22,7 +22,7 @@
 
 <div class="h-screen overflow-hidden bg-hub-bg flex flex-col">
 	{#if showHeader}
-		<AppHeader features={data.features} />
+		<AppHeader features={data.features} update={data.update} />
 	{/if}
 	<div class="flex-1 min-h-0 overflow-hidden">
 		{@render children()}

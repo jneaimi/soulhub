@@ -97,6 +97,7 @@
   "features": {
     "naseej": false,
     "workspaces": false,
-    "playbook": false
+    "playbook": false,
+    "updateCheck": true
   }
 }

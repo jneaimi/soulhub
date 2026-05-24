@@ -23,6 +23,7 @@ import { hygieneDigestFactory } from '$lib/scheduler/handlers/hygiene-digest.js'
 import { contractFalsifierFactory } from '$lib/scheduler/handlers/contract-falsifier.js';
 import { notificationBudgetFalsifierFactory } from '$lib/scheduler/handlers/notification-budget-falsifier.js';
 import { operatorNotificationBudgetFalsifierFactory } from '$lib/scheduler/handlers/operator-notification-budget-falsifier.js';
+import { updateCheckTaskFactory } from '$lib/scheduler/handlers/update-check.js';
 import { initVault, getVaultEngine } from '$lib/vault/index.js';
 import { initSystemHealth, getSystemHealth } from '$lib/system/index.js';
 import { listSessions, killSession } from '$lib/pty/manager.js';
@@ -219,6 +220,11 @@ try {
 		'operator-notification-budget-falsifier',
 		operatorNotificationBudgetFalsifierFactory,
 		'soul-hub-governance ADR-004 — falsifier for the operator-notification-budget contract: counts digest-tier operator sends in 24h and errors red on /hygiene if over budget (convergence pile-creep guard).',
+	);
+	registerTaskHandler(
+		'update-check',
+		updateCheckTaskFactory,
+		'ADR-010 — daily public-release drift check; fetches GitHub /releases/latest and caches the latest tag for the update-available banner. Task instance only reconciled when features.updateCheck is true.',
 	);
 } catch (err) {
 	console.error('[scheduler] handler registration failed:', err);

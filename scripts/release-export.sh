@@ -63,20 +63,23 @@ while IFS= read -r -d '' f; do
 done < <(git -C "$ROOT" ls-files -z)
 ok "copied $copied tracked files, withheld $skipped personal-content files"
 
-# Seed feature flags OFF in the public settings template, so a fresh public
-# install hides Naseej / Workspaces / Playbook until the operator opts in.
-step "Seeding feature flags off in settings.example.json"
+# Seed feature flags in the public settings template. Not-yet-released modules
+# (Naseej / Workspaces / Playbook) ship OFF until the operator opts in.
+# updateCheck is the INVERSE of the canonical default: ON for public installs
+# (so strangers see the update-available banner — ADR-010) but OFF on the
+# operator's private command center, which develops features before they ship.
+step "Seeding feature flags in settings.example.json"
 SEX="$TARGET/settings.example.json"
 if [ -f "$SEX" ]; then
   python3 - "$SEX" <<'PY'
 import json, sys
 p = sys.argv[1]
 d = json.load(open(p))
-d["features"] = {"naseej": False, "workspaces": False, "playbook": False}
+d["features"] = {"naseej": False, "workspaces": False, "playbook": False, "updateCheck": True}
 json.dump(d, open(p, "w"), indent=2)
 open(p, "a").write("\n")
 PY
-  ok "features.{naseej,workspaces,playbook} = false"
+  ok "features = {naseej:false, workspaces:false, playbook:false, updateCheck:true}"
 else
   warn "settings.example.json missing in export — features not seeded"
 fi

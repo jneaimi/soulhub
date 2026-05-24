@@ -4,6 +4,9 @@
 //
 //   npm run update              # pull + install + build, reload if running
 //   npm run update -- --no-reload   # never touch a running process
+//   node scripts/update.mjs --verify-remote https://github.com/jneaimi/soulhub
+//                               # abort unless origin matches (used by the
+//                               # ADR-011 one-click update endpoint)
 //
 // Safe to run on a dev checkout (no PM2 process → it just pulls + builds).
 // It NEVER starts a process that wasn't already running, so it can't surprise
@@ -21,9 +24,26 @@ const dim = (s) => c('2', s);
 
 const noReload = process.argv.includes('--no-reload');
 
+// ADR-011 §2d — remote pin. When the one-click update endpoint spawns this
+// script it passes `--verify-remote <url>`; the pull is then refused unless
+// `origin` matches, so a hijacked local remote can't make the RCE path execute
+// arbitrary code. Argument-driven (NOT hardcoded) so manual `npm run update`
+// stays portable across the canonical repo (jneaimi/soul-hub) and forks.
+function argValue(flag) {
+  const eq = process.argv.find((a) => a.startsWith(`${flag}=`));
+  if (eq) return eq.slice(flag.length + 1);
+  const i = process.argv.indexOf(flag);
+  return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : null;
+}
+const verifyRemote = argValue('--verify-remote');
+
 const step = (s) => console.log(`${bold('==>')} ${s}`);
 const ok = (s) => console.log(`  ${green('✓')} ${s}`);
 const warn = (s) => console.log(`  ${yellow('!')} ${s}`);
+
+// Normalize a git remote URL for comparison: drop a trailing `.git`, a trailing
+// slash, and case. `https://github.com/jneaimi/soulhub.git` == `…/soulhub`.
+const normRemote = (u) => String(u || '').trim().toLowerCase().replace(/\.git$/, '').replace(/\/$/, '');
 
 function run(cmd, opts = {}) {
   execSync(cmd, { stdio: 'inherit', ...opts });
@@ -44,6 +64,19 @@ if (dirty) {
   console.error(red('\nWorking tree has uncommitted changes — refusing to pull.'));
   console.error(dim('Commit or stash them first, then re-run `npm run update`.'));
   process.exit(1);
+}
+
+// ── 0b. Remote pin (ADR-011 F4) — only when --verify-remote is passed ──
+if (verifyRemote) {
+  const origin = capture('git remote get-url origin');
+  if (normRemote(origin) !== normRemote(verifyRemote)) {
+    console.error(red('\nRemote pin check FAILED — refusing to pull.'));
+    console.error(dim(`  expected origin: ${verifyRemote}`));
+    console.error(dim(`  actual origin:   ${origin || '(none)'}`));
+    console.error(dim('  A mismatched remote could execute arbitrary code under your account.'));
+    process.exit(2);
+  }
+  ok(`remote pin verified (origin → ${origin})`);
 }
 
 const before = capture('git rev-parse --short HEAD');
@@ -67,6 +100,19 @@ ok('dependencies installed');
 step('Building');
 run('npm run build');
 ok('build complete');
+
+// ── 3b. Re-sync the out-of-repo chokepoint artifacts (ADR-006 step 9 /
+//        ADR-011 F3). install-chokepoint.sh re-copies the /vault-write skill +
+//        hooks from THIS checkout into ~/.claude/, so the copied SKILL.md does
+//        not go stale on a pull. Idempotent; non-fatal — a failed resync warns
+//        but never blocks the update (the running server matters more). ───────
+step('Re-syncing vault-write chokepoint (skill + hooks)');
+const resync = spawnSync('bash', ['scripts/install-chokepoint.sh', '--quiet'], { stdio: 'inherit' });
+if (resync.status === 0) {
+  ok('chokepoint re-synced to this checkout');
+} else {
+  warn(`chokepoint resync exited ${resync.status ?? 'null'} — vault-write skill may be stale; run scripts/install-chokepoint.sh manually`);
+}
 
 // ── 4. Reload only if a production process is already online ────────
 if (noReload) {

@@ -18,6 +18,26 @@ const dim = (s) => c('2', s);
 const checks = [];
 const add = (label, status, detail) => checks.push({ label, status, detail });
 
+// True iff semver `latest` is strictly higher than `current` (v-prefix tolerated).
+// Unparseable → false (never claim an update we can't verify). Mirrors isNewer in
+// src/lib/update-check/index.ts.
+const semverNewer = (latest, current) => {
+  const parse = (v) => {
+    const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(v ?? '').trim());
+    return m ? [+m[1], +m[2], +m[3]] : null;
+  };
+  const a = parse(latest), b = parse(current);
+  if (!a || !b) return false;
+  for (let i = 0; i < 3; i++) { if (a[i] > b[i]) return true; if (a[i] < b[i]) return false; }
+  return false;
+};
+
+// Running build version (package.json, resolved relative to this script).
+let appVersion = null;
+try {
+  appVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+} catch { /* leave null — update-check step degrades to a soft note */ }
+
 const HOME = homedir();
 const SOUL_HUB_HOME = process.env.SOUL_HUB_HOME
   ? resolve(process.env.SOUL_HUB_HOME.replace(/^~/, HOME))
@@ -216,6 +236,37 @@ try {
   const tasks = settings?.scheduler?.tasks ?? [];
   const found = Array.isArray(tasks) && tasks.some((t) => t?.id === 'soul-hub-backup-daily');
   add('soul-hub-backup task', 'ok', found ? 'scheduler task registered' : 'not configured — opt-in for the primary machine; safe to skip elsewhere');
+}
+
+// ── 11.6 update-check (ADR-010) ──────────────────────────────
+// Public-distribution feature: when features.updateCheck is on, the daily
+// update-check task caches the latest published GitHub Release and the
+// AppHeader banner surfaces it. OFF on the operator's private instance (flag
+// default false) — report that as OK, not a warning.
+{
+  const flagOn = settings?.features?.updateCheck === true;
+  if (!flagOn) {
+    add('update-check', 'ok', 'disabled (operator default — enabled on public installs)');
+  } else {
+    const cachePath = join(SOUL_HUB_HOME, 'data', 'update-check.json');
+    if (!existsSync(cachePath)) {
+      add('update-check', 'warn', 'cache cold — the daily update-check task (03:00) populates it on next run');
+    } else {
+      try {
+        const cache = JSON.parse(readFileSync(cachePath, 'utf8'));
+        const latest = cache?.latestTag;
+        if (!latest || !appVersion) {
+          add('update-check', 'warn', 'cache present but missing latestTag — refreshes on next task run');
+        } else if (semverNewer(latest, appVersion)) {
+          add('update-check', 'warn', `update available: ${latest} (running ${appVersion}) — see GitHub Releases`);
+        } else {
+          add('update-check', 'ok', `up to date (running ${appVersion}, latest published ${latest})`);
+        }
+      } catch {
+        add('update-check', 'warn', 'cache unreadable — refreshes on next task run');
+      }
+    }
+  }
 }
 
 // ── 12. TikTok transcription deps (ADR-024) ──────────────────

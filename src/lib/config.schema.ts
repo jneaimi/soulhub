@@ -51,6 +51,11 @@ export const FeaturesSchema = z.object({
 	naseej: z.boolean().default(false),
 	workspaces: z.boolean().default(false),
 	playbook: z.boolean().default(false),
+	// ADR-010 — public-distribution update-available banner + daily release
+	// drift check. INVERTED default vs the others: the operator's private
+	// command center develops features before they ship, so it wants this OFF
+	// (default false). The public export seeds it true in release-export.sh.
+	updateCheck: z.boolean().default(false),
 });
 export type FeaturesConfig = z.infer<typeof FeaturesSchema>;
 
@@ -651,6 +656,21 @@ export const CORE_SCHEDULER_TASKS: z.infer<typeof SchedulerTaskSchema>[] = [
 			cwd: '<REPO_ROOT>',
 			timeoutMs: 60000,
 		},
+	},
+	{
+		// ADR-010 — daily public-release drift check. Fetches GitHub
+		// /releases/latest, writes the cache the version endpoint + AppHeader
+		// banner read. Gated by the `updateCheck` feature flag: the merge in
+		// applyAdditiveSchemaDefaults skips this core task unless the flag is
+		// true, so the operator's private instance (flag default false) never
+		// reconciles it (ADR-010 F1).
+		id: 'update-check',
+		type: 'update-check',
+		cron: '0 3 * * *',
+		enabled: true,
+		noOverlap: true,
+		description: 'Daily check for a newer published GitHub Release (ADR-010) — drives the update-available banner.',
+		params: {},
 	},
 ];
 

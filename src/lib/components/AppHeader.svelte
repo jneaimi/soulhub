@@ -1,8 +1,10 @@
 <script lang="ts">
 	import { page } from '$app/stores';
 	import type { FeaturesConfig } from '$lib/config.schema';
+	import type { UpdateState } from '$lib/update-check';
+	import UpdateBanner from './UpdateBanner.svelte';
 
-	let { features }: { features?: FeaturesConfig } = $props();
+	let { features, update }: { features?: FeaturesConfig; update?: UpdateState | null } = $props();
 
 	// ADR-008 — `feature` tags a nav entry to a visibility flag; entries with no
 	// tag always show. An entry is hidden only when its flag is explicitly false
@@ -31,6 +33,8 @@
 		return path === prefix || path.startsWith(prefix + '/');
 	}
 </script>
+
+<UpdateBanner {update} />
 
 <header class="flex-shrink-0 border-b border-hub-border bg-hub-bg/95 backdrop-blur sticky top-0 z-30">
 	<div class="flex items-center gap-3 max-w-6xl mx-auto w-full px-4 sm:px-6 h-10">

@@ -4,6 +4,26 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] — 2026-05-24
+
+### Added
+- **Update-available banner** — Soul Hub now checks once a day for a newer
+  published release and shows a slim, dismissible banner ("Soul Hub vX.Y.Z is
+  available" + a "What's new" link) when your build is behind. Read-only; the
+  check reads a local cache, never blocks a page render, and works offline.
+  (ADR-010)
+- **One-click update** — the banner's **Update now** button runs the full
+  update (`git pull → install → build → reload`) for you, with a confirmation
+  modal and live progress; the page reloads itself when the new version is up.
+  The update endpoint is locked to same-origin browser requests (an exposed
+  port or a CSRF page cannot trigger it), verifies the git remote before
+  pulling, and re-syncs the vault-write chokepoint on every update. (ADR-011)
+
+### Notes
+- Both features are controlled by the `updateCheck` flag in
+  `~/.soul-hub/settings.json`, on by default for this distribution. Set it to
+  `false` to hide the banner and disable the update endpoint.
+
 ## [2.1.0] — 2026-05-24
 
 ### Added
@@ -62,5 +82,6 @@ command center, orchestrated by Claude Code.
   development) and the **Playbook** engine (being decommissioned). Enable them
   via `features` in `~/.soul-hub/settings.json` at your own risk.
 
+[2.2.0]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.0
 [2.1.0]: https://github.com/jneaimi/soulhub/releases/tag/v2.1.0
 [2.0.0]: https://github.com/jneaimi/soulhub/releases/tag/v2.0.0
