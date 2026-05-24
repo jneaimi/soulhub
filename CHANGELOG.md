@@ -4,6 +4,18 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.6] — 2026-05-24
+
+### Fixed
+- **One-click update no longer blocked by `package-lock.json` drift** — every
+  `npm install` rewrites the lockfile's version field, which left the working
+  tree "dirty" and made the updater refuse to pull (the click appeared to run,
+  then nothing happened). The updater now discards lockfile-only drift and
+  proceeds; releases keep `package-lock.json` in lockstep with `package.json`
+  so the drift stops being created; and the update endpoint now returns an
+  immediate, explicit error if the tree has *real* uncommitted changes instead
+  of leaving the UI to time out after 120s.
+
 ## [2.2.5] — 2026-05-24
 
 ### Changed
@@ -117,6 +129,7 @@ command center, orchestrated by Claude Code.
   development) and the **Playbook** engine (being decommissioned). Enable them
   via `features` in `~/.soul-hub/settings.json` at your own risk.
 
+[2.2.6]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.6
 [2.2.5]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.5
 [2.2.4]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.4
 [2.2.3]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.3

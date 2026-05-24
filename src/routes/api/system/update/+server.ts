@@ -1,6 +1,6 @@
 import type { RequestHandler } from './$types';
 import { json } from '@sveltejs/kit';
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 import { openSync, mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { config } from '$lib/config.js';
@@ -70,10 +70,34 @@ export const POST: RequestHandler = async ({ request }) => {
 		);
 	}
 
-	// 5. Spawn the DETACHED updater. It outlives the pm2 reload that kills this
+	// 5. Pre-flight dirty-tree check — synchronous, so the browser gets an
+	//    immediate, actionable error instead of waiting out the 120s poll timeout
+	//    when the detached updater would bail. Mirrors update.mjs: package-lock.json
+	//    drift is tolerated (the updater discards + regenerates it); any OTHER
+	//    uncommitted change blocks the pull.
+	const repoRoot = process.cwd();
+	try {
+		const porcelain = execSync('git status --porcelain', { cwd: repoRoot, encoding: 'utf-8' }).trim();
+		const blocking = porcelain
+			.split('\n')
+			.filter((l) => l.trim() && !l.endsWith('package-lock.json'));
+		if (blocking.length > 0) {
+			return json(
+				{
+					error:
+						'Update blocked: the install has uncommitted changes. Commit or stash them, then retry.',
+					files: blocking.map((l) => l.slice(3)),
+				},
+				{ status: 409 },
+			);
+		}
+	} catch {
+		/* not a git checkout / git unavailable — let the updater handle it */
+	}
+
+	// 6. Spawn the DETACHED updater. It outlives the pm2 reload that kills this
 	//    process. Output goes to ~/.soul-hub/logs/update.log so the operator can
 	//    inspect a stalled/failed run ("check the terminal" in the UI timeout).
-	const repoRoot = process.cwd();
 	const scriptPath = resolve(repoRoot, 'scripts', 'update.mjs');
 	const logDir = resolve(soulHubHome(), 'logs');
 	mkdirSync(logDir, { recursive: true });

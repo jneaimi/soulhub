@@ -59,11 +59,25 @@ function capture(cmd) {
 console.log(bold('Soul Hub updater'));
 
 // ── 0. Refuse on a dirty tree — never clobber local changes ────────
+// EXCEPT package-lock.json: a plain `npm install` rewrites its version field,
+// so it drifts on essentially every install. That drift is safe to discard —
+// the `npm install` step below regenerates it. Refuse only on REAL local edits;
+// auto-discard lockfile-only drift so the one-click update isn't permanently
+// blocked by a file the operator never touched. (Caught on a live install
+// 2026-05-24.)
 const dirty = capture('git status --porcelain');
 if (dirty) {
-  console.error(red('\nWorking tree has uncommitted changes — refusing to pull.'));
-  console.error(dim('Commit or stash them first, then re-run `npm run update`.'));
-  process.exit(1);
+  const lines = dirty.split('\n').filter(Boolean);
+  const nonLock = lines.filter((l) => !l.endsWith('package-lock.json'));
+  if (nonLock.length === 0) {
+    warn('discarding package-lock.json drift (npm regenerates it)');
+    run('git checkout -- package-lock.json');
+  } else {
+    console.error(red('\nWorking tree has uncommitted changes — refusing to pull.'));
+    console.error(dim('Commit or stash them first, then re-run `npm run update`.'));
+    console.error(dim(nonLock.join('\n')));
+    process.exit(1);
+  }
 }
 
 // ── 0b. Remote pin (ADR-011 F4) — only when --verify-remote is passed ──

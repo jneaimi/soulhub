@@ -82,7 +82,7 @@ def next_version(old: str, level: str) -> str:
 
 
 def apply_bump(old: str, new: str) -> str:
-    """Rewrite package.json version, commit + push to private main. Returns new."""
+    """Rewrite package.json + package-lock.json version, commit + push. Returns new."""
     import re
     pkg = REPO_ROOT / "package.json"
     text = pkg.read_text()
@@ -92,7 +92,25 @@ def apply_bump(old: str, new: str) -> str:
         die(f'could not rewrite "version": "{old}" in package.json')
     pkg.write_text(rewritten)
     step(f"Bumped version {old} → {new}")
-    run(["git", "add", "package.json"], cwd=REPO_ROOT)
+
+    # Keep package-lock.json's version in lockstep. SET it directly (not an
+    # old→new substitution): historically the lockfile was never bumped, so its
+    # committed value has drifted (e.g. stuck at 2.0.0). A stale committed
+    # lockfile means every install's `npm install` rewrites the version field →
+    # a dirty tree → the one-click updater refuses to pull. Syncing it here stops
+    # that drift at the source. (Both the root `version` and packages[""].version.)
+    lock = REPO_ROOT / "package-lock.json"
+    if lock.exists():
+        data = json.loads(lock.read_text())
+        data["version"] = new
+        if isinstance(data.get("packages"), dict) and "" in data["packages"]:
+            data["packages"][""]["version"] = new
+        lock.write_text(json.dumps(data, indent=2) + "\n")
+        ok(f"synced package-lock.json version → {new}")
+    else:
+        warn("no package-lock.json to sync")
+
+    run(["git", "add", "package.json", "package-lock.json"], cwd=REPO_ROOT)
     run(["git", "commit", "-m", f"chore(release): v{new}"], cwd=REPO_ROOT)
     run(["git", "push", "origin", "main"], cwd=REPO_ROOT)
     ok("committed + pushed bump to private main")
