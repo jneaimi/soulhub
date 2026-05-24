@@ -53,6 +53,9 @@ READ VERBS
 WRITE VERBS (each supports --dry-run)
   soul note create   --zone Z --filename F --type T [--meta-json JSON] (--content STR | --content-file PATH | --content -)
   soul note update   PATH [--meta-json JSON] [--content STR | --content-file PATH | --content -]
+  soul note move     SRC-PATH DST-ZONE [--rename NEW-FILENAME] [--dry-run]   (link-safe: rewrites inbound wikilinks)
+  soul note rename   SRC-PATH NEW-FILENAME [--dry-run]
+  soul note move-batch (--moves-json '[{src,targetZone?,newFilename?}]' | --moves-file PATH) [--dry-run]
   soul project create --slug S [--parent P] [--title T] [--meta-json JSON]
   soul project label-shape SLUG --shape SHAPE
   soul project label-falsifier SLUG --on YYYY-MM-DD [--text TEXT]
@@ -63,6 +66,7 @@ WRITE VERBS (each supports --dry-run)
   soul adr accept    PATH
   soul adr ship      PATH
   soul adr park      PATH --review-after YYYY-MM-DD
+  soul adr move      SRC-PATH --project SLUG [--rename NEW-FILENAME] [--dry-run]   (link-safe relocate into a project)
   soul adr reject    PATH --reason "..."
   soul recipe run SLUG [--mode test|production|oneshot] [--input k=v] [--inputs-json '{...}'] [--run-id ID]
   soul recipe cancel RUN_ID
@@ -117,6 +121,7 @@ const USAGE: Record<string, string> = {
   'adr ship': 'soul adr ship      PATH',
   'adr park': 'soul adr park      PATH --review-after YYYY-MM-DD',
   'adr reject': 'soul adr reject    PATH --reason "..."',
+  'adr move': 'soul adr move      SRC-PATH --project SLUG [--rename FILE] [--dry-run]',
   'recipe list': 'soul recipe list [--project P] [-q QUERY]',
   'recipe get': 'soul recipe get SLUG',
   'recipe run': `soul recipe run SLUG [--mode test|production|oneshot] [--input k=v] [--inputs-json '{...}'] [--run-id ID]`,
@@ -130,10 +135,15 @@ const USAGE: Record<string, string> = {
   'scheduler tasks': 'soul scheduler tasks',
   'scheduler run-now': 'soul scheduler run-now TASK_ID',
   'inbox queued': 'soul inbox queued [--limit N] [--account A]',
+  'inbox accounts': 'soul inbox accounts                 (email accounts + sync age)',
+  'inbox status': 'soul inbox status                   (sync-health summary; exits 1 if any account stale)',
   'inbox digest-telegram': `soul inbox digest-telegram [--since EPOCH_MS] [--inputs-json '{...}']`,
   'intent metrics': 'soul intent metrics',
   'note create': 'soul note create   --zone Z --filename F --type T [--meta-json JSON] --content STR',
   'note update': 'soul note update   PATH [--meta-json JSON] [--content STR]',
+  'note move': 'soul note move     SRC-PATH DST-ZONE [--rename NEW-FILENAME] [--dry-run]',
+  'note rename': 'soul note rename   SRC-PATH NEW-FILENAME [--dry-run]',
+  'note move-batch': `soul note move-batch (--moves-json '[{src,targetZone?,newFilename?}]' | --moves-file PATH) [--dry-run]`,
   'contracts touching': 'soul contracts touching PATH        (governance ADR-002 — what contracts a change touches)',
   'contracts check': 'soul contracts check                (registry self-falsifier: resolution + cache freshness)',
   doctor: 'soul doctor',
@@ -159,7 +169,7 @@ interface Dispatch { [noun: string]: { [verb: string]: Verb }; }
 const dispatch: Dispatch = {
   vault:     { search: vault.search, get: vault.get, recent: vault.recent, hygiene: vault.hygiene, reindex: vault.reindex, writes: vault.writes, unresolved: vault.unresolved },
   project:   { list: project.list, get: project.get, graph: project.graph, edges: project.edges, create: project.create, 'label-shape': project.labelShape, 'label-falsifier': project.labelFalsifier, 'next-actions': project.nextActions, worklist: project.worklist, similar: project.similar, 'propose-adr': project.proposeAdr, 'ship-slice': project.shipSlice },
-  adr:       { list: adr.list, propose: adr.propose, accept: adr.accept, ship: adr.ship, park: adr.park, reject: adr.reject },
+  adr:       { list: adr.list, propose: adr.propose, accept: adr.accept, ship: adr.ship, park: adr.park, reject: adr.reject, move: adr.move },
   recipe:    { list: naseej.recipeList, get: naseej.recipeGet, run: naseej.recipeRun, cancel: naseej.recipeCancel },
   component: { list: naseej.componentList, get: naseej.componentGet },
   naseej:    { audit: naseej.naseejAudit },
@@ -168,7 +178,7 @@ const dispatch: Dispatch = {
   scheduler: { tasks: scheduler.tasks, 'run-now': scheduler.runNow },
   inbox:     { queued: inbox.queued, accounts: inbox.accounts, status: inbox.status, 'digest-telegram': inbox.digestTelegram },
   intent:    { metrics: intent.metrics },
-  note:      { create: note.create, update: note.update },
+  note:      { create: note.create, update: note.update, move: note.move, rename: note.rename, 'move-batch': note.moveBatch },
   contracts: { touching: contracts.touching, check: contracts.check },
 };
 
@@ -254,6 +264,9 @@ async function main() {
       filename:    { type: 'string' },
       content:     { type: 'string' },
       'content-file': { type: 'string' },
+      rename:      { type: 'string' },
+      'moves-json': { type: 'string' },
+      'moves-file': { type: 'string' },
       reason:      { type: 'string' },
       shape:       { type: 'string' },
       format:      { type: 'string' },
@@ -286,7 +299,13 @@ async function main() {
     if (typeof v === 'boolean') args[k] = v ? '1' : undefined;
     else args[k] = v as string | undefined;
   }
-  if (parsed.positionals.length > 0) args._ = parsed.positionals.join('/');
+  if (parsed.positionals.length > 0) {
+    // `_` keeps the join('/') form for single-path verbs (note update, adr accept…).
+    // `_0`, `_1`, … expose individual positionals for multi-arg verbs (note move
+    // <src> <dst-zone>) where joining two paths with '/' would be ambiguous.
+    args._ = parsed.positionals.join('/');
+    parsed.positionals.forEach((p, i) => { args['_' + i] = p; });
+  }
 
   try {
     await dispatch[noun][verb](args, opts);

@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { apiPost, apiPut } from '../api.ts';
 import { emit, fail, exitIfApiFailure, type OutputOpts } from '../output.ts';
 import { resolveContent } from '../content-input.ts';
@@ -88,5 +89,85 @@ export async function update(args: Record<string, string | undefined>, opts: Out
       ? `✗ ${d.error ?? 'unknown error'}`
       : `✓ updated ${d.path ?? path}`,
   );
+  exitIfApiFailure(data);
+}
+
+// ── ADR-004 — link-safe relocation (move / rename) ──────────────────
+
+export interface RelocateResp {
+  success?: boolean;
+  error?: string;
+  dryRun?: boolean;
+  moves?: { src: string; dst: string }[];
+  rewrites?: { path: string; bodyCount: number; metaCount: number }[];
+}
+
+export function emitRelocate(data: RelocateResp, opts: OutputOpts) {
+  emit(data, opts, (d: RelocateResp) => {
+    if (d.success === false) return `✗ ${d.error ?? 'move failed'}`;
+    const lines: string[] = [];
+    const moveVerb = d.dryRun ? 'DRY RUN — would move' : '✓ moved';
+    for (const m of d.moves ?? []) lines.push(`${moveVerb}  ${m.src}  →  ${m.dst}`);
+    const rw = d.rewrites ?? [];
+    const body = rw.reduce((s, r) => s + r.bodyCount, 0);
+    const meta = rw.reduce((s, r) => s + r.metaCount, 0);
+    lines.push(`${d.dryRun ? 'would rewrite' : 'rewrote'} links in ${rw.length} note(s)  (${body} body, ${meta} frontmatter)`);
+    for (const r of rw) lines.push(`    ${r.path}  (${r.bodyCount}b ${r.metaCount}f)`);
+    return lines.join('\n');
+  });
+}
+
+/** soul note move <src-path> <dst-zone> [--rename <new-filename>] [--dry-run] */
+export async function move(args: Record<string, string | undefined>, opts: OutputOpts) {
+  const src = args._0;
+  const toZone = args._1;
+  if (!src || !toZone) {
+    fail('note move: usage: soul note move <src-path> <dst-zone> [--rename <new-filename>] [--dry-run]');
+  }
+  const body: Record<string, unknown> = { src, targetZone: toZone, dryRun: !!args['dry-run'] };
+  if (args.rename) body.newFilename = args.rename;
+  const data = await apiPost<RelocateResp>('/api/vault/notes/move', body);
+  emitRelocate(data, opts);
+  exitIfApiFailure(data);
+}
+
+/** soul note rename <src-path> <new-filename> [--dry-run] */
+export async function rename(args: Record<string, string | undefined>, opts: OutputOpts) {
+  const src = args._0;
+  const newName = args._1;
+  if (!src || !newName) {
+    fail('note rename: usage: soul note rename <src-path> <new-filename> [--dry-run]');
+  }
+  const data = await apiPost<RelocateResp>('/api/vault/notes/move', {
+    src,
+    newFilename: newName,
+    dryRun: !!args['dry-run'],
+  });
+  emitRelocate(data, opts);
+  exitIfApiFailure(data);
+}
+
+/** soul note move-batch (--moves-json '[...]' | --moves-file PATH) [--dry-run]
+ *  Each element: { src, targetZone?, newFilename? }. Moves the whole set in one
+ *  pass — mutually-referencing notes relocate without a forward-ref failure. */
+export async function moveBatch(args: Record<string, string | undefined>, opts: OutputOpts) {
+  let raw = args['moves-json'];
+  if (!raw && args['moves-file']) {
+    try {
+      raw = readFileSync(args['moves-file'], 'utf8');
+    } catch (err) {
+      fail(`note move-batch: --moves-file: cannot read ${args['moves-file']}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (!raw) fail('note move-batch: --moves-json JSON or --moves-file PATH is required');
+  let moves: unknown;
+  try {
+    moves = JSON.parse(raw);
+  } catch (err) {
+    fail(`note move-batch: invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!Array.isArray(moves)) fail('note move-batch: moves must be a JSON array of { src, targetZone?, newFilename? }');
+  const data = await apiPost<RelocateResp>('/api/vault/notes/move', { moves, dryRun: !!args['dry-run'] });
+  emitRelocate(data, opts);
   exitIfApiFailure(data);
 }

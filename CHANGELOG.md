@@ -4,6 +4,21 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] — 2026-05-25
+
+### Added
+- **Link-safe note relocation** — `soul note move <src> <dst-zone> [--rename …]`,
+  `soul note rename <src> <new-filename>`, and `soul adr move <src> --project …`
+  relocate a note and **rewrite every inbound wikilink across the vault** — both
+  body links and frontmatter relationship fields (`relates_to`, `supersedes`, …)
+  — so nothing breaks. Backed by a new `POST /api/vault/notes/move` endpoint.
+- **Batch relocation** — `soul note move-batch` (and the endpoint's `moves: […]`)
+  moves a whole set of notes in one pass. Mutually-referencing notes relocate
+  without the old two-step "create-then-relink" workaround, because all files
+  move before any link is rewritten.
+- **`--dry-run`** on every relocation verb — prints the planned destinations and
+  the exact notes whose links would be rewritten, writing nothing.
+
 ## [2.3.0] — 2026-05-25
 
 ### Added

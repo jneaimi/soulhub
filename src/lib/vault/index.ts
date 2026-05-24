@@ -15,6 +15,8 @@ import { VaultWatcher } from './watcher.js';
 import { GovernanceResolver } from './governance.js';
 import { TemplateLoader } from './templates.js';
 import { validateLinks } from './link-validator.js';
+import { rewriteBody, rewriteMeta, stripMd } from './relocate.js';
+import type { MoveSpec, RelocateResult } from './relocate.js';
 import { VaultCommitter } from './committer.js';
 import { emitReindex } from './events.js';
 
@@ -1340,6 +1342,175 @@ export class VaultEngine {
 			context: existing.meta.source_context as string | undefined,
 		});
 
+		return { success: true, path: newPath };
+	}
+
+	/** ADR-004 (soul-hub-cli) — link-safe relocation. Moves one note (optionally
+	 *  renaming it) to a new zone, then rewrites every inbound wikilink across the
+	 *  vault — body AND frontmatter relationship fields — so nothing dangles. A
+	 *  thin wrapper over `relocateNotes` (single-element batch). */
+	async relocateNote(
+		spec: MoveSpec,
+		opts?: { dryRun?: boolean; actor?: string; actorContext?: string },
+	): Promise<RelocateResult> {
+		return this.relocateNotes([spec], opts);
+	}
+
+	/** ADR-004 — batch link-safe relocation. Moves a SET of notes in one pass.
+	 *  Because all files are moved BEFORE any inbound link is rewritten, every
+	 *  destination already exists when a rewritten relationship field is
+	 *  re-validated — so mutually-referencing notes move with no forward-
+	 *  reference failure and no two-pass workaround (the ADR-004 motivation).
+	 *  The committer's debounce coalesces the move + rewrites into one commit. */
+	async relocateNotes(
+		specs: MoveSpec[],
+		opts?: { dryRun?: boolean; actor?: string; actorContext?: string },
+	): Promise<RelocateResult> {
+		// 1. Resolve + validate every move; build the src→dst map.
+		const moveMap = new Map<string, string>();
+		const moves: { src: string; dst: string }[] = [];
+		const movingSrc = new Set(specs.map((s) => s.src));
+		for (const spec of specs) {
+			const existing = this.indexer.get(spec.src);
+			if (!existing) return { success: false, error: `Note not found: ${spec.src}`, moves: [], rewrites: [] };
+			const srcZone = dirname(spec.src);
+			const srcFilename = spec.src.split('/').pop()!;
+			const targetZone = spec.targetZone ?? srcZone;
+			const filename = spec.newFilename ?? srcFilename;
+			const dst = join(targetZone, filename);
+			if (dst === spec.src) return { success: false, error: `Destination equals source: ${spec.src}`, moves: [], rewrites: [] };
+			if (this.indexer.get(dst) && !movingSrc.has(dst)) {
+				return { success: false, error: `Destination already exists: ${dst}`, moves: [], rewrites: [] };
+			}
+			const zone = this.governance.resolve(targetZone);
+			if (zone.allowedTypes.length > 0 && existing.meta.type && !zone.allowedTypes.includes(existing.meta.type)) {
+				return { success: false, error: `Type "${existing.meta.type}" not allowed in zone "${targetZone}"`, moves: [], rewrites: [] };
+			}
+			moveMap.set(spec.src, dst);
+			moves.push({ src: spec.src, dst });
+		}
+
+		// A bare new slug is safe to keep bare only if no OTHER (non-moving) note
+		// owns that basename — the moved note will then be its sole holder.
+		const dstSlugs = new Set([...moveMap.values()].map((p) => stripMd(p).split('/').pop()!));
+		const bareSlugIsUnique = (slug: string): boolean => {
+			if (!dstSlugs.has(slug)) {
+				// Not one of our destinations — fall back to path form to be safe.
+				return false;
+			}
+			return !this.indexer.all().some((n) => !movingSrc.has(n.path) && stripMd(n.path.split('/').pop()!) === slug);
+		};
+
+		// 2. Capture phase (BEFORE moving): the resolver still maps old targets to
+		//    their current paths, so we can detect which links point into the move
+		//    set and precompute the rewritten body/meta for every affected note.
+		const rewrites: { path: string; newContent?: string; newMeta?: VaultMeta; bodyCount: number; metaCount: number }[] = [];
+		for (const note of this.indexer.all()) {
+			const resolveTarget = (raw: string) => this.indexer.resolveLink(raw, note.path);
+			const body = rewriteBody(note.content, resolveTarget, moveMap, bareSlugIsUnique);
+			const relFields = this.governance.resolve(dirname(note.path)).allowedRelationshipFields;
+			const meta = rewriteMeta(note.meta, relFields, resolveTarget, moveMap, bareSlugIsUnique);
+			if (body.count > 0 || meta.count > 0) {
+				rewrites.push({
+					path: note.path,
+					newContent: body.count > 0 ? body.content : undefined,
+					newMeta: meta.count > 0 ? meta.meta : undefined,
+					bodyCount: body.count,
+					metaCount: meta.count,
+				});
+			}
+		}
+
+		if (opts?.dryRun) {
+			return {
+				success: true,
+				dryRun: true,
+				moves,
+				rewrites: rewrites.map((r) => ({ path: r.path, bodyCount: r.bodyCount, metaCount: r.metaCount })),
+			};
+		}
+
+		// 3. Move every file first (low-level rename, no validation), so all
+		//    destinations exist before any inbound link is rewritten.
+		for (const { src, dst } of moves) {
+			const moved = await this._relocateFile(src, dst, opts);
+			if (!moved.success) return { success: false, error: moved.error, moves: [], rewrites: [] };
+		}
+
+		// 4. Apply the precomputed rewrites. A rewritten note that was itself moved
+		//    now lives at its destination — apply there.
+		for (const r of rewrites) {
+			const targetPath = moveMap.get(r.path) ?? r.path;
+			const req: UpdateNoteRequest = {};
+			if (r.newContent !== undefined) req.content = r.newContent;
+			if (r.newMeta !== undefined) req.meta = r.newMeta;
+			const res = await this.updateNote(targetPath, req, {
+				actor: opts?.actor ?? 'relocateNote',
+				actorContext: opts?.actorContext ?? `link-rewrite (${r.bodyCount} body, ${r.metaCount} meta)`,
+			});
+			if (!res.success) {
+				return { success: false, error: `Link rewrite failed at ${targetPath}: ${res.error}`, moves, rewrites: [] };
+			}
+		}
+
+		return {
+			success: true,
+			moves,
+			rewrites: rewrites.map((r) => ({ path: r.path, bodyCount: r.bodyCount, metaCount: r.metaCount })),
+		};
+	}
+
+	/** Internal: relocate a single file on disk to an arbitrary destination path
+	 *  (zone AND/OR filename change), updating the index. Mirrors `moveNote`'s
+	 *  collision-guard + reindex + commit, but allows a filename change. Does NOT
+	 *  rewrite links — the caller (`relocateNotes`) owns that. */
+	private async _relocateFile(
+		path: string,
+		newPath: string,
+		opts?: { actor?: string; actorContext?: string },
+	): Promise<WriteResult | WriteError> {
+		const existing = this.indexer.get(path);
+		if (!existing) return { success: false, error: `Note not found: ${path}` };
+		const absSource = resolve(this.config.rootDir, path);
+		const absTarget = resolve(this.config.rootDir, newPath);
+		try {
+			await stat(absTarget);
+			return { success: false, error: `Move target already exists: ${newPath}` };
+		} catch {
+			// destination free
+		}
+		try {
+			await mkdir(dirname(absTarget), { recursive: true });
+			await rename(absSource, absTarget);
+		} catch (err) {
+			return { success: false, error: `Move failed: ${err instanceof Error ? err.message : String(err)}` };
+		}
+		this.indexer.remove(path);
+		this.searcher.remove(path);
+		await this.indexer.reindex(newPath);
+		const note = this.indexer.get(newPath);
+		if (note) this.searcher.upsert(note);
+		const agent = opts?.actor ?? (existing.meta.source_agent as string | undefined);
+		const context = opts?.actorContext ?? (existing.meta.source_context as string | undefined);
+		this.logWrite({
+			action: 'move',
+			path: newPath,
+			previousPath: path,
+			agent,
+			context,
+			zone: dirname(newPath).split('/')[0],
+			type: existing.meta.type as string | undefined,
+			success: true,
+		});
+		this.committer.enqueue({
+			action: 'move',
+			path: newPath,
+			previousPath: path,
+			zone: dirname(newPath).split('/')[0],
+			type: existing.meta.type as string | undefined,
+			agent,
+			context,
+		});
 		return { success: true, path: newPath };
 	}
 

@@ -1,6 +1,7 @@
 import { apiGet, apiPost } from '../api.ts';
 import { emit, fail, todayIso, exitIfApiFailure, type OutputOpts } from '../output.ts';
 import { resolveContent } from '../content-input.ts';
+import { emitRelocate, type RelocateResp } from './note.ts';
 
 interface AdrHit {
   path: string;
@@ -106,6 +107,25 @@ async function transition(action: 'accept' | 'reject' | 'park' | 'ship', args: R
       ? `✗ ${d.error ?? 'unknown error'}`
       : `✓ ${path} → ${d.newStatus ?? action + 'ed'}`,
   );
+  exitIfApiFailure(data);
+}
+
+/** soul adr move <src> --project <p> [--rename <new-filename>] [--dry-run]
+ *  ADR-aware convenience over `note move`: relocates an ADR into another
+ *  project's zone (projects/<p>), link-safe. Renumbering the in-body
+ *  `# ADR-NNN` heading is deferred to a follow-up (v1 moves + rewrites links). */
+export async function move(args: Record<string, string | undefined>, opts: OutputOpts) {
+  const src = args._0;
+  if (!src) fail('adr move: usage: soul adr move <src-path> --project <slug> [--rename <new-filename>] [--dry-run]');
+  if (!args.project) fail('adr move: --project SLUG is required');
+  const body: Record<string, unknown> = {
+    src,
+    targetZone: `projects/${args.project}`,
+    dryRun: !!args['dry-run'],
+  };
+  if (args.rename) body.newFilename = args.rename;
+  const data = await apiPost<RelocateResp>('/api/vault/notes/move', body);
+  emitRelocate(data, opts);
   exitIfApiFailure(data);
 }
 
