@@ -666,10 +666,10 @@ export const CORE_SCHEDULER_TASKS: z.infer<typeof SchedulerTaskSchema>[] = [
 		// reconciles it (ADR-010 F1).
 		id: 'update-check',
 		type: 'update-check',
-		cron: '0 3 * * *',
+		cron: '0 */6 * * *',
 		enabled: true,
 		noOverlap: true,
-		description: 'Daily check for a newer published GitHub Release (ADR-010) — drives the update-available banner.',
+		description: 'Check every 6h for a newer published GitHub Release (ADR-010) — drives the update-available banner.',
 		params: {},
 	},
 ];

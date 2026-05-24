@@ -4,6 +4,13 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.8] — 2026-05-24
+
+### Changed
+- **Update check runs every 6 hours** (was once daily) — a freshly-published
+  release now surfaces in the banner within hours instead of up to a day. Still
+  a single lightweight GitHub call per check.
+
 ## [2.2.7] — 2026-05-24
 
 ### Added
@@ -138,6 +145,7 @@ command center, orchestrated by Claude Code.
   development) and the **Playbook** engine (being decommissioned). Enable them
   via `features` in `~/.soul-hub/settings.json` at your own risk.
 
+[2.2.8]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.8
 [2.2.7]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.7
 [2.2.6]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.6
 [2.2.5]: https://github.com/jneaimi/soulhub/releases/tag/v2.2.5
