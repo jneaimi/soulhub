@@ -36,6 +36,7 @@ import type { BackendDispatcher, DispatchEvent, DispatchOptions, DispatchResult 
 import { resolveBudget } from './budget.js';
 import { claudeCliFlagDispatcher } from './claude-cli-flag.js';
 import { loadAgentRunRecord } from '$lib/sessions/run-record.js';
+import { createRunTail, type RunTail } from '$lib/sessions/run-tail.js';
 
 /** Default silence-after-activity threshold before treating the session as
  *  done. 30s is fine for chat-shaped agents that emit progress text every
@@ -126,6 +127,11 @@ export const claudePtyDispatcher: BackendDispatcher = {
 		// recipe steps can specialise convergence per invocation.
 		const goalCondition = (opts.goal_condition ?? agent.goal_condition)?.trim();
 		const goalActive = !!goalCondition;
+		// ADR-004 P1 — opt-in live transcript-driven termination + honest status.
+		// Off by default (env unset) → behaviour identical to the legacy path.
+		// Scoped to non-goal agents: goal-mode emits `end_turn` on every iteration,
+		// so it keeps the `Goal achieved` marker as its termination signal.
+		const liveTail = process.env.PTY_LIVE_TRANSCRIPT === '1' && !goalActive;
 		const taskPayload = composePrompt(opts.task, opts.context);
 		const initialPrompt = goalActive ? `/goal ${goalCondition}` : taskPayload;
 
@@ -164,6 +170,14 @@ export const claudePtyDispatcher: BackendDispatcher = {
 			console.log(
 				`[agents/claude-pty] goal-mode active for ${agent.id}: "${goalCondition!.slice(0, 80)}${goalCondition!.length > 80 ? '…' : ''}"`,
 			);
+		}
+
+		// ADR-004 D1 — begin tailing this run's transcript live (the
+		// `--session-id` set on spawn makes it locatable immediately).
+		let runTail: RunTail | undefined;
+		if (liveTail) {
+			runTail = createRunTail(sessionUuid, { cwd: config.resolved.vaultDir });
+			console.log(`[agents/claude-pty] live-transcript termination active for ${agent.id}`);
 		}
 
 		// Buffer stdout chunks and a stripped accumulator for the final result.
@@ -247,6 +261,7 @@ export const claudePtyDispatcher: BackendDispatcher = {
 		try {
 			let stalled = false;
 			let timedOut = false;
+			let transcriptDone = false;
 
 			while (!exited) {
 				while (queue.length > 0) {
@@ -259,6 +274,14 @@ export const claudePtyDispatcher: BackendDispatcher = {
 
 				if (elapsed >= budget.timeout_ms) {
 					timedOut = true;
+					killSession(session.id);
+					break;
+				}
+				// ADR-004 D2 — the transcript says the last turn ended cleanly with
+				// no open tool call: the agent is genuinely done. Terminate now
+				// instead of waiting out the idle-stall window.
+				if (runTail?.snapshot().done) {
+					transcriptDone = true;
 					killSession(session.id);
 					break;
 				}
@@ -318,6 +341,13 @@ export const claudePtyDispatcher: BackendDispatcher = {
 					claude_session_id: sessionUuid,
 				});
 			}
+			// ADR-004 D2 — transcript-confirmed completion is authoritative.
+			if (transcriptDone) {
+				return finish(runId, agent, started, 'success', finalOutput, undefined, {
+					num_turns: transcriptTurns,
+					claude_session_id: sessionUuid,
+				});
+			}
 			if (timedOut) {
 				const msg = `Dispatch exceeded ${budget.timeout_ms}ms timeout`;
 				yield { type: 'error', message: msg, ts: Date.now() };
@@ -327,7 +357,24 @@ export const claudePtyDispatcher: BackendDispatcher = {
 				});
 			}
 			if (stalled) {
-				// Stall is expected when the model is done and waiting for input.
+				// ADR-004 D3 — under live-tail a stall that the transcript can't
+				// confirm as a clean `end_turn` is a real hang, not a finished agent
+				// idling for input. Flush the transcript once more first (end_turn
+				// may have landed in the race between pumps), then refuse to score an
+				// unconfirmed stall as success — the legacy bug this ADR retires.
+				if (runTail) {
+					await runTail.pump();
+					if (!runTail.snapshot().done) {
+						const msg = 'Stalled without a completing end_turn in the transcript';
+						yield { type: 'error', message: msg, ts: Date.now() };
+						return finish(runId, agent, started, 'error', finalOutput, msg, {
+							num_turns: transcriptTurns,
+							claude_session_id: sessionUuid,
+						});
+					}
+				}
+				// Legacy path (flag off) or live-tail confirmed completion: a stall
+				// is expected when the model is done and waiting for input.
 				return finish(runId, agent, started, 'success', finalOutput, undefined, {
 					num_turns: transcriptTurns,
 					claude_session_id: sessionUuid,
@@ -348,6 +395,7 @@ export const claudePtyDispatcher: BackendDispatcher = {
 				claude_session_id: sessionUuid,
 			});
 		} finally {
+			runTail?.stop();
 			session.emitter.off('output', onOutput);
 			session.emitter.off('exit', onExit);
 			session.emitter.off('prompt_sent', onPromptSent);

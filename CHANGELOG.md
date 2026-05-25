@@ -4,6 +4,19 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.0] — 2026-05-25
+
+### Added
+- **Live transcript-driven agent dispatch (PTY).** Agent runs on the Claude Code
+  PTY backend can now read Claude Code's own session transcript *live* to decide
+  when a run is done — terminating the instant the agent's last turn ends cleanly
+  with no open tool call, instead of waiting out a fixed 30–120s idle window. The
+  same signal makes status honest: a run that stalls *without* a confirmed
+  completion is recorded as a failure rather than mislabelled a success. Opt-in
+  via the `PTY_LIVE_TRANSCRIPT` flag (off by default; the legacy idle-stall path
+  is unchanged and remains the fallback). Validated live — a real dispatch
+  finished in ~9s where the old path would have padded it by ~30s. (ADR-004 P1.)
+
 ## [2.8.1] — 2026-05-25
 
 ### Changed
