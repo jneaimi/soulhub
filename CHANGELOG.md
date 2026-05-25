@@ -4,6 +4,17 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.0] — 2026-05-25
+
+### Changed
+- **Cleaner live progress for agent runs.** While a PTY-backed agent works, the
+  run now streams structured progress — which tool it's calling and which turn
+  it's on — derived from the session transcript, instead of raw terminal
+  control codes. The chat-to-test panel and any progress surface get legible
+  events (`🔧 Bash`, step boundaries) rather than ANSI noise. Set
+  `PTY_LIVE_TRANSCRIPT=0` to restore the legacy raw stream. (ADR-004 D5 —
+  completes the live-transcript dispatch series.)
+
 ## [2.10.0] — 2026-05-25
 
 ### Added

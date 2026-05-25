@@ -266,9 +266,21 @@ export const claudePtyDispatcher: BackendDispatcher = {
 			let budgetExceeded: 'max_turns' | 'max_usd' | null = null;
 
 			while (!exited) {
-				while (queue.length > 0) {
-					const chunk = queue.shift()!;
-					yield { type: 'output', data: chunk, ts: Date.now() };
+				if (liveTail && runTail) {
+					// ADR-004 D5 — emit clean structured progress from the transcript
+					// (tool_call / step) instead of raw ANSI. The scrollback chunks
+					// still accrue in `combined` (via onOutput) as the fallback output
+					// source; we just don't stream them.
+					for (const p of runTail.drain()) {
+						if (p.kind === 'tool') yield { type: 'tool_call', name: p.name, ts: p.ts };
+						else yield { type: 'step', n: p.n, finishReason: p.finishReason, ts: p.ts };
+					}
+					queue.length = 0;
+				} else {
+					while (queue.length > 0) {
+						const chunk = queue.shift()!;
+						yield { type: 'output', data: chunk, ts: Date.now() };
+					}
 				}
 
 				const elapsed = Date.now() - started;
@@ -313,10 +325,19 @@ export const claudePtyDispatcher: BackendDispatcher = {
 				await new Promise((r) => setTimeout(r, 200));
 			}
 
-			// Flush any final buffered chunks
-			while (queue.length > 0) {
-				const chunk = queue.shift()!;
-				yield { type: 'output', data: chunk, ts: Date.now() };
+			// Flush final progress (D5) or buffered chunks.
+			if (liveTail && runTail) {
+				await runTail.pump();
+				for (const p of runTail.drain()) {
+					if (p.kind === 'tool') yield { type: 'tool_call', name: p.name, ts: p.ts };
+					else yield { type: 'step', n: p.n, finishReason: p.finishReason, ts: p.ts };
+				}
+				queue.length = 0;
+			} else {
+				while (queue.length > 0) {
+					const chunk = queue.shift()!;
+					yield { type: 'output', data: chunk, ts: Date.now() };
+				}
 			}
 
 			const cleaned = stripAnsi(combined).trim();

@@ -57,9 +57,18 @@ export interface RunTailState {
 	done: boolean;
 }
 
+/** ADR-004 D5 — structured progress derived from the transcript, drained by the
+ *  dispatcher to emit clean `tool_call` / `step` DispatchEvents instead of raw
+ *  ANSI scrollback. Maps 1:1 onto the existing DispatchEvent union. */
+export type RunTailProgress =
+	| { kind: 'tool'; name: string; ts: number }
+	| { kind: 'step'; n: number; finishReason?: string; ts: number };
+
 export interface RunTail {
 	/** Current authoritative state. Cheap — returns the live accumulator. */
 	snapshot(): RunTailState;
+	/** Pull + clear progress events accumulated since the last drain (D5). */
+	drain(): RunTailProgress[];
 	/** Force a synchronous-ish read of any appended bytes (awaitable). Useful
 	 *  for a final flush right before the dispatcher reads the terminal state. */
 	pump(): Promise<void>;
@@ -95,6 +104,7 @@ export function createRunTail(sessionId: string, opts: RunTailOptions = {}): Run
 	let sawError = false;
 	let lastEventTs = 0;
 	let eventCount = 0;
+	const progress: RunTailProgress[] = [];
 
 	let stopped = false;
 	let pumping = false;
@@ -122,9 +132,15 @@ export function createRunTail(sessionId: string, opts: RunTailOptions = {}): Run
 				for (const block of content) {
 					if (block?.type === 'tool_use' && typeof block.id === 'string') {
 						pendingTools.add(block.id);
+						// D5 — surface the tool name as live progress.
+						if (typeof block.name === 'string') {
+							progress.push({ kind: 'tool', name: block.name, ts: lastEventTs });
+						}
 					}
 				}
 			}
+			// D5 — a completed assistant turn is a step boundary.
+			if (stop) progress.push({ kind: 'step', n: requestIds.size, finishReason: stop, ts: lastEventTs });
 			// An assistant error event flips the error flag (parser exposes these
 			// as forward-compat fields on ClaudeEvent).
 			if (e.isApiErrorMessage || e.error) sawError = true;
@@ -210,6 +226,10 @@ export function createRunTail(sessionId: string, opts: RunTailOptions = {}): Run
 		};
 	}
 
+	function drain(): RunTailProgress[] {
+		return progress.splice(0);
+	}
+
 	function stop(): void {
 		if (stopped) return;
 		stopped = true;
@@ -237,5 +257,5 @@ export function createRunTail(sessionId: string, opts: RunTailOptions = {}): Run
 	// first interval fires.
 	void pump();
 
-	return { snapshot, pump, stop };
+	return { snapshot, drain, pump, stop };
 }
