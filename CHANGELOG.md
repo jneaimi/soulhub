@@ -4,6 +4,17 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.16.1] — 2026-05-25
+
+### Added
+- **Self-delegation detection for orchestrator agents (ADR-008).** Closes
+  ADR-005 gap #2: an `allow_subagents` orchestrator could spawn a sub-agent of
+  its own type. Claude Code already caps recursion at depth 1 and ADR-006's
+  ceiling bounds the cost, so this *detects and flags* rather than prevents —
+  the dispatcher scans the run transcript for an `Agent`/`Task` call whose
+  `subagent_type` matches the parent agent id, logs a warning, and appends a
+  footer to the recorded result so the run is visibly flagged.
+
 ## [2.16.0] — 2026-05-25
 
 ### Added

@@ -453,11 +453,24 @@ export const claudePtyDispatcher: BackendDispatcher = {
 				const record = await loadAgentRunRecord(sessionUuid, {
 					cwd: config.resolved.vaultDir,
 					timeoutMs: 3000,
+					parentAgentId: agent.id, // ADR-008 — detect self-delegation
 				});
 				if (record) {
 					if (record.finalAssistantText) finalOutput = record.finalAssistantText;
 					transcriptTurns = record.assistantTurns;
 					transcriptCostUsd = record.summary.cost.totalUsd ?? undefined;
+					// ADR-008 — reactive self-delegation guard. Recursion is already
+					// depth-capped by Claude Code + cost-bounded by ADR-006's ceiling,
+					// so we don't abort — we flag it: warn in the log and append a
+					// footer to the recorded result so it's visible in the runs UI.
+					if (record.selfDelegatedTypes.length > 0) {
+						const types = record.selfDelegatedTypes.join(', ');
+						console.warn(
+							`[agents/claude-pty] ⚠ self-delegation: ${agent.id} spawned a sub-agent of its own type (${types}) — work runs in a hidden sidechain (ADR-008). Prefer delegating to a different agent type.`,
+						);
+						finalOutput =
+							`${finalOutput}\n\n---\n⚠ Self-delegation (ADR-008): this run spawned a sub-agent of its own type (${types}). Its work ran in a hidden sidechain; consider decomposing to a different agent type.`.trim();
+					}
 				}
 			} catch {
 				/* keep the scrape */

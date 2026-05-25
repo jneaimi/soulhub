@@ -29,6 +29,12 @@ export interface AgentRunRecord {
 	assistantTurns: number;
 	toolCallCount: number;
 	summary: SessionSummary;
+	/** ADR-008 — sub-agent types this run spawned that match its OWN agent id
+	 *  (self-delegation). Empty unless `parentAgentId` was passed to the loader
+	 *  AND a matching `Agent`/`Task` tool_use was found in the parent transcript.
+	 *  Detection-only (recursion is already depth-capped + cost-bounded); the
+	 *  dispatcher surfaces a warning when non-empty. */
+	selfDelegatedTypes: string[];
 }
 
 /**
@@ -79,6 +85,27 @@ function extractAssistant(events: ClaudeEvent[]): { finalText: string; turns: nu
 	return { finalText, turns: requestIds.size };
 }
 
+/** ADR-008 self-delegation detection. Scans the parent transcript's main-thread
+ *  `Agent`/`Task` tool_use blocks for a `subagent_type` equal to the parent's
+ *  own agent id — i.e. an orchestrator spawning a sub-agent of its own type.
+ *  Returns the distinct offending types (usually 0 or 1). Pure; no I/O. */
+export function extractSelfDelegation(events: ClaudeEvent[], parentAgentId: string): string[] {
+	const hits = new Set<string>();
+	for (const e of events) {
+		if (e.type !== 'assistant' || e.isSidechain) continue;
+		const content = e.message?.content;
+		if (!Array.isArray(content)) continue;
+		for (const b of content) {
+			if (b.type !== 'tool_use') continue;
+			// CC renamed `Task` → `Agent` in 2.1.63; match both.
+			if (b.name !== 'Agent' && b.name !== 'Task') continue;
+			const st = b.input?.subagent_type;
+			if (typeof st === 'string' && st === parentAgentId) hits.add(st);
+		}
+	}
+	return [...hits];
+}
+
 /**
  * Poll for the transcript to appear and settle, then parse it into a run
  * record. Returns null if the transcript never materialises within
@@ -90,7 +117,7 @@ function extractAssistant(events: ClaudeEvent[]): { finalText: string; turns: nu
  */
 export async function loadAgentRunRecord(
 	sessionId: string,
-	opts: { cwd?: string; timeoutMs?: number; pollMs?: number } = {},
+	opts: { cwd?: string; timeoutMs?: number; pollMs?: number; parentAgentId?: string } = {},
 ): Promise<AgentRunRecord | null> {
 	const timeoutMs = opts.timeoutMs ?? 3000;
 	const pollMs = opts.pollMs ?? 250;
@@ -118,6 +145,11 @@ export async function loadAgentRunRecord(
 		// ADR-005 gap #1 — fold sub-agent (fan-out) spend into the recorded total
 		// so `cost_usd` in agent_runs reflects the whole run, not just the parent.
 		await applySubagentRollup(summary.cost, path);
+		// ADR-008 — flag self-delegation (orchestrator spawning its own type). Only
+		// runs when the caller knows the parent agent id; otherwise stays empty.
+		const selfDelegatedTypes = opts.parentAgentId
+			? extractSelfDelegation(session.events, opts.parentAgentId)
+			: [];
 		return {
 			sessionId: session.sessionId,
 			jsonlPath: path,
@@ -125,6 +157,7 @@ export async function loadAgentRunRecord(
 			assistantTurns: turns,
 			toolCallCount: summary.toolCallCount,
 			summary,
+			selfDelegatedTypes,
 		};
 	} catch {
 		return null;
