@@ -7,6 +7,7 @@ interface AdrHit {
   path: string;
   title?: string;
   type?: string;
+  status?: string;
   project?: string;
   tags?: string[];
   snippet?: string;
@@ -15,18 +16,21 @@ interface SearchResp { results: AdrHit[]; total?: number; }
 
 export async function list(args: Record<string, string | undefined>, opts: OutputOpts) {
   if (!args.project) fail('adr list: --project SLUG is required');
-  const data = await apiGet<SearchResp>('/api/vault/notes', {
+  const params: Record<string, string> = {
     project: args.project,
     type: 'decision',
     limit: args.limit ?? '100',
-  });
+  };
+  if (args.status) params.status = args.status;
+  const data = await apiGet<SearchResp>('/api/vault/notes', params);
   emit(data, opts, (d: SearchResp) =>
     d.results.length === 0
       ? '(no ADRs)'
       : d.results
           .map((r) => {
+            const status = (r.status ?? '?').padEnd(9);
             const file = (r.path.split('/').pop() ?? r.path).padEnd(60);
-            return `${file}  ${r.title ?? ''}`;
+            return `${status} ${file}  ${r.title ?? ''}`;
           })
           .join('\n')
   );

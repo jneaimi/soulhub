@@ -177,6 +177,8 @@ export interface SearchQuery {
 	q?: string;
 	/** Filter by note type (single or multiple, OR logic) */
 	type?: string | string[];
+	/** Filter by status (single or multiple, OR logic) */
+	status?: string | string[];
 	/** Filter by tags (AND logic — all must match) */
 	tags?: string[];
 	/** Filter by zone (top-level folder) */

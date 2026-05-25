@@ -72,6 +72,11 @@ export class VaultSearch {
 					const types = Array.isArray(query.type) ? query.type : [query.type];
 					if (!types.includes(result['type'] as string)) return false;
 				}
+				if (query.status) {
+					const statuses = Array.isArray(query.status) ? query.status : [query.status];
+					const noteStatus = this.noteMap.get(result['id'] as string)?.meta.status as string | undefined;
+					if (!noteStatus || !statuses.includes(noteStatus)) return false;
+				}
 				if (query.project && result['project'] !== query.project) return false;
 				if (query.tags && query.tags.length > 0) {
 					const resultTags = (result['tags'] as string).split(' ');
@@ -108,6 +113,10 @@ export class VaultSearch {
 		if (query.type) {
 			const types = Array.isArray(query.type) ? query.type : [query.type];
 			notes = notes.filter((n) => n.meta.type && types.includes(n.meta.type));
+		}
+		if (query.status) {
+			const statuses = Array.isArray(query.status) ? query.status : [query.status];
+			notes = notes.filter((n) => n.meta.status && statuses.includes(n.meta.status as string));
 		}
 		if (query.project) {
 			notes = notes.filter((n) => n.meta.project === query.project);

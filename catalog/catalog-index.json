@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-05-21T13:38:55.009Z",
+  "generated_at": "2026-05-24T23:03:49.936Z",
   "components": {
     "agent-dispatch": {
       "name": "agent-dispatch",
@@ -359,7 +359,8 @@
       ],
       "used_by_recipes": [
         "hello-naseej",
-        "peer-brief"
+        "peer-brief",
+        "peer-brief-rebuild"
       ],
       "example_usage": {
         "from_recipe": "hello-naseej",
@@ -1840,8 +1841,9 @@
       "version": "1.0.0",
       "project": "naseej",
       "description": "ADR-034 CP3 — the daily peer-brief rebuilt on the internalized Naseej stack:\nthe peer-brief DOCUMENT TEMPLATE (catalog/documents/peer-brief) + the slot\ntaxonomy + doc-render. ZERO katib.\n\nSpine: two deterministic context loads (trend SQL + miner-daily split) run in\nparallel; a sequential 3-turn claude session chain drafts the JUDGMENT slots\nas JSON (so figure labels stay consistent with finding titles — the same\nmodel wrote both); fill-template.py merges static template values +\ndeterministic data + the JSON drafts into a concrete doc-render composition;\nstop-slop scans it as a safety net; doc-render renders the PDF.\n\nThe static slots (Why / Method bodies, figure labels, GCC sector columns) and\nthe deterministic trend chart never hit the model — only genuine analytical\njudgment costs tokens. This is the ADR-029 payoff.\n\nRuns as a shadow beside the legacy `peer-brief-daily` cron for a week of\nparity (ADR-034 falsifier), then legacy is retired.\n",
-      "step_count": 18,
+      "step_count": 19,
       "components_used": [
+        "channel-send-text",
         "doc-render",
         "inline-llm-pass",
         "shell-exec",

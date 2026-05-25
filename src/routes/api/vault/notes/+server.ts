@@ -17,12 +17,16 @@ export const GET: RequestHandler = async ({ url }) => {
 	const typeParam = url.searchParams.get('type');
 	const types = typeParam ? typeParam.split(',').map(t => t.trim()).filter(Boolean) : [];
 
+	const statusParam = url.searchParams.get('status');
+	const statuses = statusParam ? statusParam.split(',').map(s => s.trim()).filter(Boolean) : [];
+
 	const tagsParam = url.searchParams.get('tags');
 	const tags = tagsParam ? tagsParam.split(',').map(t => t.trim()).filter(Boolean) : [];
 
 	const query: SearchQuery = {
 		q: url.searchParams.get('q') || undefined,
 		type: types.length > 1 ? types : types.length === 1 ? types[0] : undefined,
+		status: statuses.length > 1 ? statuses : statuses.length === 1 ? statuses[0] : undefined,
 		tags: tags.length > 0 ? tags : undefined,
 		zone: url.searchParams.get('zone') || undefined,
 		project: url.searchParams.get('project') || undefined,

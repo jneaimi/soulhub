@@ -181,7 +181,18 @@
 	// projects-graph ADR-011 — breadcrumb + sibling switcher.
 	// The full project list is fetched once on mount and used to derive the
 	// sibling set client-side (32 projects ≈ sub-ms filter; no new endpoint).
-	type SiblingRow = { slug: string; adrCount: number; parentProject: string | null };
+	// projects-graph ADR-011 (sibling switcher) + ADR-023 (child panel) — the
+	// shared row carried for both. The extra fields (shape/counts/falsifier)
+	// power the ADR-023 child-projects cards; siblings ignore them.
+	type SiblingRow = {
+		slug: string;
+		adrCount: number;
+		parentProject: string | null;
+		shape?: ProjectShape | null;
+		openCount?: number;
+		shippedCount?: number;
+		falsifierDate?: string | null;
+	};
 	let allProjects = $state<SiblingRow[]>([]);
 	let siblingsOpen = $state(false);
 
@@ -279,6 +290,25 @@
 			.filter((p) => p.parentProject === parent && p.slug !== slug)
 			.sort((a, b) => b.adrCount - a.adrCount);
 	});
+
+	// projects-graph ADR-023 — direct children of THIS project (the "down"
+	// navigation ADR-011 never added). Reuses the allProjects fetch already
+	// made for the sibling switcher — no extra request. Direct children only
+	// (parent_project === this slug); grandchildren are reached by descending
+	// one level at a time, mirroring how the breadcrumb walks one level up.
+	const childProjects = $derived.by(() => {
+		if (allProjects.length === 0) return [];
+		return allProjects
+			.filter((p) => p.parentProject === slug)
+			.sort((a, b) => (b.adrCount ?? 0) - (a.adrCount ?? 0));
+	});
+
+	// projects-graph ADR-023 — an umbrella/parent reads its emptiness as a
+	// feature, not a defect: suppress the "no ADRs yet — propose your first"
+	// nudge and the "no decisions yet" placeholder for it.
+	const isUmbrella = $derived(
+		!!detail && (detail.shape === 'parent' || (detail.adrCount === 0 && childProjects.length > 0))
+	);
 
 	// projects-graph ADR-013 — cluster tag derivation.
 	// Convention: `cluster:<slug>` tag on the project root index.md, set
@@ -419,11 +449,26 @@
 			const res = await fetch('/api/vault/projects');
 			if (!res.ok) return;
 			const data = await res.json();
-			allProjects = (data.projects ?? []).map((p: SiblingRow) => ({
-				slug: p.slug,
-				adrCount: p.adrCount,
-				parentProject: p.parentProject
-			}));
+			allProjects = (data.projects ?? []).map(
+				(p: {
+					slug: string;
+					adrCount: number;
+					parentProject: string | null;
+					shape?: ProjectShape | null;
+					openCount?: number;
+					statusCounts?: { shipped?: number };
+					projectFalsifierDate?: string | null;
+				}) => ({
+					slug: p.slug,
+					adrCount: p.adrCount,
+					parentProject: p.parentProject,
+					// projects-graph ADR-023 — child-card fields (unused by siblings).
+					shape: p.shape ?? null,
+					openCount: p.openCount ?? 0,
+					shippedCount: p.statusCounts?.shipped ?? 0,
+					falsifierDate: p.projectFalsifierDate ?? null
+				})
+			);
 		} catch {
 			// Sibling switcher is a nice-to-have; failing silently is acceptable.
 			allProjects = [];
@@ -849,6 +894,42 @@
 					</div>
 				{/if}
 
+				<!-- projects-graph ADR-023 — child-projects navigation panel.
+				     Renders the direct children as clickable cards so a parent/
+				     umbrella can be navigated DOWN, completing ADR-011's up
+				     (breadcrumb) + sideways (sibling switcher) navigation. Gated
+				     on having children, so leaf projects are unaffected. -->
+				{#if childProjects.length > 0}
+					<div class="mb-6">
+						<div class="flex items-center gap-2 mb-2">
+							<span class="text-[10px] uppercase tracking-wider text-hub-info font-semibold">Child projects</span>
+							<span class="text-[11px] text-hub-dim">{childProjects.length}</span>
+						</div>
+						<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+							{#each childProjects as child (child.slug)}
+								<a
+									href="/projects/{child.slug}"
+									class="p-3 rounded-lg border border-hub-border bg-hub-card/40 hover:bg-hub-card hover:border-hub-info/40 transition-colors flex flex-col gap-1.5"
+								>
+									<div class="flex items-center gap-2">
+										<span class="text-sm font-medium text-hub-text truncate flex-1 min-w-0">{child.slug}</span>
+										{#if child.shape}
+											<span class="px-1.5 py-0.5 rounded text-[10px] font-medium flex-shrink-0 {shapeClass(child.shape)}">{child.shape}</span>
+										{/if}
+									</div>
+									<div class="flex items-center gap-2 text-[11px] text-hub-dim">
+										<span>{child.openCount ?? 0} open</span>
+										<span class="text-hub-cta">{child.shippedCount ?? 0} shipped</span>
+										{#if child.falsifierDate}
+											<span class="text-hub-warning ml-auto" title="project falsifier">⏱ {child.falsifierDate}</span>
+										{/if}
+									</div>
+								</a>
+							{/each}
+						</div>
+					</div>
+				{/if}
+
 				<!-- Next up strip — surfaces the highest-priority open ADR
 				     (proposed, then accepted, oldest first; demotes ADRs whose
 				     blocked_by deps aren't all shipped). Per project-phases
@@ -873,10 +954,20 @@
 						{/if}
 					</button>
 				{:else if nextActions?.hint === 'no_adrs'}
-					<div class="mb-6 p-3 rounded-lg border border-hub-border bg-hub-card/40 text-xs text-hub-dim">
-						<span class="font-semibold text-hub-text">No ADRs yet.</span>
-						Propose your first via <code class="font-mono text-hub-info">soul adr propose</code>.
-					</div>
+					<!-- projects-graph ADR-023 — shape-aware empty state. An umbrella
+					     having no own ADRs is expected (its value is the rollup), so
+					     it shouldn't read like a broken/abandoned leaf. -->
+					{#if isUmbrella}
+						<div class="mb-6 p-3 rounded-lg border border-hub-border bg-hub-card/40 text-xs text-hub-dim">
+							<span class="font-semibold text-hub-text">Umbrella project.</span>
+							Progress rolls up from its children — this node isn't meant to hold its own ADRs.
+						</div>
+					{:else}
+						<div class="mb-6 p-3 rounded-lg border border-hub-border bg-hub-card/40 text-xs text-hub-dim">
+							<span class="font-semibold text-hub-text">No ADRs yet.</span>
+							Propose your first via <code class="font-mono text-hub-info">soul adr propose</code>.
+						</div>
+					{/if}
 				{/if}
 
 				<!-- Plan / index.md preview -->
@@ -1170,7 +1261,13 @@
 					</div>
 
 					{#if others.length === 0 && proposed.length === 0}
-						<p class="text-hub-dim text-xs py-6 text-center">No decisions yet for this project.</p>
+						<!-- projects-graph ADR-023 — umbrellas point at their children
+						     instead of reading as an empty decision stream. -->
+						{#if isUmbrella}
+							<p class="text-hub-dim text-xs py-6 text-center">Umbrella project — see the child projects above.</p>
+						{:else}
+							<p class="text-hub-dim text-xs py-6 text-center">No decisions yet for this project.</p>
+						{/if}
 					{:else if others.length === 0}
 						<p class="text-hub-dim text-xs py-3 text-center">All other decisions cleared.</p>
 					{:else}
