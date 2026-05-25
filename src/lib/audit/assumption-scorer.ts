@@ -1,68 +1,125 @@
 /**
- * project-phases ADR-008 S1 — Layer A deterministic assumption-rate scorer.
+ * project-phases ADR-008 S1 (Layer A v2) — deterministic assumption-rate scorer.
  *
  * Pure function over a Claude Code session transcript (JSONL). No I/O, no
- * DB writes — those happen in S2 (scheduler handler). The scorer reads
- * the transcript content and emits three signal counts + sample claims +
- * a 0-100 composite score.
+ * DB writes — those happen in S2 (scheduler handler). The scorer reads the
+ * transcript content and emits signal counts + sample claims + a 0-100 score.
  *
- * Signals (from ADR-008 D2 Layer A):
+ * ── Why v2 (see review 2026-05-26) ──────────────────────────────────────
+ * v1 measured the wrong thing. Its three signals were:
+ *   - `hedge`           — required a hedge phrase AND a tool_use in the SAME
+ *                         turn; that co-occurrence almost never happens, so
+ *                         the signal fired 0 times across 190 live audits.
+ *   - `claim_no_verify` — flagged ANY file path / SHA, including design
+ *                         references inside plans and markdown tables.
+ *   - `post_hoc`        — matched the bare words "actually" / "wait", which
+ *                         saturate normal explanatory prose.
+ * Result: the composite ranked sessions by how often they said "actually",
+ * not by assumption drift. The Haiku grader (Layer B) was the only part
+ * finding the real failure mode: *concrete runtime/state assertions the
+ * assistant could not have verified* (PIDs, restart counts, "51/51 passing",
+ * "HTTP 200 in 15ms"). v2 codifies that deterministically.
  *
- *   - hedge:                hedge phrases within ±200 chars of a tool_use block
- *   - claim_no_verify:      concrete claims (commit SHAs, file paths, counts,
- *                           dates) appearing in assistant text WITHOUT a
- *                           preceding tool_use of Read/Bash/Grep against the
- *                           same subject in the same turn
- *   - post_hoc_corrections: phrases that admit drift after the fact
- *                           ("wait", "actually", "I was wrong", "let me re-check")
+ * ── Signals (v2) ────────────────────────────────────────────────────────
+ *   - volatile_state_claim:  runtime facts that drift instantly and are never
+ *                            re-verifiable later — PIDs, restart counts,
+ *                            uptimes, HTTP status, response-time ms. Highest
+ *                            weight: these are the worst assumption hazard.
+ *   - state_claim_no_verify: concrete state assertions — test pass-counts,
+ *                            file/line/error counts with an action verb,
+ *                            commit SHAs, file paths asserted with a state
+ *                            verb ("X has 42 lines", not "X will live in …").
+ *   - post_hoc_corrections:  genuine drift admissions ("I was wrong",
+ *                            "scratch that", "let me re-check") — the bare
+ *                            "actually"/"wait" matches from v1 are dropped.
  *
- * Layer B (LLM grader) is gated separately in S3; this module's `score`
- * field is the deterministic-only score. The S3 composite will combine
- * `score` (this module) with an `llm_score` field stored on the same row.
+ * ── The verification gate (the key correctness win) ─────────────────────
+ * A state claim only counts when its turn contains NO verifying tool call
+ * (Read / Bash / Grep / Glob) and no tool_result grounding it. This is a
+ * STRONGER check than Layer B, which grades a *truncated* transcript and so
+ * mislabels verified claims "assumed" when the supporting tool_result was
+ * cut. Layer A sees the whole turn and never has that blind spot.
+ *
+ * Layer B (LLM grader, S3) still runs on top; this module's `score` is the
+ * deterministic-only score persisted as `deterministic_score`.
  */
 
-const HEDGE_PHRASES = [
-	'i think',
-	'i assume',
-	'should be',
-	'probably',
-	'likely',
-	'might be',
-	'i believe',
-	'i suspect',
-	'presumably',
-	'seems like',
-	'appears to'
-];
+// ── Phrase / pattern banks ────────────────────────────────────────────────
 
+/**
+ * Genuine post-hoc drift admissions. Deliberately conservative: "actually"
+ * and "wait" were removed — they are explanatory-prose words, not corrections
+ * ("what's actually happening", "wait for the build"), and drove ~70% of v1's
+ * false positives.
+ */
 const POST_HOC_PHRASES = [
-	'actually',
-	'wait',
 	'i was wrong',
+	'i was mistaken',
+	'that was wrong',
 	'let me re-check',
 	'let me recheck',
 	'let me check again',
-	'i assumed but',
-	'i missed',
-	'correction',
-	'on second look',
-	'looking again',
 	'scratch that',
-	'i misread'
+	'i misread',
+	'i missed',
+	'i overlooked',
+	'on second look',
+	'looking again i',
+	'correction:',
+	'i stand corrected',
+	'my mistake',
+	'i jumped to',
+	'i assumed but',
+	'turns out i'
 ];
 
-const COMMIT_SHA_RE = /\b[0-9a-f]{7,40}\b/gi;
-const FILE_PATH_RE = /\b(?:src|tests|\.claude|~|\/Users)[\w/.\-]*\.[a-z]{2,4}\b/g;
+/**
+ * Future-tense / intent markers. A sentence containing one of these is a
+ * PLAN, not a state claim ("the runner WILL live in src/…"), so it is
+ * excluded from both state-claim tiers. This is the precision lever that
+ * separates design references from factual assertions.
+ */
+const DESIGN_INTENT_RE =
+	/\b(?:will|i'?ll|we'?ll|let me|let'?s|going to|plan to|planning|should|would|could|might|next step|to-?do|propose|recommend|suggest|need to|i'?d|we'?d|intend|aim to|consider|draft|sketch)\b/i;
 
-const HEDGE_WINDOW = 200;
+/** Verb signalling an assertion ABOUT current state (vs. a future plan). */
+const STATE_VERB_RE =
+	/\b(?:has|have|had|is|are|was|were|contains?|contained|exists?|existed|shows?|showed|returns?|returned|defined|declared|located|lives? (?:at|in)|sits? (?:at|in)|missing|holds?|stores?|points? to|imports?|calls?|wraps?)\b/i;
+
+/** Volatile runtime facts — never re-verifiable, drift instantly. */
+const VOLATILE_RES: RegExp[] = [
+	/\bpid[\s:=#]*\d+/i,
+	/\b\d+\s*(?:→|->|to)\s*\d+\b/, // transition counts e.g. "27 → 28"
+	/\brestart(?:ed|s|\s*count)?\b[^.\n]{0,15}\b\d+/i,
+	/\bup(?:time)?\b[^.\n]{0,12}\b\d+\s*(?:ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|days?)\b/i,
+	/\bhttp[\s/]*\d{3}\b/i,
+	/\b(?:status|response)(?:\s*code)?[\s:=]*\d{3}\b/i,
+	/\b\d+\s*ms\b/i
+];
+
+/** Path / SHA shapes used by the state-claim tier. */
+const PATH_RE = /\b(?:src|tests?|scripts?|\.claude|build)\/[\w/.\-]+\.\w{2,4}\b/;
+const SHA_RE = /\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b/i; // ≥1 hex letter → not a year/count
+const RATIO_RE = /\b\d+\s*\/\s*\d+\b/; // "51/51"
+const TEST_CONTEXT_RE = /\b(?:tests?|specs?|pass(?:ing|ed|es)?|assertions?|checks?)\b/i;
+const COUNT_RE = /\b\d+\s+(?:files?|lines?|loc|insertions?|deletions?|errors?|warnings?|commits?|rows?)\b/i;
+const ACTION_VERB_RE =
+	/\b(?:creat\w*|chang\w*|add\w*|modif\w*|delet\w*|remov\w*|touch\w*|wrote|written|generat\w*|fix\w*|pass\w*|fail\w*|insert\w*)\b/i;
+
+const VERIFY_TOOLS = new Set(['Read', 'Bash', 'Grep', 'Glob']);
+
+// ── Public types ──────────────────────────────────────────────────────────
 
 export interface ScorerSignals {
-	hedge: number;
-	claim_no_verify: number;
+	volatile_state_claim: number;
+	state_claim_no_verify: number;
 	post_hoc_corrections: number;
 }
 
-export type ClaimKind = 'hedge' | 'claim_no_verify' | 'post_hoc_correction';
+export type ClaimKind =
+	| 'volatile_state_claim'
+	| 'state_claim_no_verify'
+	| 'post_hoc_correction';
 
 export interface SampleClaim {
 	text: string;
@@ -84,6 +141,8 @@ interface Turn {
 	text: string;
 	tool_uses: string[];
 }
+
+// ── Transcript parsing ──────────────────────────────────────────────────────
 
 function parseTurns(jsonlContent: string): { turns: Turn[]; session_id: string | null } {
 	const lines = jsonlContent.split('\n');
@@ -129,9 +188,8 @@ function parseTurns(jsonlContent: string): { turns: Turn[]; session_id: string |
 				} else if (b.type === 'tool_use' && typeof b.name === 'string') {
 					tool_uses.push(b.name);
 				} else if (b.type === 'tool_result') {
-					// Tool result content is verification material; include
-					// as text so claims grounded in it can be detected as
-					// "verified-in-same-turn".
+					// Tool-result content is verification material; fold it into
+					// text so claims grounded in it read as verified-in-turn.
 					if (typeof b.content === 'string') textParts.push(b.content);
 					else if (Array.isArray(b.content)) {
 						for (const c of b.content) {
@@ -155,124 +213,133 @@ function parseTurns(jsonlContent: string): { turns: Turn[]; session_id: string |
 	return { turns, session_id };
 }
 
-function countOccurrences(haystack: string, needle: string): number {
-	if (!needle) return 0;
-	const lower = haystack.toLowerCase();
-	const n = needle.toLowerCase();
-	let count = 0;
-	let from = 0;
-	for (;;) {
-		const i = lower.indexOf(n, from);
-		if (i < 0) break;
-		count++;
-		from = i + n.length;
-	}
-	return count;
+// ── Text helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Strip fenced code blocks and markdown table rows. Both are overwhelmingly
+ * design/reference material (architecture plans, "files claimed" tables,
+ * pasted command snippets) rather than live state assertions, and they were
+ * the dominant false-positive source in v1.
+ */
+function stripNoise(text: string): string {
+	let t = text.replace(/```[\s\S]*?```/g, ' ');
+	// Drop URLs before claim-scanning. A commit SHA inside a GitHub URL
+	// (".../commit/6a6809e") is a verifiable reference, not an unverified
+	// state claim — without this it trips the SHA + state-verb rule.
+	t = t.replace(/https?:\/\/\S+/g, ' ');
+	t = t
+		.split('\n')
+		.filter((l) => (l.match(/\|/g) || []).length < 2)
+		.join('\n');
+	return t;
 }
 
-function findHedges(turn: Turn): SampleClaim[] {
-	const claims: SampleClaim[] = [];
-	if (turn.role !== 'assistant') return claims;
-	if (turn.tool_uses.length === 0) return claims;
+function splitSentences(text: string): string[] {
+	return text
+		.split(/(?<=[.!?\n])\s+|\n+/)
+		.map((s) => s.trim())
+		.filter(Boolean);
+}
 
-	const lower = turn.text.toLowerCase();
-	for (const phrase of HEDGE_PHRASES) {
-		let from = 0;
-		for (;;) {
-			const i = lower.indexOf(phrase, from);
-			if (i < 0) break;
-			const start = Math.max(0, i - HEDGE_WINDOW);
-			const end = Math.min(turn.text.length, i + phrase.length + HEDGE_WINDOW);
-			const slice = turn.text.slice(start, end);
-			claims.push({
-				text: slice.replace(/\s+/g, ' ').slice(0, 200).trim(),
-				turn_index: turn.index,
-				kind: 'hedge'
-			});
-			from = i + phrase.length;
+function sample(text: string, kind: ClaimKind, turn_index: number): SampleClaim {
+	return { text: text.replace(/\s+/g, ' ').slice(0, 200).trim(), turn_index, kind };
+}
+
+// ── Per-turn detectors ──────────────────────────────────────────────────────
+
+function turnIsVerified(turn: Turn): boolean {
+	return turn.tool_uses.some((t) => VERIFY_TOOLS.has(t));
+}
+
+function findStateClaims(turn: Turn): SampleClaim[] {
+	const out: SampleClaim[] = [];
+	if (turn.role !== 'assistant') return out;
+	// A claim grounded by a same-turn verification tool is not an assumption.
+	if (turnIsVerified(turn)) return out;
+
+	for (const sentence of splitSentences(stripNoise(turn.text))) {
+		// Plans are not claims.
+		if (DESIGN_INTENT_RE.test(sentence)) continue;
+
+		if (VOLATILE_RES.some((re) => re.test(sentence))) {
+			out.push(sample(sentence, 'volatile_state_claim', turn.index));
+			continue;
+		}
+
+		const isTestResult = RATIO_RE.test(sentence) && TEST_CONTEXT_RE.test(sentence);
+		const isCount = COUNT_RE.test(sentence) && ACTION_VERB_RE.test(sentence);
+		const isShaClaim = SHA_RE.test(sentence) && STATE_VERB_RE.test(sentence);
+		const isPathClaim = PATH_RE.test(sentence) && STATE_VERB_RE.test(sentence);
+
+		if (isTestResult || isCount || isShaClaim || isPathClaim) {
+			out.push(sample(sentence, 'state_claim_no_verify', turn.index));
 		}
 	}
-	return claims;
+	return out;
 }
 
 function findPostHocCorrections(turn: Turn): SampleClaim[] {
-	const claims: SampleClaim[] = [];
-	if (turn.role !== 'assistant') return claims;
-	const lower = turn.text.toLowerCase();
+	const out: SampleClaim[] = [];
+	if (turn.role !== 'assistant') return out;
+	const text = stripNoise(turn.text);
+	const lower = text.toLowerCase();
 	for (const phrase of POST_HOC_PHRASES) {
 		let from = 0;
 		for (;;) {
 			const i = lower.indexOf(phrase, from);
 			if (i < 0) break;
 			const start = Math.max(0, i - 80);
-			const end = Math.min(turn.text.length, i + phrase.length + 120);
-			claims.push({
-				text: turn.text.slice(start, end).replace(/\s+/g, ' ').slice(0, 200).trim(),
-				turn_index: turn.index,
-				kind: 'post_hoc_correction'
-			});
+			const end = Math.min(text.length, i + phrase.length + 120);
+			out.push(sample(text.slice(start, end), 'post_hoc_correction', turn.index));
 			from = i + phrase.length;
 		}
 	}
-	return claims;
+	return out;
 }
 
-function findClaimsWithoutVerify(turn: Turn): SampleClaim[] {
-	const claims: SampleClaim[] = [];
-	if (turn.role !== 'assistant') return claims;
-
-	const VERIFY_TOOLS = new Set(['Read', 'Bash', 'Grep', 'Glob']);
-	const verifiedInTurn = turn.tool_uses.some((t) => VERIFY_TOOLS.has(t));
-	if (verifiedInTurn) return claims;
-
-	// Look for concrete claims (commit SHAs, file paths) in text-only turns.
-	const shas = Array.from(turn.text.matchAll(COMMIT_SHA_RE), (m) => m[0]).filter(
-		// Filter out years and common numeric strings that match hex by coincidence.
-		(s) => !/^[0-9]+$/.test(s) && s.length >= 7
-	);
-	const paths = Array.from(turn.text.matchAll(FILE_PATH_RE), (m) => m[0]);
-
-	const concreteHits = [...new Set([...shas, ...paths])].slice(0, 3);
-	for (const hit of concreteHits) {
-		const i = turn.text.indexOf(hit);
-		const start = Math.max(0, i - 80);
-		const end = Math.min(turn.text.length, i + hit.length + 120);
-		claims.push({
-			text: turn.text.slice(start, end).replace(/\s+/g, ' ').slice(0, 200).trim(),
-			turn_index: turn.index,
-			kind: 'claim_no_verify'
-		});
-	}
-	return claims;
-}
+// ── Composite ───────────────────────────────────────────────────────────────
 
 function composite(signals: ScorerSignals): number {
-	// Capped contributions so a single noisy turn can't saturate the score.
-	const hedgePts = Math.min(30, signals.hedge * 5);
-	const claimPts = Math.min(40, signals.claim_no_verify * 8);
-	const correctionPts = Math.min(60, signals.post_hoc_corrections * 12);
-	return Math.min(100, hedgePts + claimPts + correctionPts);
+	// Volatile claims weighted heaviest — they are the highest-severity,
+	// never-re-verifiable assumption hazard. Per-signal caps so one noisy
+	// turn can't saturate the score on its own.
+	const volatilePts = Math.min(60, signals.volatile_state_claim * 15);
+	const statePts = Math.min(45, signals.state_claim_no_verify * 7);
+	const postHocPts = Math.min(40, signals.post_hoc_corrections * 8);
+	return Math.min(100, volatilePts + statePts + postHocPts);
 }
+
+// ── Entry point ─────────────────────────────────────────────────────────────
 
 export function scoreTranscript(jsonlContent: string): ScorerResult {
 	const { turns, session_id } = parseTurns(jsonlContent);
 
-	let hedge = 0;
-	let claim_no_verify = 0;
+	let volatile_state_claim = 0;
+	let state_claim_no_verify = 0;
 	let post_hoc_corrections = 0;
 	const sample_claims: SampleClaim[] = [];
 
 	for (const turn of turns) {
-		const h = findHedges(turn);
-		const c = findClaimsWithoutVerify(turn);
-		const p = findPostHocCorrections(turn);
-		hedge += h.length;
-		claim_no_verify += c.length;
-		post_hoc_corrections += p.length;
-		sample_claims.push(...h.slice(0, 2), ...c.slice(0, 2), ...p.slice(0, 2));
+		const state = findStateClaims(turn);
+		const postHoc = findPostHocCorrections(turn);
+
+		for (const c of state) {
+			if (c.kind === 'volatile_state_claim') volatile_state_claim++;
+			else state_claim_no_verify++;
+		}
+		post_hoc_corrections += postHoc.length;
+
+		// Keep a bounded, representative sample (≤2 of each kind per turn).
+		const vol = state.filter((c) => c.kind === 'volatile_state_claim').slice(0, 2);
+		const st = state.filter((c) => c.kind === 'state_claim_no_verify').slice(0, 2);
+		sample_claims.push(...vol, ...st, ...postHoc.slice(0, 2));
 	}
 
-	const signals: ScorerSignals = { hedge, claim_no_verify, post_hoc_corrections };
+	const signals: ScorerSignals = {
+		volatile_state_claim,
+		state_claim_no_verify,
+		post_hoc_corrections
+	};
 	return {
 		score: composite(signals),
 		signals,

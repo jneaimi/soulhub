@@ -92,6 +92,21 @@ export function saveAudit(input: SaveAuditInput): number {
 	return Number(info.lastInsertRowid);
 }
 
+/**
+ * Delete all audit rows for a transcript path. Used by the handler's
+ * `forceRescan` path: a path can legitimately accumulate history rows over
+ * time (one per file modification), so a re-scan must clear the prior rows
+ * for that path before inserting the fresh score — otherwise it duplicates.
+ * Returns the number of rows removed.
+ */
+export function deleteAuditsByPath(transcript_path: string): number {
+	const db = getHeartbeatDb();
+	const info = db
+		.prepare(`DELETE FROM assumption_audits WHERE transcript_path = ?`)
+		.run(transcript_path);
+	return Number(info.changes);
+}
+
 interface RawAuditRow {
 	id: number;
 	session_id: string;

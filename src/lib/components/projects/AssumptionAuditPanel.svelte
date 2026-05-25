@@ -21,14 +21,14 @@
 	import { onMount } from 'svelte';
 
 	interface ScorerSignals {
-		hedge: number;
-		claim_no_verify: number;
+		volatile_state_claim: number;
+		state_claim_no_verify: number;
 		post_hoc_corrections: number;
 	}
 	interface SampleClaim {
 		text: string;
 		turn_index: number;
-		kind: 'hedge' | 'claim_no_verify' | 'post_hoc_correction';
+		kind: 'volatile_state_claim' | 'state_claim_no_verify' | 'post_hoc_correction';
 	}
 	interface LlmClaim {
 		text: string;
@@ -272,7 +272,7 @@
 							<div class="ml-5 mt-1 mb-2 pl-3 border-l border-hub-card space-y-2 text-[11px]">
 								<div class="text-hub-dim">
 									<span class="font-mono text-hub-text">signals:</span>
-									hedge={a.signals.hedge}, claim_no_verify={a.signals.claim_no_verify}, post_hoc={a.signals.post_hoc_corrections}
+									volatile={a.signals.volatile_state_claim ?? 0}, state_claim={a.signals.state_claim_no_verify ?? 0}, post_hoc={a.signals.post_hoc_corrections ?? 0}
 								</div>
 								<div class="text-hub-dim font-mono break-all">{a.transcript_path}</div>
 

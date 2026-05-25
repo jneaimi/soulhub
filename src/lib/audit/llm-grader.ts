@@ -95,7 +95,7 @@ export async function gradeTranscript(
 		};
 	}
 
-	const layerSummary = `Layer A flagged: hedge=${layerA.signals.hedge}, claim_no_verify=${layerA.signals.claim_no_verify}, post_hoc_corrections=${layerA.signals.post_hoc_corrections}.`;
+	const layerSummary = `Layer A flagged: volatile_state_claim=${layerA.signals.volatile_state_claim}, state_claim_no_verify=${layerA.signals.state_claim_no_verify}, post_hoc_corrections=${layerA.signals.post_hoc_corrections}.`;
 	const prompt = `${PROMPT_PREFIX}\n\n${layerSummary}\n\nTRANSCRIPT:\n${transcript}\n\nReturn ONLY the JSON.`;
 
 	const started = Date.now();

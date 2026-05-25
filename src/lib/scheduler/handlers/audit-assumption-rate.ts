@@ -17,7 +17,10 @@
  *        minScoreToStore?: 0,          // store every audit; UI filters
  *        llmGrading?: false,           // S3 — turn on for Layer B
  *        llmGradingThreshold?: 20,     // skip LLM for det score < this
- *        llmGradingModel?: 'anthropic/claude-haiku-4-5'
+ *        llmGradingModel?: 'anthropic/claude-haiku-4-5',
+ *        forceRescan?: false           // ignore mtime watermark; re-audit
+ *                                      // every candidate (use once after a
+ *                                      // scorer-logic change to re-score)
  *      }
  *    }
  */
@@ -25,7 +28,7 @@
 import { readFileSync } from 'node:fs';
 import { scoreTranscript } from '../../audit/assumption-scorer.js';
 import { extractLinkedProjects } from '../../audit/extract-linked-projects.js';
-import { saveAudit, latestTranscriptMtimeByPath } from '../../audit/persister.js';
+import { saveAudit, deleteAuditsByPath, latestTranscriptMtimeByPath } from '../../audit/persister.js';
 import { scanTranscripts } from '../../audit/scan-transcripts.js';
 import { gradeTranscript, isGraderError } from '../../audit/llm-grader.js';
 import type { LlmGraderResult } from '../../audit/llm-grader.js';
@@ -37,6 +40,7 @@ interface AuditAssumptionRateParams {
 	llmGrading?: boolean;
 	llmGradingThreshold?: number;
 	llmGradingModel?: string;
+	forceRescan?: boolean;
 }
 
 export interface AuditScanSummary {
@@ -67,6 +71,7 @@ export function auditAssumptionRateFactory(rawParams: unknown): TaskFn {
 	const llmGrading = params.llmGrading === true;
 	const llmGradingThreshold = params.llmGradingThreshold ?? 20;
 	const llmGradingModel = params.llmGradingModel;
+	const forceRescan = params.forceRescan === true;
 
 	return async (ctx) => {
 		const startedAt = Date.now();
@@ -88,7 +93,9 @@ export function auditAssumptionRateFactory(rawParams: unknown): TaskFn {
 			took_ms: 0
 		};
 
-		const watermark = latestTranscriptMtimeByPath();
+		// forceRescan: pass an empty watermark so every candidate clears the
+		// mtime gate and gets re-scored under the current scorer rules.
+		const watermark = forceRescan ? new Map<string, number>() : latestTranscriptMtimeByPath();
 		const scan = scanTranscripts({
 			latestAuditedAtByPath: watermark,
 			maxCandidates
@@ -135,6 +142,9 @@ export function auditAssumptionRateFactory(rawParams: unknown): TaskFn {
 				}
 
 				const projects = extractLinkedProjects(content);
+				// Re-scoring under new rules: clear prior history rows for this
+				// path so we replace rather than duplicate.
+				if (forceRescan) deleteAuditsByPath(candidate.path);
 				saveAudit({
 					session_id: layerA.session_id ?? candidate.path.split('/').pop() ?? '',
 					transcript_path: candidate.path,
