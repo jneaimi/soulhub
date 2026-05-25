@@ -10,7 +10,7 @@ description: |
   Flow:
   1. Recipe-start resolves `target_file` to a known-good file path and stat-checks it.
   2. `shell-exec` runs `wc -l` on the file, redirecting stdout into work_dir.
-  3. `vault-write` logs the result to inbox/_naseej-runs/ using filters
+  3. `vault-write` logs the result to operations/naseej-runs/ using filters
      (basename, dirname, human_bytes, date_fmt) to verify they all interpolate
      at step time.
 
@@ -39,9 +39,9 @@ steps:
     component: vault-write@1.0.0
     depends_on: [count-lines]
     inputs:
-      path: "inbox/_naseej-runs/{{date}}-{{run_id}}-shell-smoke.md"
+      path: "operations/naseej-runs/{{date}}-{{run_id}}-shell-smoke.md"
       frontmatter:
-        type: output
+        type: session-log
         created: "{{date}}"
         tags: [naseej, shell-smoke, adr-006-s3, auto-generated]
         project: naseej

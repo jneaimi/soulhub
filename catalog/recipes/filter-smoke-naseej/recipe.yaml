@@ -32,9 +32,9 @@ steps:
     component: vault-write@1.0.0
     depends_on: [score]
     inputs:
-      path: "inbox/_naseej-runs/{{date}}-{{run_id}}-filter-smoke.md"
+      path: "operations/naseej-runs/{{date}}-{{run_id}}-filter-smoke.md"
       frontmatter:
-        type: output
+        type: session-log
         created: "{{date}}"
         tags: [naseej, filter-smoke, adr-006-s2, auto-generated]
         project: naseej

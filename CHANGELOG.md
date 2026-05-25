@@ -4,6 +4,31 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.18.0] — 2026-05-26
+
+### Changed
+- **Layer A assumption-rate scorer rewritten on state-claim detection
+  (ADR-008 amendment).** The deterministic scorer was ranking sessions by how
+  often they said "actually", not by assumption drift: across 190 live audits
+  `hedge` fired 0 times, `claim_no_verify` flagged design references in
+  plans/tables, and `post_hoc_corrections` matched bare "actually"/"wait". v2
+  re-grounds on the real failure mode — concrete state/runtime assertions made
+  without verification — and gates every signal on in-turn verification (a
+  claim grounded by a same-turn Read/Bash/Grep/Glob doesn't count), which is
+  stronger than the truncated-transcript Layer B grader. New signals
+  `volatile_state_claim` (PIDs, restart counts, uptimes, HTTP status, ms) and
+  `state_claim_no_verify` (test counts, file/line counts, SHAs, path+state-verb);
+  `hedge` dropped. Code fences, markdown tables, and URLs are stripped before
+  scanning, and a design-intent guard skips future-tense sentences. Validated
+  on live transcripts (id1728 80→15, id478 98→100); 30 scorer + 5 handler tests.
+
+### Added
+- **`forceRescan` param on the `audit-assumption-rate` handler.** Ignores the
+  mtime watermark and re-audits every candidate, deleting prior history rows
+  per path (`deleteAuditsByPath`) before insert so a re-score replaces rather
+  than duplicates. Run once with `{ "forceRescan": true }` to re-score the
+  backlog under the v2 scorer.
+
 ## [2.17.0] — 2026-05-25
 
 ### Added

@@ -31,6 +31,12 @@ export function getStaleInbox(
 		if (note.path.split('/')[0] !== 'inbox') continue;
 		// inbox/index.md and zone-CLAUDE.md never go stale themselves.
 		if (note.path.endsWith('/index.md') || note.path === 'inbox/index.md') continue;
+		// Managed voice-queue notes (vault-scout / project-phases ADR-009) are
+		// NOT un-filed captures — they ride their own lifecycle: surfaced via
+		// the voice queue, acked on delivery, and swept by
+		// archiveOldNotes('inbox', 30). Flagging them "needs human review" is a
+		// false positive, so they're exempt from stale-inbox.
+		if (note.meta.voice_eligible === true) continue;
 		if (note.mtime > cutoff) continue;
 
 		const ageDays = Math.floor((Date.now() - note.mtime) / MS_PER_DAY);

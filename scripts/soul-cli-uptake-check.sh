@@ -238,8 +238,10 @@ else
 fi
 
 # ────────────────────────────────────────────────────────────────────────
-# Optional: write the digest to ~/vault/inbox/<date>-soul-cli-uptake.md
-# via POST /api/vault/notes (ADR-046 chokepoint compliant).
+# Optional: write the digest to ~/vault/operations/<date>-soul-cli-uptake.md
+# via POST /api/vault/notes (ADR-046 chokepoint compliant). Filed under
+# operations/ (a report, not an inbox triage item) so it doesn't trip the
+# stale-inbox hygiene rule.
 # ────────────────────────────────────────────────────────────────────────
 
 if [ "$WRITE_VAULT" = "1" ]; then
@@ -257,7 +259,7 @@ if [ "$WRITE_VAULT" = "1" ]; then
     "$(printf "%s\n" "${WRITE_SAMPLES:-_(none)_}" | sed 's/^/    /')")
 
   PAYLOAD=$(jq -n \
-    --arg zone     "inbox" \
+    --arg zone     "operations" \
     --arg filename "$FILENAME" \
     --arg today    "$TODAY" \
     --arg content  "$BODY" \

@@ -29,9 +29,9 @@ steps:
     component: vault-write@1.0.0
     depends_on: [score]
     inputs:
-      path: "inbox/_quality-checks/{{date}}-{{inputs.label}}-{{run_id}}.md"
+      path: "operations/quality-checks/{{date}}-{{inputs.label}}-{{run_id}}.md"
       frontmatter:
-        type: output
+        type: session-log
         created: "{{date}}"
         tags: [naseej, quality-check, stop-slop]
         project: naseej
