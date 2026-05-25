@@ -4,6 +4,37 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.16.0] — 2026-05-25
+
+### Added
+- **Agents UI Phase 6 — budget & orchestration surfacing.** Brings the agent UI
+  up to date with the ADR-005 sub-agent fan-out and ADR-006 dynamic budget:
+  - **Orchestrator chip** in the agent list for `allow_subagents` agents.
+  - **`BudgetMeter`** two-band (soft → ceiling) spend bar, shown in the test
+    runner's production mode, plus a passive velocity-warning pill.
+  - **Budget-cap line** + `awaiting-budget-approval` paused status colour in the
+    list row, and **44px mobile touch targets** on row/wizard actions.
+  - **ai-sdk key wiring** in the wizard — provider key presence + last-4
+    fingerprint via the new `GET /api/settings/keys` (never returns the secret).
+  - **Budget-approval web surface (ADR-007)** — `/orchestration/agents/budget`
+    panel lists ADR-006 paused runs with bump/stop actions (the same engine the
+    Telegram buttons drive), backed by `GET/POST /api/agents/budget-approvals`
+    (same-origin-strict guard) + a "Budget" sub-nav tab.
+
+## [2.15.1] — 2026-05-25
+
+### Fixed
+- **Vault note saves no longer 409 spuriously.** The optimistic-concurrency
+  guard on `PUT /api/vault/notes/[...path]` compared `parseInt(x-note-mtime, 10)`
+  against the note's `mtime` — but `mtime` is `fileStat.mtimeMs`, a
+  fractional-millisecond float. `parseInt` truncated the fraction, so the value
+  never matched and **every** conditional save returned a false `409 conflict`.
+  This silently broke the vault note editor (which sends `X-Note-Mtime` on each
+  save). The server now uses `parseFloat`, `updateNote` returns the post-write
+  `mtime` (on `WriteResult`), and the editor re-syncs its guard from that value
+  instead of `Date.now()` (an integer that re-triggered the conflict on the next
+  save). The guard still rejects genuinely stale writes.
+
 ## [2.15.0] — 2026-05-25
 
 ### Added

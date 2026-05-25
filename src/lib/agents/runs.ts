@@ -420,6 +420,21 @@ export function listAgentRuns(
 		.all(...args) as AgentRunRow[];
 }
 
+/** ADR-007 — open paused runs awaiting a budget decision, newest-first. The
+ *  web budget-approval surface lists these, merges each with its pending
+ *  approval detail (ceilings + TTL), and drives the same resume/stop engine the
+ *  Telegram buttons use. */
+export function listAwaitingBudgetApprovals(): AgentRunRow[] {
+	return db()
+		.prepare(
+			`SELECT ${SELECT_COLS}
+			FROM agent_runs
+			WHERE status = 'awaiting-budget-approval'
+			ORDER BY started_at DESC`,
+		)
+		.all() as AgentRunRow[];
+}
+
 /** List runs for a single conversation (WhatsApp `jid`), newest-first. Used
  *  by the conversation-context helper to feed the orchestrator a thin slice
  *  of recent agent activity for the same chat. */

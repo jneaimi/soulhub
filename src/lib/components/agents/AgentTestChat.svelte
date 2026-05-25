@@ -1,5 +1,6 @@
 <script lang="ts">
 	import BackendBadge from './BackendBadge.svelte';
+	import BudgetMeter from './BudgetMeter.svelte';
 
 	type Backend = 'claude-pty' | 'claude-cli-flag' | 'ai-sdk';
 
@@ -9,7 +10,13 @@
 		backend: Backend;
 		model?: string;
 		provider?: string;
-		budget?: { max_usd?: number; max_turns?: number; timeout_sec?: number };
+		budget?: {
+			max_usd?: number;
+			max_turns?: number;
+			timeout_sec?: number;
+			ceiling_usd?: number;
+			ceiling_turns?: number;
+		};
 	}
 
 	// Production defaults — must stay in sync with `PRODUCTION_DEFAULTS` in
@@ -71,6 +78,13 @@
 	const prodIsCustom = $derived(
 		!!(agent.budget?.max_usd || agent.budget?.max_turns || agent.budget?.timeout_sec),
 	);
+	// ADR-006 — hard ceiling for the production budget meter; defaults to 2× soft.
+	const prodCeilingUsd = $derived(agent.budget?.ceiling_usd ?? prodMaxUsd * 2);
+
+	// Live spend for the production meter — set from each run's result summary.
+	let liveCostUsd = $state(0);
+	// Passive flag set when a `budget_warning` event arrives mid-run (ADR-006 velocity).
+	let budgetWarning = $state(false);
 
 	const examples: Record<Backend, string[]> = {
 		'claude-pty': [
@@ -118,6 +132,7 @@
 		scrollToBottom();
 
 		running = true;
+		budgetWarning = false;
 		abortController = new AbortController();
 
 		try {
@@ -203,6 +218,9 @@
 			// Show step badges only if there are tool turns; v1 ai-sdk has no tools.
 		} else if (ev.type === 'tool_call') {
 			pushAgentChunk(`\n[tool: ${ev.name}]\n`);
+		} else if (ev.type === 'budget_warning') {
+			// ADR-006 velocity warning — surface a passive pill near the meter.
+			budgetWarning = true;
 		} else if (ev.type === 'error') {
 			messages = [
 				...messages,
@@ -216,6 +234,7 @@
 			scrollToBottom();
 		} else if (ev.type === 'done' && typeof ev.result === 'object') {
 			const result = ev.result as DispatchResult;
+			if (result.cost_usd > 0) liveCostUsd = result.cost_usd;
 			messages = [
 				...messages,
 				{
@@ -310,6 +329,24 @@
 				Production <span class="text-[9px] opacity-75">(${prodMaxUsd.toFixed(2)} cap)</span>
 			</button>
 		</div>
+
+		{#if mode === 'production'}
+			<div class="mt-2">
+				<div class="flex items-center gap-2 mb-1">
+					<span class="text-[10px] uppercase tracking-wide text-hub-dim font-medium">Production budget</span>
+					{#if budgetWarning}
+						<span class="text-[10px] font-medium px-1.5 py-0.5 rounded bg-hub-warning/10 text-hub-warning">
+							⚡ velocity warning
+						</span>
+					{/if}
+				</div>
+				<BudgetMeter
+					spentUsd={liveCostUsd}
+					softUsd={prodMaxUsd}
+					ceilingUsd={prodCeilingUsd}
+				/>
+			</div>
+		{/if}
 	</div>
 
 	<!-- Messages -->

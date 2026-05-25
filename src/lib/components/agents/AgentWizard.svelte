@@ -85,7 +85,27 @@
 	onMount(() => {
 		loadSkillCatalogue();
 		loadCredentials();
+		loadKeyStatus();
 	});
+
+	// ─── ai-sdk key status (ADR-006 #6) ────────────────────────────────────
+	// Fetched from `GET /api/settings/keys` (Panel B). Defensive: on non-200,
+	// network error, or empty payload we leave the map empty and render no
+	// extra hints. Shape: { keys: { ENV_VAR: { present, last4 } } }.
+	let keyStatus = $state<Record<string, { present: boolean; last4: string | null }>>({});
+
+	async function loadKeyStatus() {
+		try {
+			const res = await fetch('/api/settings/keys');
+			if (!res.ok) return;
+			const data = await res.json();
+			if (data && typeof data === 'object' && data.keys && typeof data.keys === 'object') {
+				keyStatus = data.keys;
+			}
+		} catch {
+			// Silent — endpoint may not exist yet; UI degrades to no key badges.
+		}
+	}
 
 	function toggleSkill(id: string) {
 		if (skillsSelected.includes(id)) {
@@ -149,6 +169,10 @@
 	function providerAvailable(p: Provider): boolean {
 		return credSet[PROVIDER_TO_KEY[p]] === true;
 	}
+
+	// Key status for the currently selected ai-sdk provider (from
+	// `/api/settings/keys`), or undefined when the endpoint returned nothing.
+	const selectedKeyStatus = $derived(keyStatus[PROVIDER_TO_KEY[provider]]);
 
 	async function loadCredentials() {
 		try {
@@ -771,6 +795,18 @@
 								<a href="/settings" class="underline">Add in Settings →</a>
 							</p>
 						{/if}
+						{#if selectedKeyStatus}
+							{#if selectedKeyStatus.present}
+								<p class="text-[11px] mt-1">
+									<span class="text-hub-cta">✓</span>
+									<span class="text-hub-dim font-mono">••••{selectedKeyStatus.last4 ?? '????'}</span>
+								</p>
+							{:else}
+								<p class="text-[11px] text-hub-dim mt-1">
+									✗ <a href="/settings" class="underline">Add key in Settings →</a>
+								</p>
+							{/if}
+						{/if}
 					</div>
 					<div>
 						<label for="ai-model" class="block text-xs text-hub-muted mb-1">Model</label>
@@ -821,7 +857,7 @@
 		<button
 			type="button"
 			onclick={cancel}
-			class="px-3 py-1.5 rounded-lg text-sm text-hub-muted hover:text-hub-text hover:bg-hub-card transition-colors cursor-pointer"
+			class="px-3 py-1.5 min-h-[44px] sm:min-h-0 rounded-lg text-sm text-hub-muted hover:text-hub-text hover:bg-hub-card transition-colors cursor-pointer"
 		>
 			Cancel
 		</button>
@@ -829,7 +865,7 @@
 			type="button"
 			onclick={save}
 			disabled={!formValid || saving}
-			class="px-3 py-1.5 rounded-lg bg-hub-cta text-black font-medium text-sm hover:bg-hub-cta/90 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+			class="px-3 py-1.5 min-h-[44px] sm:min-h-0 rounded-lg bg-hub-cta text-black font-medium text-sm hover:bg-hub-cta/90 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
 		>
 			{saving ? 'Saving…' : isEdit ? 'Save changes' : 'Create agent'}
 		</button>

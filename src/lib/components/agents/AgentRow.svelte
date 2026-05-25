@@ -32,6 +32,8 @@
 		source_path: string;
 		system_prompt: string;
 		chat_dispatchable?: boolean;
+		allow_subagents?: boolean;
+		budget?: { max_usd?: number; max_turns?: number; timeout_sec?: number; ceiling_usd?: number; ceiling_turns?: number };
 		stats?: AgentStats | null;
 	}
 
@@ -88,6 +90,7 @@
 		cancelled: 'text-hub-muted',
 		timeout: 'text-hub-warning',
 		'budget-exceeded': 'text-hub-warning',
+		'awaiting-budget-approval': 'text-hub-info',
 	};
 </script>
 
@@ -128,6 +131,14 @@
 						💬 chat
 					</span>
 				{/if}
+				{#if agent.allow_subagents}
+					<span
+						class="text-[10px] text-hub-purple font-medium px-1.5 py-0.5 bg-hub-purple/10 rounded border border-hub-purple/40 flex-shrink-0"
+						title="Fans out to parallel sub-agents (Claude Code Task tool) — ADR-005."
+					>
+						⚙ orchestrator
+					</span>
+				{/if}
 			</div>
 			{#if agent.description}
 				<p class="text-xs text-hub-muted truncate" title={agent.description}>{agent.description}</p>
@@ -150,6 +161,9 @@
 		<div class="text-[11px] text-hub-muted min-w-[120px]">
 			<div>{agent.skills.length} skill{agent.skills.length === 1 ? '' : 's'}</div>
 			<div class="text-hub-dim text-[10px]">{agent.tools.length} tool{agent.tools.length === 1 ? '' : 's'}</div>
+			{#if agent.budget?.max_usd}
+				<div class="text-hub-dim text-[10px] font-mono">${agent.budget.max_usd.toFixed(2)} cap</div>
+			{/if}
 		</div>
 
 		<!-- Lifetime stats -->
@@ -180,21 +194,21 @@
 		<div class="flex items-center gap-1.5 flex-shrink-0">
 			<a
 				href="/orchestration/agents/{encodeURIComponent(agent.id)}/test"
-				class="px-2 py-1 rounded-md text-[11px] font-medium text-hub-info hover:text-hub-text hover:bg-hub-info/10 transition-colors cursor-pointer"
+				class="px-2 py-1 min-h-[44px] sm:min-h-0 inline-flex items-center rounded-md text-[11px] font-medium text-hub-info hover:text-hub-text hover:bg-hub-info/10 transition-colors cursor-pointer"
 				title="Test in chat"
 			>
 				▶ Test
 			</a>
 			<a
 				href="/orchestration/agents/{encodeURIComponent(agent.id)}/runs"
-				class="px-2 py-1 rounded-md text-[11px] font-medium text-hub-muted hover:text-hub-text hover:bg-hub-bg transition-colors cursor-pointer"
+				class="px-2 py-1 min-h-[44px] sm:min-h-0 inline-flex items-center rounded-md text-[11px] font-medium text-hub-muted hover:text-hub-text hover:bg-hub-bg transition-colors cursor-pointer"
 				title="Run history"
 			>
 				⏱ Runs
 			</a>
 			<a
 				href="/orchestration/agents/{encodeURIComponent(agent.id)}/edit"
-				class="px-2 py-1 rounded-md text-[11px] font-medium text-hub-muted hover:text-hub-text hover:bg-hub-bg transition-colors cursor-pointer"
+				class="px-2 py-1 min-h-[44px] sm:min-h-0 inline-flex items-center rounded-md text-[11px] font-medium text-hub-muted hover:text-hub-text hover:bg-hub-bg transition-colors cursor-pointer"
 				title="Edit agent"
 			>
 				✎ Edit
@@ -203,7 +217,7 @@
 				<button
 					type="button"
 					onclick={onDelete}
-					class="px-2 py-1 rounded-md text-[11px] font-medium transition-colors cursor-pointer
+					class="px-2 py-1 min-h-[44px] sm:min-h-0 inline-flex items-center rounded-md text-[11px] font-medium transition-colors cursor-pointer
 						{deleteConfirming
 							? 'bg-hub-danger/15 text-hub-danger hover:bg-hub-danger/25'
 							: 'text-hub-dim hover:text-hub-danger hover:bg-hub-danger/10'}"
@@ -215,7 +229,7 @@
 			<button
 				type="button"
 				onclick={onToggleExpand}
-				class="px-2 py-1 rounded-md text-[11px] font-medium text-hub-muted hover:text-hub-text hover:bg-hub-bg transition-colors cursor-pointer"
+				class="px-2 py-1 min-h-[44px] sm:min-h-0 inline-flex items-center rounded-md text-[11px] font-medium text-hub-muted hover:text-hub-text hover:bg-hub-bg transition-colors cursor-pointer"
 				title={expanded ? 'Hide details' : 'Show system prompt + skills'}
 				aria-expanded={expanded}
 			>

@@ -6,6 +6,7 @@
 	const NAV: { href: string; label: string; matchPrefix: string }[] = [
 		{ href: '/orchestration', label: 'Overview', matchPrefix: '/orchestration' },
 		{ href: '/orchestration/agents', label: 'Agents', matchPrefix: '/orchestration/agents' },
+		{ href: '/orchestration/agents/budget', label: 'Budget', matchPrefix: '/orchestration/agents/budget' },
 		{ href: '/orchestration/skills', label: 'Skills', matchPrefix: '/orchestration/skills' },
 		{ href: '/orchestration/tools', label: 'Tools', matchPrefix: '/orchestration/tools' },
 		{ href: '/orchestration/metrics', label: 'Metrics', matchPrefix: '/orchestration/metrics' },
