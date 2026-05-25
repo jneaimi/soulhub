@@ -34,6 +34,7 @@ import { dirname } from 'node:path';
 import type { ClaudeEvent } from './types.js';
 import { priceUsage } from './pricing.js';
 import { locateTranscript } from './run-record.js';
+import { rollupSubagentCost } from './subagent-cost.js';
 
 export interface RunTailState {
 	/** True once the transcript file has been located and opened. */
@@ -44,9 +45,15 @@ export interface RunTailState {
 	lastStopReason?: string;
 	/** A `tool_use` was emitted whose matching `tool_result` hasn't arrived. */
 	pendingToolUse: boolean;
-	/** Summed priced `usage`. `null` if any priced turn had unknown pricing
-	 *  (mirrors `summarize.ts` — caller shows `—`, never a wrong dollar value). */
+	/** Grand total priced `usage`: parent thread + sub-agent (fan-out) spend
+	 *  (ADR-005 gap #1). `null` if any priced turn — parent or sub-agent — had
+	 *  unknown pricing (mirrors `summarize.ts`: caller shows `—`, never a wrong
+	 *  dollar value). This is the honest signal ADR-006 budget enforces against. */
 	costUsd: number | null;
+	/** Sub-agent (fan-out) portion of `costUsd`. `0` for a non-orchestrator run. */
+	subagentCostUsd: number | null;
+	/** Distinct assistant turns across all sub-agent transcripts. */
+	subagentTurns: number;
 	/** Any assistant API error or `tool_result.is_error === true` seen. */
 	sawError: boolean;
 	/** `Date.now()` when the last event was folded in — freshness signal. */
@@ -100,6 +107,15 @@ export function createRunTail(sessionId: string, opts: RunTailOptions = {}): Run
 	const pendingTools = new Set<string>();
 	let costUsd = 0;
 	let unknownPricing = false;
+	// ADR-005 gap #1 — sub-agent (fan-out) spend lives in separate
+	// `<uuid>/subagents/agent-*.jsonl` files, not the parent transcript. We sweep
+	// them on a throttle (full re-read; the files are small and few) and cache the
+	// result so `snapshot()` stays cheap + synchronous.
+	let subagentCostUsd = 0;
+	let subagentUnknownPricing = false;
+	let subagentTurns = 0;
+	let lastSubagentSweep = 0;
+	const subagentSweepMs = 2000;
 	let lastStopReason: string | undefined;
 	let sawError = false;
 	let lastEventTs = 0;
@@ -167,6 +183,20 @@ export function createRunTail(sessionId: string, opts: RunTailOptions = {}): Run
 				path = locateTranscript(sessionId, opts.cwd);
 				if (!path) return; // not written yet — try again next tick
 			}
+			// Sub-agent sweep (throttled) — independent of parent growth, since a
+			// fan-out parent sits idle on `tool_use` while its sub-agents write.
+			const now = Date.now();
+			if (now - lastSubagentSweep >= subagentSweepMs) {
+				lastSubagentSweep = now;
+				try {
+					const sa = await rollupSubagentCost(path);
+					subagentCostUsd = sa.totalUsd ?? 0;
+					subagentUnknownPricing = sa.totalUsd === null;
+					subagentTurns = sa.turns;
+				} catch {
+					/* leave last-known sub-agent figures */
+				}
+			}
 			let size: number;
 			try {
 				size = (await stat(path)).size;
@@ -213,12 +243,19 @@ export function createRunTail(sessionId: string, opts: RunTailOptions = {}): Run
 
 	function snapshot(): RunTailState {
 		const pending = pendingTools.size > 0;
+		// Grand total is null if EITHER part is unpriceable — an honest "—" beats
+		// a wrong number, and the dollar cap simply doesn't fire (max_turns still
+		// bounds the run, per ADR-004 D4).
+		const totalCost =
+			unknownPricing || subagentUnknownPricing ? null : costUsd + subagentCostUsd;
 		return {
 			found: path !== null,
 			turns: requestIds.size,
 			lastStopReason,
 			pendingToolUse: pending,
-			costUsd: unknownPricing ? null : costUsd,
+			costUsd: totalCost,
+			subagentCostUsd: subagentUnknownPricing ? null : subagentCostUsd,
+			subagentTurns,
 			sawError,
 			lastEventTs,
 			eventCount,

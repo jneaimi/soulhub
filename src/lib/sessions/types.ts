@@ -112,7 +112,11 @@ export interface ClaudeSessionRef {
 }
 
 export interface CostBreakdown {
+	/** Grand total: parent thread + any sub-agent (sidechain) spend (ADR-005 gap #1). */
 	totalUsd: number | null;
+	/** Sub-agent (fan-out) portion of `totalUsd`. `undefined` until rolled up;
+	 *  `0` for a non-fan-out run; `null` if a sub-agent's pricing was unknown. */
+	subagentUsd?: number | null;
 	byModel: Record<string, number | null>;
 	tokens: {
 		input: number;

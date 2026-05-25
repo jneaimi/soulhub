@@ -136,9 +136,15 @@ export function summarizeSession(s: ClaudeSession): SessionSummary {
 
 /**
  * Convenience: parse + summarize in one call. Used by the API list endpoint.
+ * Folds in sub-agent (fan-out) spend so the listed total is honest (ADR-005
+ * gap #1) — `summarizeSession` itself stays pure parent-only (no I/O), since
+ * the sub-agent detail route summarizes a leaf transcript that has none.
  */
 export async function summarizeFromPath(jsonlPath: string): Promise<SessionSummary> {
 	const { parseSession } = await import('./parser.js');
+	const { applySubagentRollup } = await import('./subagent-cost.js');
 	const session = await parseSession(jsonlPath);
-	return summarizeSession(session);
+	const summary = summarizeSession(session);
+	await applySubagentRollup(summary.cost, jsonlPath);
+	return summary;
 }

@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { encodeCwd, claudeProjectsRoot } from './paths.js';
 import { parseSession } from './parser.js';
 import { summarizeSession } from './summarize.js';
+import { applySubagentRollup } from './subagent-cost.js';
 import type { ClaudeEvent, SessionSummary } from './types.js';
 
 export interface AgentRunRecord {
@@ -114,6 +115,9 @@ export async function loadAgentRunRecord(
 		const session = await parseSession(path);
 		const { finalText, turns } = extractAssistant(session.events);
 		const summary = summarizeSession(session);
+		// ADR-005 gap #1 — fold sub-agent (fan-out) spend into the recorded total
+		// so `cost_usd` in agent_runs reflects the whole run, not just the parent.
+		await applySubagentRollup(summary.cost, path);
 		return {
 			sessionId: session.sessionId,
 			jsonlPath: path,
