@@ -265,18 +265,42 @@
 	// types it as string | undefined, so default to '' to keep it `string`.
 	const slug = $derived($page.params.slug ?? '');
 	const decisions = $derived(detail?.decisions ?? []);
-	/** projects-graph ADR-016 — per-project ADR view mode. Network is the
-	 *  default (vault-faithful Sugiyama DAG via dagre); `?view=gantt`
-	 *  falls back to the legacy time-axis chart. The parent-rollup
-	 *  table (one bar per project on a shared time axis) is unaffected —
-	 *  it always renders as Gantt. */
-	const view = $derived<'work' | 'network' | 'gantt'>(
-		$page.url.searchParams.get('view') === 'gantt'
-			? 'gantt'
-			: $page.url.searchParams.get('view') === 'work'
-				? 'work'
-				: 'network',
-	);
+	/** projects-graph ADR-016 + ADR-022 — per-project view resolution. Three
+	 *  tiers, highest priority first:
+	 *    1. explicit `?view=` URL param (bookmarkable / shareable)
+	 *    2. sticky operator preference from a prior manual tab click
+	 *    3. smart default — Workbench when the project has open work, else
+	 *       Network (ADR-016's built-out-project view). Avoids landing a
+	 *       finished project on an empty Workbench, and an active one on a
+	 *       structural DAG when the question is "what now".
+	 *  Timeline (Gantt) stays opt-in via `?view=gantt`. The parent-rollup
+	 *  table always renders as Gantt regardless. */
+	const DETAIL_VIEW_KEY = 'vault-project-detail-view-pref';
+	const view = $derived.by<'work' | 'network' | 'gantt'>(() => {
+		const param = $page.url.searchParams.get('view');
+		if (param === 'gantt' || param === 'work' || param === 'network') return param;
+		try {
+			if (typeof localStorage !== 'undefined') {
+				const pref = localStorage.getItem(DETAIL_VIEW_KEY);
+				if (pref === 'gantt' || pref === 'work' || pref === 'network') return pref;
+			}
+		} catch {
+			// localStorage disabled — fall through to the smart default.
+		}
+		return detail && detail.openCount > 0 ? 'work' : 'network';
+	});
+
+	// projects-graph ADR-022 — persist an explicit tab choice so it sticks
+	// across visits (mirrors the /projects list view's tree/graph pref). Set
+	// only on a manual click; the smart default never writes, so it keeps
+	// re-evaluating until the operator expresses a preference.
+	function persistView(v: 'work' | 'network' | 'gantt') {
+		try {
+			if (typeof localStorage !== 'undefined') localStorage.setItem(DETAIL_VIEW_KEY, v);
+		} catch {
+			// ignore — sticky pref is a nice-to-have
+		}
+	}
 	const proposed = $derived(decisions.filter((d) => d.status === 'proposed'));
 	const others = $derived(decisions.filter((d) => d.status !== 'proposed'));
 
@@ -1035,16 +1059,19 @@
 							<nav class="flex items-center gap-0.5 text-[11px] rounded-md border border-hub-border bg-hub-bg/40 p-0.5" aria-label="View mode">
 								<a
 									href="?view=work"
+									onclick={() => persistView('work')}
 									class="px-2 py-0.5 rounded transition-colors {view === 'work' ? 'bg-hub-card text-hub-text' : 'text-hub-dim hover:text-hub-text'}"
 									aria-current={view === 'work' ? 'page' : undefined}
 								>Work</a>
 								<a
 									href="?view=network"
+									onclick={() => persistView('network')}
 									class="px-2 py-0.5 rounded transition-colors {view === 'network' ? 'bg-hub-card text-hub-text' : 'text-hub-dim hover:text-hub-text'}"
 									aria-current={view === 'network' ? 'page' : undefined}
 								>Network</a>
 								<a
 									href="?view=gantt"
+									onclick={() => persistView('gantt')}
 									class="px-2 py-0.5 rounded transition-colors {view === 'gantt' ? 'bg-hub-card text-hub-text' : 'text-hub-dim hover:text-hub-text'}"
 									aria-current={view === 'gantt' ? 'page' : undefined}
 								>Timeline</a>

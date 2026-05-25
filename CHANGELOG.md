@@ -4,6 +4,41 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.1] — 2026-05-25
+
+### Changed
+- **Per-project pages open on the right view for their state.** Instead of
+  always defaulting to the Network (dependency) view, a project's detail page
+  now lands on the **Workbench** when it has open work, and on **Network** when
+  it's fully shipped — so active projects answer "what now" immediately and
+  finished ones don't open to an empty Workbench. An explicit `?view=` still
+  wins, and your last manual tab choice is remembered across visits.
+
+## [2.8.0] — 2026-05-25
+
+### Added
+- **Child-projects navigation on parent projects.** A project that has children
+  (a `parent`-shaped umbrella, or any project others point at via
+  `parent_project`) now shows a **Child projects** panel on its detail page —
+  clickable cards, one per direct child, each with its shape and a
+  `N open · M shipped` count. This completes the navigation triad: you could
+  already go **up** (breadcrumb) and **sideways** (sibling switcher); now you
+  can go **down** into children too.
+- **Status column in `soul adr list`.** The default listing now shows each
+  ADR's status (proposed / accepted / shipped / …) before its filename, so an
+  unfiltered list is legible without a second lookup; `--json` carries the
+  `status` field.
+
+### Fixed
+- **`soul adr list --status` now actually filters.** The flag was advertised in
+  `--help` but silently ignored — every status returned the full list. It is
+  now wired end-to-end (search, API, CLI) and supports a comma-separated union
+  (e.g. `--status proposed,accepted` for all open work).
+- **Umbrella projects no longer read as broken.** A `parent`-shaped project with
+  no ADRs of its own previously showed *"No ADRs yet — propose your first"* as
+  if it were abandoned. It now shows umbrella-appropriate copy and points at its
+  children, whose progress rolls up into its aggregate.
+
 ## [2.7.0] — 2026-05-25
 
 ### Added
