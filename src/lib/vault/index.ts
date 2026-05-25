@@ -1136,6 +1136,7 @@ export class VaultEngine {
 		});
 
 		const updateResult: WriteResult = { success: true, path };
+		if (note) updateResult.mtime = note.mtime;
 		if (linkResult.warnings.length > 0) updateResult.warnings = linkResult.warnings;
 		if (stubsCreated.length > 0) updateResult.stubs_created = stubsCreated;
 		return updateResult;

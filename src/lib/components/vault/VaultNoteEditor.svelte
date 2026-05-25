@@ -87,7 +87,11 @@
 
 			const data = await res.json();
 			if (data.success) {
-				savedMtime = Date.now();
+				// Re-sync to the server's actual post-write mtime (fractional-ms
+				// float). Date.now() was an integer guess that never matches the
+				// real file mtime → the next save would 409. Fall back only if the
+				// server didn't return one.
+				savedMtime = data.mtime ?? Date.now();
 				onSave(note.path);
 			} else {
 				saveError = data.error || 'Save failed';

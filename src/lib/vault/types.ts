@@ -362,6 +362,10 @@ export interface WriteResult {
 	 *  `meta.scaffold_stubs: true`. Each entry is a vault-relative path to a
 	 *  newly-created empty stub. Elided when none were created. */
 	stubs_created?: StubInfo[];
+	/** Post-write fractional-ms mtime of the note (fileStat.mtimeMs). Returned
+	 *  on update so optimistic-concurrency clients can re-sync their guard
+	 *  without a follow-up GET. Omitted when unavailable. */
+	mtime?: number;
 }
 
 /** ADR-049 — record of one stub note created by the scaffold_stubs flow. */

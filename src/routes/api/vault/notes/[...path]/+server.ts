@@ -87,7 +87,11 @@ export const PUT: RequestHandler = async ({ params, request }) => {
 	// Check for edit conflicts
 	const ifMtime = request.headers.get('x-note-mtime');
 	if (ifMtime) {
-		const clientMtime = parseInt(ifMtime, 10);
+		// parseFloat, NOT parseInt: mtime is fileStat.mtimeMs — a fractional-
+		// millisecond float (e.g. 1779711322350.0142). parseInt(…,10) truncates
+		// the fraction, so the value never equals current.mtime and EVERY
+		// conditional save 409s spuriously (hit the note editor + recipe skill).
+		const clientMtime = parseFloat(ifMtime);
 		const current = await engine.getNote(path);
 		if (current && !isNaN(clientMtime) && current.mtime !== clientMtime) {
 			return json({
