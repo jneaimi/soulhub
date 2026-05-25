@@ -127,11 +127,12 @@ export const claudePtyDispatcher: BackendDispatcher = {
 		// recipe steps can specialise convergence per invocation.
 		const goalCondition = (opts.goal_condition ?? agent.goal_condition)?.trim();
 		const goalActive = !!goalCondition;
-		// ADR-004 P1 — opt-in live transcript-driven termination + honest status.
-		// Off by default (env unset) → behaviour identical to the legacy path.
-		// Scoped to non-goal agents: goal-mode emits `end_turn` on every iteration,
-		// so it keeps the `Goal achieved` marker as its termination signal.
-		const liveTail = process.env.PTY_LIVE_TRANSCRIPT === '1' && !goalActive;
+		// ADR-004 — live transcript-driven termination + honest status + budget
+		// caps (D2/D3/D4). ON by default; set PTY_LIVE_TRANSCRIPT=0 to fall back
+		// to the legacy idle-stall path. Scoped to non-goal agents: goal-mode
+		// emits `end_turn` every iteration, so it keeps the `Goal achieved` marker
+		// as its termination signal (it still reports transcript cost/turns).
+		const liveTail = process.env.PTY_LIVE_TRANSCRIPT !== '0' && !goalActive;
 		const taskPayload = composePrompt(opts.task, opts.context);
 		const initialPrompt = goalActive ? `/goal ${goalCondition}` : taskPayload;
 
@@ -262,6 +263,7 @@ export const claudePtyDispatcher: BackendDispatcher = {
 			let stalled = false;
 			let timedOut = false;
 			let transcriptDone = false;
+			let budgetExceeded: 'max_turns' | 'max_usd' | null = null;
 
 			while (!exited) {
 				while (queue.length > 0) {
@@ -277,13 +279,29 @@ export const claudePtyDispatcher: BackendDispatcher = {
 					killSession(session.id);
 					break;
 				}
-				// ADR-004 D2 — the transcript says the last turn ended cleanly with
-				// no open tool call: the agent is genuinely done. Terminate now
-				// instead of waiting out the idle-stall window.
-				if (runTail?.snapshot().done) {
-					transcriptDone = true;
-					killSession(session.id);
-					break;
+				// ADR-004 D2/D4 — consult the live transcript: terminate the instant
+				// the last turn ended cleanly (D2), or enforce the turn / cost caps
+				// the PTY path never had (D4). A clean finish wins over a cap hit —
+				// an agent that lands its answer ON the last allowed turn succeeded.
+				if (runTail) {
+					const snap = runTail.snapshot();
+					if (snap.done) {
+						transcriptDone = true;
+						killSession(session.id);
+						break;
+					}
+					if (snap.turns >= budget.max_turns) {
+						budgetExceeded = 'max_turns';
+						killSession(session.id);
+						break;
+					}
+					// cost is null when any turn had unknown pricing — don't enforce
+					// a dollar cap we can't trust; max_turns still bounds the run.
+					if (snap.costUsd !== null && snap.costUsd >= budget.max_usd) {
+						budgetExceeded = 'max_usd';
+						killSession(session.id);
+						break;
+					}
 				}
 				if (promptInjected && idle >= stallMs) {
 					stalled = true;
@@ -311,24 +329,34 @@ export const claudePtyDispatcher: BackendDispatcher = {
 			// write, or `--session-id` unsupported on an older CLI).
 			let finalOutput = cleaned;
 			let transcriptTurns: number | undefined;
+			// ADR-004 D4 — cost is the API-equivalent priced from the transcript's
+			// per-turn usage (the same notional pricing the cli-flag / stream-json
+			// backends already report into agent_runs). Undefined when no transcript
+			// → finish() falls back to 0.
+			let transcriptCostUsd: number | undefined;
 			try {
 				const record = await loadAgentRunRecord(sessionUuid, {
 					cwd: config.resolved.vaultDir,
 					timeoutMs: 3000,
 				});
-				if (record?.finalAssistantText) {
-					finalOutput = record.finalAssistantText;
+				if (record) {
+					if (record.finalAssistantText) finalOutput = record.finalAssistantText;
 					transcriptTurns = record.assistantTurns;
+					transcriptCostUsd = record.summary.cost.totalUsd ?? undefined;
 				}
 			} catch {
 				/* keep the scrape */
 			}
 
+			// Shared terminal metrics for every return below (ADR-004 D4).
+			const termExtras = {
+				num_turns: transcriptTurns,
+				cost_usd: transcriptCostUsd,
+				claude_session_id: sessionUuid,
+			};
+
 			if (opts.signal?.aborted) {
-				return finish(runId, agent, started, 'cancelled', finalOutput, 'cancelled', {
-					num_turns: transcriptTurns,
-					claude_session_id: sessionUuid,
-				});
+				return finish(runId, agent, started, 'cancelled', finalOutput, 'cancelled', termExtras);
 			}
 			// ADR-031 v3 — convergence wins over timeout/stall. If the
 			// agent emitted `Goal achieved (...)` before the budget kill,
@@ -337,24 +365,27 @@ export const claudePtyDispatcher: BackendDispatcher = {
 			if (goalAchieved) {
 				const { num_turns } = parseGoalMetrics(goalMetricsRaw);
 				return finish(runId, agent, started, 'goal_achieved', finalOutput, undefined, {
+					...termExtras,
 					num_turns: num_turns || transcriptTurns,
-					claude_session_id: sessionUuid,
 				});
 			}
 			// ADR-004 D2 — transcript-confirmed completion is authoritative.
 			if (transcriptDone) {
-				return finish(runId, agent, started, 'success', finalOutput, undefined, {
-					num_turns: transcriptTurns,
-					claude_session_id: sessionUuid,
-				});
+				return finish(runId, agent, started, 'success', finalOutput, undefined, termExtras);
+			}
+			// ADR-004 D4 — a turn/cost cap tripped mid-run (live-tail only).
+			if (budgetExceeded) {
+				const msg =
+					budgetExceeded === 'max_turns'
+						? `Budget exceeded: ${transcriptTurns ?? '?'} turns ≥ max_turns ${budget.max_turns}`
+						: `Budget exceeded: $${(transcriptCostUsd ?? 0).toFixed(4)} ≥ max_usd $${budget.max_usd}`;
+				yield { type: 'error', message: msg, ts: Date.now() };
+				return finish(runId, agent, started, 'budget-exceeded', finalOutput, msg, termExtras);
 			}
 			if (timedOut) {
 				const msg = `Dispatch exceeded ${budget.timeout_ms}ms timeout`;
 				yield { type: 'error', message: msg, ts: Date.now() };
-				return finish(runId, agent, started, 'timeout', finalOutput, msg, {
-					num_turns: transcriptTurns,
-					claude_session_id: sessionUuid,
-				});
+				return finish(runId, agent, started, 'timeout', finalOutput, msg, termExtras);
 			}
 			if (stalled) {
 				// ADR-004 D3 — under live-tail a stall that the transcript can't
@@ -367,33 +398,21 @@ export const claudePtyDispatcher: BackendDispatcher = {
 					if (!runTail.snapshot().done) {
 						const msg = 'Stalled without a completing end_turn in the transcript';
 						yield { type: 'error', message: msg, ts: Date.now() };
-						return finish(runId, agent, started, 'error', finalOutput, msg, {
-							num_turns: transcriptTurns,
-							claude_session_id: sessionUuid,
-						});
+						return finish(runId, agent, started, 'error', finalOutput, msg, termExtras);
 					}
 				}
 				// Legacy path (flag off) or live-tail confirmed completion: a stall
 				// is expected when the model is done and waiting for input.
-				return finish(runId, agent, started, 'success', finalOutput, undefined, {
-					num_turns: transcriptTurns,
-					claude_session_id: sessionUuid,
-				});
+				return finish(runId, agent, started, 'success', finalOutput, undefined, termExtras);
 			}
 			// 129 = SIGHUP on macOS, treated as success per orchestration engine.
 			const ok = exitCode === 0 || exitCode === 129;
 			if (!ok) {
 				const msg = `PTY exited ${exitCode}`;
 				yield { type: 'error', message: msg, ts: Date.now() };
-				return finish(runId, agent, started, 'error', finalOutput, msg, {
-					num_turns: transcriptTurns,
-					claude_session_id: sessionUuid,
-				});
+				return finish(runId, agent, started, 'error', finalOutput, msg, termExtras);
 			}
-			return finish(runId, agent, started, 'success', finalOutput, undefined, {
-				num_turns: transcriptTurns,
-				claude_session_id: sessionUuid,
-			});
+			return finish(runId, agent, started, 'success', finalOutput, undefined, termExtras);
 		} finally {
 			runTail?.stop();
 			session.emitter.off('output', onOutput);
@@ -434,7 +453,7 @@ function finish(
 	status: DispatchResult['status'],
 	output: string,
 	error?: string,
-	extras?: { num_turns?: number; claude_session_id?: string },
+	extras?: { num_turns?: number; cost_usd?: number; claude_session_id?: string },
 ): DispatchResult {
 	return {
 		runId,
@@ -442,7 +461,10 @@ function finish(
 		backend: agent.backend,
 		status,
 		output,
-		cost_usd: 0, // PTY runs use Max subscription — no per-call cost
+		// ADR-004 D4 — API-equivalent cost priced from the transcript (matches the
+		// cli-flag / stream-json backends). 0 when no transcript materialised;
+		// PTY runs bill nothing on the Max subscription either way.
+		cost_usd: extras?.cost_usd ?? 0,
 		num_turns: extras?.num_turns ?? 0,
 		duration_ms: Date.now() - started,
 		error,

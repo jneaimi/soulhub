@@ -1,8 +1,10 @@
 /**
  * Model pricing — USD per 1,000,000 tokens.
  *
- * TODO: source real values from https://www.anthropic.com/pricing
- * Last updated: 2026-04-27 (PLACEHOLDER VALUES — do not trust dollars yet)
+ * Verified against https://www.anthropic.com/pricing (2026-05-25): input/output
+ * + cache multipliers (read 0.1×in, write-5m 1.25×in, write-1h 2×in) match the
+ * published Claude 4.x rates. ADR-004 D4 relies on these for the PTY backend's
+ * API-equivalent cost. Re-verify when a new model lands.
  *
  * When a model is missing from this map, cost calculations return null and the
  * UI displays `—` rather than $0.00.
@@ -17,7 +19,6 @@ export interface ModelPricing {
 }
 
 export const MODEL_PRICING: Record<string, ModelPricing> = {
-	// PLACEHOLDER — replace with current values from anthropic.com/pricing
 	'claude-opus-4-7':   { input: 15, cacheCreate5m: 18.75, cacheCreate1h: 30, cacheRead: 1.5, output: 75 },
 	'claude-opus-4-6':   { input: 15, cacheCreate5m: 18.75, cacheCreate1h: 30, cacheRead: 1.5, output: 75 },
 	'claude-sonnet-4-6': { input: 3,  cacheCreate5m: 3.75,  cacheCreate1h: 6,  cacheRead: 0.3, output: 15 },

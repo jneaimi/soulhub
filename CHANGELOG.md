@@ -4,6 +4,24 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.0] — 2026-05-25
+
+### Added
+- **Agent budget caps + real cost on the PTY backend.** Live transcript dispatch
+  now enforces an agent's turn and dollar budgets mid-run — a run that exceeds
+  `max_turns` (or its priced `max_usd`, when pricing is known) is stopped and
+  recorded as `budget-exceeded` instead of running to the wall-clock. Each run
+  now also reports its API-equivalent cost (priced from the session transcript)
+  rather than a flat `$0`, so agent-run dashboards reflect real token spend
+  across every backend. (ADR-004 D4.)
+
+### Changed
+- **Live transcript dispatch is now on by default.** The transcript-driven
+  termination + honest-status behaviour added in v2.9.0 (faster finishes, hangs
+  no longer mislabelled as success) is enabled for all non-goal agents out of
+  the box. Set `PTY_LIVE_TRANSCRIPT=0` to fall back to the legacy idle-stall
+  path.
+
 ## [2.9.0] — 2026-05-25
 
 ### Added
