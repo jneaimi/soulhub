@@ -36,6 +36,23 @@ const __dirname = dirname(__filename);
 // Soul-hub repo root: catalog/components/agent-dispatch/ → ../../..
 const SOUL_HUB_ROOT = resolvePath(__dirname, '..', '..', '..');
 
+// ── stdout-contract guard ────────────────────────────────────────────────────
+// This component's ENTIRE stdout is parsed by the Naseej runner as a single
+// JSON document (runner.ts `parseOutputs` → `JSON.parse(stdout)`). But we
+// dynamically import the soul-hub $lib/agents module graph, which logs
+// operationally to stdout during a dispatch — the PTY spawn line in
+// pty/manager.ts (`[pty:…] spawned claude …`), config reloads, vault-session
+// capture, and any future console.log in that large graph. A single stray
+// stdout line corrupts the JSON document → parseOutputs returns undefined →
+// the runner drops this step's outputs. That is exactly how the peer-brief
+// synth step's `artifact_path` vanished, sending an empty path to the scan
+// step (2026-05-25 debug). Fixing each logger is whack-a-mole; instead reserve
+// stdout exclusively for emit() and reroute every other stdout write to
+// stderr, where operational logs belong. Installed before any dynamic import
+// so module-load side effects are covered too.
+const __realStdoutWrite = process.stdout.write.bind(process.stdout);
+process.stdout.write = (...args) => process.stderr.write(...args);
+
 // ADR-005 D6 — agent context cap. Bigger blobs stall the PTY paste buffer.
 const MAX_CONTEXT_CHARS = 4000;
 
@@ -52,7 +69,10 @@ const EXIT = {
 };
 
 function emit(obj) {
-	process.stdout.write(JSON.stringify(obj, null, 2) + '\n');
+	// Use the captured real stdout writer — the module-level guard above
+	// reroutes the public process.stdout.write to stderr. This is the only
+	// path that may write to the runner's stdout JSON channel.
+	__realStdoutWrite(JSON.stringify(obj, null, 2) + '\n');
 }
 
 function fail(code, message, extra = {}) {

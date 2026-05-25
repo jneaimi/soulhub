@@ -246,7 +246,23 @@ function interpolate(value: unknown, ctx: Record<string, unknown>): unknown {
 		const wholeMatch = value.match(/^\{\{\s*([^}]+?)\s*\}\}$/);
 		if (wholeMatch) {
 			const v = evaluateExpr(wholeMatch[1], ctx);
-			return v === undefined ? '' : v;
+			// Fail loud on an unresolved whole-string reference. `"{{x}}"` means
+			// "this value IS x"; if x resolves to undefined (a missing input or a
+			// dropped upstream step output) silently substituting "" sends an
+			// empty string downstream — e.g. an empty recipe path to the
+			// peer-brief scanner, which then reads cwd and crashes with a cryptic
+			// IsADirectoryError (2026-05-25 debug). Throwing here mirrors the
+			// existing unknown-filter hard-fail in applyFilter; the runner surfaces
+			// it as a clean step failure naming the unresolved reference. A
+			// present-but-empty value (literal "") is distinct from undefined and
+			// passes through unchanged.
+			if (v === undefined) {
+				throw new Error(
+					`unresolved template reference: "{{ ${wholeMatch[1].trim()} }}" resolved to undefined ` +
+					'(missing input or upstream step output not emitted)',
+				);
+			}
+			return v;
 		}
 		return value.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_full, expr) => {
 			const v = evaluateExpr(String(expr), ctx);
