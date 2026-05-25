@@ -67,8 +67,11 @@ import {
 	deleteBudgetApproval,
 	resumeWithRaisedBudget,
 	stopBudgetApproval,
+	getVelocityApproval,
+	deleteVelocityApproval,
 	BUDGET_BUMPS,
 } from '../../agents/budget-escalation.js';
+import { applyLiveGrant } from '../../agents/budget-grants.js';
 import {
 	formatKeeperTask,
 	parseKeeperResult,
@@ -135,6 +138,11 @@ type InboxVerb =
 // run that hit its ceiling; the operator grants more (resume via claude --resume)
 // or stops (keep partial). Resolved INLINE.
 type BudgetVerb = 'bgt-u2' | 'bgt-u5' | 'bgt-t10' | 'bgt-stop';
+
+// ADR-006 Phase 3 — velocity-warning verbs (bgv- prefix). The run is STILL
+// running; a tap writes a live grant the dispatch loop adopts in-flight (no
+// pause/resume). Distinct from bgt- (which resumes an already-paused run).
+type BudgetVelocityVerb = 'bgv-u2' | 'bgv-u5' | 'bgv-t10';
 
 // ADR-043 — vault-hygiene verbs (vh- prefix, distinct from project-hygiene hyg-)
 type VaultHygieneVerb =
@@ -260,6 +268,7 @@ type HygieneParse = { kind: 'hygiene'; verb: HygieneVerb; id: string };
 type VaultHygieneParse = { kind: 'vault-hygiene'; verb: VaultHygieneVerb; id: string };
 type InboxParse = { kind: 'inbox'; verb: InboxVerb; id: string };
 type BudgetParse = { kind: 'budget'; verb: BudgetVerb; id: string };
+type BudgetVelocityParse = { kind: 'budget-velocity'; verb: BudgetVelocityVerb; id: string };
 type ParsedCallback =
 	| ProposalParse
 	| YoutubeParse
@@ -267,7 +276,8 @@ type ParsedCallback =
 	| HygieneParse
 	| VaultHygieneParse
 	| InboxParse
-	| BudgetParse;
+	| BudgetParse
+	| BudgetVelocityParse;
 
 function parseCallbackData(data: string): ParsedCallback | null {
 	const i = data.indexOf(':');
@@ -337,6 +347,9 @@ function parseCallbackData(data: string): ParsedCallback | null {
 	if (verb === 'bgt-u2' || verb === 'bgt-u5' || verb === 'bgt-t10' || verb === 'bgt-stop') {
 		return { kind: 'budget', verb, id };
 	}
+	if (verb === 'bgv-u2' || verb === 'bgv-u5' || verb === 'bgv-t10') {
+		return { kind: 'budget-velocity', verb, id };
+	}
 	return null;
 }
 
@@ -391,6 +404,10 @@ export async function handleCallbackQuery(
 	}
 	if (parsed.kind === 'budget') {
 		await handleBudgetCallback(query, parsed);
+		return;
+	}
+	if (parsed.kind === 'budget-velocity') {
+		await handleVelocityCallback(query, parsed);
 		return;
 	}
 	await handleYoutubeCallback(query, parsed, config);
@@ -504,6 +521,50 @@ async function handleBudgetCallback(query: TgCallbackQuery, parsed: BudgetParse)
 		chat_id: row.chatJid,
 		message_id: row.messageId,
 		text: `▶️ Resuming \`${row.agentId}\` — ${grant}.\n_(button tapped)_`,
+		parse_mode: 'Markdown',
+	}).catch(() => {});
+}
+
+/** Velocity-warning branch (ADR-006 Phase 3). The run is STILL running and ~1
+ *  turn from its ceiling. A bump writes a live grant that the dispatch loop
+ *  adopts in-flight — the ceiling rises and the run continues with NO
+ *  pause/resume cycle. If the run already finished or paused, the live grant is
+ *  harmless (cleared by the loop's finally / never consumed). Resolved INLINE. */
+const VELOCITY_BUMPS: Record<BudgetVelocityVerb, { addUsd?: number; addTurns?: number }> = {
+	'bgv-u2': { addUsd: 2 },
+	'bgv-u5': { addUsd: 5 },
+	'bgv-t10': { addTurns: 10 },
+};
+
+async function handleVelocityCallback(
+	query: TgCallbackQuery,
+	parsed: BudgetVelocityParse,
+): Promise<void> {
+	const row = getVelocityApproval(parsed.id);
+	if (!row) {
+		await answerCallbackQuery({
+			callback_query_id: query.id,
+			text: 'Warning expired — the run already finished or paused.',
+			show_alert: false,
+		});
+		return;
+	}
+
+	const bump = VELOCITY_BUMPS[parsed.verb];
+	const raised = applyLiveGrant(row.sessionUuid, bump, {
+		ceilingUsd: row.ceilingUsd,
+		ceilingTurns: row.ceilingTurns,
+	});
+	deleteVelocityApproval(parsed.id);
+	const grant =
+		parsed.verb === 'bgv-t10'
+			? `+10 turns (ceiling ${raised.ceilingTurns})`
+			: `+$${raised.ceilingUsd - row.ceilingUsd} (ceiling $${raised.ceilingUsd})`;
+	await answerCallbackQuery({ callback_query_id: query.id, text: `⚡ Raised — ${grant}` });
+	await editMessageText({
+		chat_id: row.chatJid,
+		message_id: row.messageId,
+		text: `⚡ Raised \`${row.agentId}\` ceiling in-flight — ${grant}. Running on, no restart.\n_(button tapped)_`,
 		parse_mode: 'Markdown',
 	}).catch(() => {});
 }

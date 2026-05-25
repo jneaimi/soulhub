@@ -37,6 +37,7 @@ import { resolveBudget } from './budget.js';
 import { claudeCliFlagDispatcher } from './claude-cli-flag.js';
 import { loadAgentRunRecord } from '$lib/sessions/run-record.js';
 import { createRunTail, type RunTail } from '$lib/sessions/run-tail.js';
+import { getLiveGrant, clearLiveGrant } from '../budget-grants.js';
 
 /** Default silence-after-activity threshold before treating the session as
  *  done. 30s is fine for chat-shaped agents that emit progress text every
@@ -287,6 +288,13 @@ export const claudePtyDispatcher: BackendDispatcher = {
 			// hard ceiling (the "auto-approve band": a near-done run isn't discarded
 			// one turn short of its answer).
 			let softCapLatched = false;
+			// ADR-006 Phase 3 — the hard ceilings are MUTABLE: a live grant (operator
+			// pre-approval from a velocity warning) raises them in-flight so the run
+			// continues uninterrupted. `velocityWarned` latches the early warning,
+			// re-armed after a raise so a second approach can warn again.
+			let ceilingUsd = budget.ceiling_usd;
+			let ceilingTurns = budget.ceiling_turns;
+			let velocityWarned = false;
 
 			while (!exited) {
 				if (liveTail && runTail) {
@@ -325,35 +333,79 @@ export const claudePtyDispatcher: BackendDispatcher = {
 						killSession(session.id);
 						break;
 					}
+					// ADR-006 Phase 3 — adopt any operator live grant (pre-approval from
+					// a velocity warning) BEFORE the ceiling checks, so the run never
+					// trips a ceiling the operator already raised. Re-arm the warning so
+					// a later approach to the NEW ceiling can warn again.
+					const grant = getLiveGrant(sessionUuid);
+					if (grant) {
+						if (grant.ceilingUsd > ceilingUsd) ceilingUsd = grant.ceilingUsd;
+						if (grant.ceilingTurns > ceilingTurns) ceilingTurns = grant.ceilingTurns;
+						clearLiveGrant(sessionUuid);
+						velocityWarned = false;
+						console.log(
+							`[agents/claude-pty] ${agent.id} adopted live budget grant — ceiling now $${ceilingUsd}/${ceilingTurns}t`,
+						);
+					}
+
 					// ADR-006 tier 2 — HARD ceiling terminates the run (runaway /
 					// recursion backstop). This is the only budget kill now; the soft
 					// caps below just log + auto-extend.
-					if (snap.turns >= budget.ceiling_turns) {
+					if (snap.turns >= ceilingTurns) {
 						budgetExceeded = 'max_turns';
 						killSession(session.id);
 						break;
 					}
 					// cost is null when any turn had unknown pricing — don't enforce
 					// a dollar ceiling we can't trust; ceiling_turns still bounds the run.
-					if (snap.costUsd !== null && snap.costUsd >= budget.ceiling_usd) {
+					if (snap.costUsd !== null && snap.costUsd >= ceilingUsd) {
 						budgetExceeded = 'max_usd';
 						killSession(session.id);
 						break;
 					}
 					// ADR-006 tier 1 — soft cap crossing: log once, then auto-extend to
-					// the ceiling. No kill. (Telegram-gated ceiling raises land in
-					// Phase 2; for now the band is silently auto-approved.)
+					// the ceiling. No kill.
 					if (!softCapLatched) {
 						const overTurns = snap.turns >= budget.max_turns;
 						const overCost = snap.costUsd !== null && snap.costUsd >= budget.max_usd;
 						if (overTurns || overCost) {
 							softCapLatched = true;
 							const detail = overCost
-								? `$${snap.costUsd!.toFixed(4)} ≥ soft $${budget.max_usd} (ceiling $${budget.ceiling_usd})`
-								: `${snap.turns} turns ≥ soft ${budget.max_turns} (ceiling ${budget.ceiling_turns})`;
+								? `$${snap.costUsd!.toFixed(4)} ≥ soft $${budget.max_usd} (ceiling $${ceilingUsd})`
+								: `${snap.turns} turns ≥ soft ${budget.max_turns} (ceiling ${ceilingTurns})`;
 							console.log(
 								`[agents/claude-pty] ${agent.id} crossed soft budget cap — auto-extending to ceiling: ${detail}`,
 							);
+						}
+					}
+					// ADR-006 Phase 3 — velocity warning. Project one turn ahead from the
+					// observed cost-per-turn: if the NEXT turn likely crosses the ceiling
+					// (cost) or it's the last turn before the turn ceiling, fire ONE early
+					// warning so the operator can raise the ceiling in-flight (no
+					// pause/resume cycle). Pausable runs only; needs ≥2 turns for a stable
+					// rate. index.ts turns the event into a Telegram message.
+					if (pausable && !velocityWarned && snap.turns >= 2) {
+						const costPerTurn =
+							snap.costUsd !== null && snap.turns > 0 ? snap.costUsd / snap.turns : 0;
+						const willHitCost =
+							snap.costUsd !== null &&
+							costPerTurn > 0 &&
+							snap.costUsd < ceilingUsd &&
+							snap.costUsd + costPerTurn >= ceilingUsd;
+						const willHitTurns = snap.turns < ceilingTurns && snap.turns + 1 >= ceilingTurns;
+						if (willHitCost || willHitTurns) {
+							velocityWarned = true;
+							yield {
+								type: 'budget_warning',
+								runId,
+								sessionUuid,
+								ceilingUsd,
+								ceilingTurns,
+								spentUsd: snap.costUsd ?? 0,
+								turns: snap.turns,
+								reason: willHitCost ? 'max_usd' : 'max_turns',
+								ts: Date.now(),
+							};
 						}
 					}
 				}
@@ -443,17 +495,19 @@ export const claudePtyDispatcher: BackendDispatcher = {
 			if (budgetExceeded) {
 				const msg =
 					budgetExceeded === 'max_turns'
-						? `Budget ceiling reached: ${transcriptTurns ?? '?'} turns ≥ ceiling ${budget.ceiling_turns} (soft ${budget.max_turns})`
-						: `Budget ceiling reached: $${(transcriptCostUsd ?? 0).toFixed(4)} ≥ ceiling $${budget.ceiling_usd} (soft $${budget.max_usd})`;
+						? `Budget ceiling reached: ${transcriptTurns ?? '?'} turns ≥ ceiling ${ceilingTurns} (soft ${budget.max_turns})`
+						: `Budget ceiling reached: $${(transcriptCostUsd ?? 0).toFixed(4)} ≥ ceiling $${ceilingUsd} (soft $${budget.max_usd})`;
 				if (pausable) {
 					// ADR-006 Phase 2 — the session lives on disk; index.ts escalates
-					// to Telegram and the resume path picks up via `--resume`.
+					// to Telegram and the resume path picks up via `--resume`. Report the
+					// effective (possibly live-grant-raised) ceilings so a bump from here
+					// raises from the right base.
 					return finish(runId, agent, started, 'awaiting-budget-approval', finalOutput, msg, {
 						...termExtras,
 						budget_pause: {
 							reason: budgetExceeded,
-							ceiling_usd: budget.ceiling_usd,
-							ceiling_turns: budget.ceiling_turns,
+							ceiling_usd: ceilingUsd,
+							ceiling_turns: ceilingTurns,
 						},
 					});
 				}
@@ -493,6 +547,9 @@ export const claudePtyDispatcher: BackendDispatcher = {
 			return finish(runId, agent, started, 'success', finalOutput, undefined, termExtras);
 		} finally {
 			runTail?.stop();
+			// ADR-006 Phase 3 — never leak a live grant past the run that owns it
+			// (resume reuses the same session UUID, so a stale grant would mis-raise).
+			clearLiveGrant(sessionUuid);
 			session.emitter.off('output', onOutput);
 			session.emitter.off('exit', onExit);
 			session.emitter.off('prompt_sent', onPromptSent);

@@ -73,6 +73,21 @@ export type DispatchEvent =
 	| { type: 'tool_call'; name: string; ts: number }
 	| { type: 'step'; n: number; finishReason?: string; ts: number }
 	| { type: 'error'; message: string; ts: number }
+	/** ADR-006 Phase 3 — velocity projection sees the run ~1 turn from its hard
+	 *  ceiling. `dispatch/index.ts` turns this into an early Telegram warning so
+	 *  the operator can raise the ceiling in-flight (avoiding the pause/resume
+	 *  cycle). Carries everything the escalation + live-grant base needs. */
+	| {
+			type: 'budget_warning';
+			runId: string;
+			sessionUuid: string;
+			ceilingUsd: number;
+			ceilingTurns: number;
+			spentUsd: number;
+			turns: number;
+			reason: 'max_usd' | 'max_turns';
+			ts: number;
+	  }
 	| { type: 'done'; result: DispatchResult; ts: number };
 
 export interface DispatchResult {

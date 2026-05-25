@@ -66,6 +66,32 @@ export interface BudgetApprovalRow {
 
 const pendingApprovals = makePendingStore<BudgetApprovalRow>('budget-approval', APPROVAL_TTL_MS);
 
+/** ADR-006 Phase 3 — velocity-warning pending rows. Short TTL: a warning only
+ *  matters while the dispatch is still running (minutes); a stale tap finds no
+ *  live run to raise. */
+const VELOCITY_TTL_MS = 30 * 60 * 1000;
+
+export interface BudgetVelocityRow {
+	runId: string;
+	agentId: string;
+	sessionUuid: string;
+	/** Hard ceilings in force when the warning fired — the live-grant base. */
+	ceilingUsd: number;
+	ceilingTurns: number;
+	chatJid: string;
+	messageId: number;
+	createdAt: number;
+}
+
+const pendingVelocity = makePendingStore<BudgetVelocityRow>('budget-velocity', VELOCITY_TTL_MS);
+
+export function getVelocityApproval(id: string): BudgetVelocityRow | undefined {
+	return pendingVelocity.get(id);
+}
+export function deleteVelocityApproval(id: string): void {
+	pendingVelocity.delete(id);
+}
+
 /** Stable short_id for a paused run — keeps callback_data inside Telegram's
  *  64-byte cap (`bgt-u2:` + 16 chars). Same run → same id across restarts. */
 export function budgetApprovalIdFor(runId: string, sessionUuid: string): string {
@@ -204,6 +230,77 @@ export function resumeWithRaisedBudget(
 	})();
 
 	return { ceilingUsd, ceilingTurns };
+}
+
+// ─── Phase 3 — velocity warning (in-flight, pre-emptive) ───────────────────
+
+function buildVelocityKeyboard(id: string): InlineKeyboardMarkup {
+	const rows: InlineKeyboardMarkup['inline_keyboard'] = [
+		[
+			{ text: '➕ $2', callback_data: `bgv-u2:${id}` },
+			{ text: '➕ $5', callback_data: `bgv-u5:${id}` },
+			{ text: '➕ 10 turns', callback_data: `bgv-t10:${id}` },
+		],
+	];
+	const url = dashboardOrchestrationUrl();
+	if (url) rows.push([{ text: '⚙️ More options', url }]);
+	return { inline_keyboard: rows };
+}
+
+export interface VelocityWarningInput {
+	runId: string;
+	agentId: string;
+	sessionUuid: string;
+	ceilingUsd: number;
+	ceilingTurns: number;
+	reason: 'max_usd' | 'max_turns';
+	spentUsd: number;
+	turns: number;
+}
+
+function formatVelocityMessage(input: VelocityWarningInput): string {
+	const at =
+		input.reason === 'max_usd'
+			? `*$${input.spentUsd.toFixed(2)}* of its $${input.ceilingUsd} ceiling`
+			: `*${input.turns}* of its ${input.ceilingTurns}-turn ceiling`;
+	return [
+		`⚡ *${input.agentId}* is burning fast — at ${at}, ~1 turn from the wall.`,
+		'',
+		`Pre-approve now to raise the ceiling *in-flight* — the run keeps going with no restart. Ignore it and it'll pause at the ceiling instead (you can grant or stop then).`,
+		'',
+		`_run \`${input.runId}\` · ${input.turns} turns · $${input.spentUsd.toFixed(2)}_`,
+	].join('\n');
+}
+
+/** Send the early velocity warning + persist its pending row so a bump tap can
+ *  resolve back to the live session. Best-effort; never throws into dispatch. */
+export async function escalateVelocityWarning(
+	input: VelocityWarningInput,
+): Promise<{ ok: boolean; error?: string }> {
+	const chatId = resolveTelegramChatId();
+	if (!chatId) return { ok: false, error: 'no-telegram-chat-id' };
+	const delivery = soulHubConfig.channels?.telegram?.delivery;
+	if (!delivery) return { ok: false, error: 'no-telegram-delivery-config' };
+
+	const id = budgetApprovalIdFor(input.runId, input.sessionUuid);
+	const result = await sendText(chatId, formatVelocityMessage(input), delivery, {
+		replyMarkup: buildVelocityKeyboard(id),
+	});
+	if (!result.ok || result.messageIds.length === 0) {
+		return { ok: false, error: result.error ?? 'send-failed' };
+	}
+
+	pendingVelocity.set(id, {
+		runId: input.runId,
+		agentId: input.agentId,
+		sessionUuid: input.sessionUuid,
+		ceilingUsd: input.ceilingUsd,
+		ceilingTurns: input.ceilingTurns,
+		chatJid: String(chatId),
+		messageId: result.messageIds[0],
+		createdAt: Date.now(),
+	});
+	return { ok: true };
 }
 
 /** Operator chose Stop — flip the paused run to a terminal `budget-exceeded`

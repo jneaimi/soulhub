@@ -23,7 +23,7 @@ import { claudeCliFlagDispatcher } from './claude-cli-flag.js';
 import { claudeStreamJsonDispatcher } from './claude-stream-json.js';
 import { aiSdkDispatcher } from './ai-sdk.js';
 import { recordAgentRun, startAgentRun, finishAgentRun } from '../runs.js';
-import { escalateBudgetApproval } from '../budget-escalation.js';
+import { escalateBudgetApproval, escalateVelocityWarning } from '../budget-escalation.js';
 
 const dispatchers: Record<AgentSummary['backend'], BackendDispatcher> = {
 	'claude-pty': claudePtyDispatcher,
@@ -160,6 +160,23 @@ export async function* dispatchAgent(
 			} catch (err) {
 				console.error('[agents/runs] failed to write start row:', (err as Error).message);
 			}
+		}
+		// ADR-006 Phase 3 — velocity warning fires mid-run: escalate to Telegram so
+		// the operator can raise the ceiling in-flight (a tap writes a live grant
+		// the dispatch loop adopts). Detached — never block the event stream.
+		if (ev.type === 'budget_warning') {
+			void escalateVelocityWarning({
+				runId: ev.runId,
+				agentId: agent.id,
+				sessionUuid: ev.sessionUuid,
+				ceilingUsd: ev.ceilingUsd,
+				ceilingTurns: ev.ceilingTurns,
+				reason: ev.reason,
+				spentUsd: ev.spentUsd,
+				turns: ev.turns,
+			}).catch((err) =>
+				console.error('[agents/budget] velocity warning failed:', (err as Error).message),
+			);
 		}
 		yield ev;
 	}
