@@ -50,7 +50,21 @@ export interface DispatchOptions {
 		max_usd?: number;
 		max_turns?: number;
 		timeout_sec?: number;
+		/** ADR-006 — raise the hard ceilings (default 2× soft). Used by the
+		 *  resume path when the operator grants more budget via Telegram. */
+		ceiling_usd?: number;
+		ceiling_turns?: number;
 	};
+	/** ADR-006 Phase 2 — when true, hitting the HARD ceiling pauses the run
+	 *  (clean-kill → `awaiting-budget-approval`) instead of terminating it, so
+	 *  the operator can grant more budget via Telegram and the run resumes via
+	 *  `claude --resume`. Background dispatches (no chat `jid`) default to true;
+	 *  chat dispatches keep the hard kill (the human is already present). */
+	pausable_on_ceiling?: boolean;
+	/** ADR-006 Phase 2 — resume an existing Claude session (raised ceiling)
+	 *  rather than starting fresh. Set by the resume path; the backend passes
+	 *  `--resume <id>` and omits `--session-id`. */
+	resume_session_id?: string;
 }
 
 export type DispatchEvent =
@@ -65,12 +79,30 @@ export interface DispatchResult {
 	runId: string;
 	agentId: string;
 	backend: string;
-	status: 'success' | 'error' | 'cancelled' | 'timeout' | 'budget-exceeded' | 'goal_achieved';
+	status:
+		| 'success'
+		| 'error'
+		| 'cancelled'
+		| 'timeout'
+		| 'budget-exceeded'
+		| 'goal_achieved'
+		/** ADR-006 Phase 2 — hit the hard ceiling but was pausable: the session
+		 *  is preserved, awaiting an operator budget grant to resume. */
+		| 'awaiting-budget-approval';
 	output: string;
 	cost_usd: number;
 	num_turns: number;
 	duration_ms: number;
 	error?: string;
+	/** ADR-006 Phase 2 — present iff `status === 'awaiting-budget-approval'`.
+	 *  The context the escalation + resume path needs. */
+	budget_pause?: {
+		/** Which ceiling tripped. */
+		reason: 'max_usd' | 'max_turns';
+		/** Ceilings that were in force (so the bump raises from the right base). */
+		ceiling_usd: number;
+		ceiling_turns: number;
+	};
 	/** ADR-002 Layer 1 — Claude Code session UUID for this run, when the backend
 	 *  set a deterministic `--session-id` (PTY) or reported one (cli-flag). Lets
 	 *  consumers re-locate the JSONL transcript for replay/audit. */

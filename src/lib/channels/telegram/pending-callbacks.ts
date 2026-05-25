@@ -23,7 +23,8 @@ export type PendingKind =
 	| 'intent-proposal'
 	| 'project-hygiene'
 	| 'vault-hygiene'
-	| 'fix-batch';
+	| 'fix-batch'
+	| 'budget-approval';
 
 /** Upsert a pending-callback row. `payload` is serialised to JSON; pass the row
  *  WITHOUT its `createdAt` field — the timestamps are columns. Re-registering an

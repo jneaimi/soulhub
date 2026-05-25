@@ -63,6 +63,13 @@ import { findContactByEmail } from '../../crm/index.js';
 import { getVaultEngine } from '../../vault/index.js';
 import { dispatchAgent } from '../../agents/dispatch/index.js';
 import {
+	getBudgetApproval,
+	deleteBudgetApproval,
+	resumeWithRaisedBudget,
+	stopBudgetApproval,
+	BUDGET_BUMPS,
+} from '../../agents/budget-escalation.js';
+import {
 	formatKeeperTask,
 	parseKeeperResult,
 	formatTelegramResult,
@@ -123,6 +130,11 @@ type InboxVerb =
 	| 'ibx-mute-y' // confirmed mute of a CRM contact
 	| 'ibx-mute-n' // cancelled
 	| 'ibx-reply'; // direct: background scribe dispatch
+
+// ADR-006 Phase 2 — budget-approval verbs (bgt- prefix). A paused background
+// run that hit its ceiling; the operator grants more (resume via claude --resume)
+// or stops (keep partial). Resolved INLINE.
+type BudgetVerb = 'bgt-u2' | 'bgt-u5' | 'bgt-t10' | 'bgt-stop';
 
 // ADR-043 — vault-hygiene verbs (vh- prefix, distinct from project-hygiene hyg-)
 type VaultHygieneVerb =
@@ -247,13 +259,15 @@ type IntentParse = { kind: 'intent'; verb: IntentVerb; id: string };
 type HygieneParse = { kind: 'hygiene'; verb: HygieneVerb; id: string };
 type VaultHygieneParse = { kind: 'vault-hygiene'; verb: VaultHygieneVerb; id: string };
 type InboxParse = { kind: 'inbox'; verb: InboxVerb; id: string };
+type BudgetParse = { kind: 'budget'; verb: BudgetVerb; id: string };
 type ParsedCallback =
 	| ProposalParse
 	| YoutubeParse
 	| IntentParse
 	| HygieneParse
 	| VaultHygieneParse
-	| InboxParse;
+	| InboxParse
+	| BudgetParse;
 
 function parseCallbackData(data: string): ParsedCallback | null {
 	const i = data.indexOf(':');
@@ -320,6 +334,9 @@ function parseCallbackData(data: string): ParsedCallback | null {
 	) {
 		return { kind: 'inbox', verb, id };
 	}
+	if (verb === 'bgt-u2' || verb === 'bgt-u5' || verb === 'bgt-t10' || verb === 'bgt-stop') {
+		return { kind: 'budget', verb, id };
+	}
 	return null;
 }
 
@@ -370,6 +387,10 @@ export async function handleCallbackQuery(
 	}
 	if (parsed.kind === 'inbox') {
 		await handleInboxCallback(query, parsed, config);
+		return;
+	}
+	if (parsed.kind === 'budget') {
+		await handleBudgetCallback(query, parsed);
 		return;
 	}
 	await handleYoutubeCallback(query, parsed, config);
@@ -440,6 +461,51 @@ async function handleProposalCallback(
 	}
 
 	await dispatchInbound(synthetic, config, account);
+}
+
+/** Budget-approval branch (ADR-006 Phase 2). A pausable background run hit its
+ *  hard ceiling and paused, preserving its Claude session. A bump tap raises the
+ *  ceiling and resumes via `claude --resume` (fire-and-forget — the run
+ *  re-surfaces via the normal finish/escalation path); Stop keeps the partial
+ *  result and flips the run terminal. Resolved INLINE — no orchestrator. */
+async function handleBudgetCallback(query: TgCallbackQuery, parsed: BudgetParse): Promise<void> {
+	const row = getBudgetApproval(parsed.id);
+	if (!row) {
+		await answerCallbackQuery({
+			callback_query_id: query.id,
+			text: 'Budget request expired — the run was already closed out.',
+			show_alert: false,
+		});
+		return;
+	}
+
+	if (parsed.verb === 'bgt-stop') {
+		stopBudgetApproval(row);
+		await answerCallbackQuery({ callback_query_id: query.id, text: '🛑 Stopped — partial kept.' });
+		await editMessageText({
+			chat_id: row.chatJid,
+			message_id: row.messageId,
+			text: `🛑 Stopped \`${row.agentId}\` at the ceiling — partial result kept.\n_(button tapped)_`,
+			parse_mode: 'Markdown',
+		}).catch(() => {});
+		return;
+	}
+
+	// Bump verbs — narrowed to keyof BUDGET_BUMPS now that 'bgt-stop' is handled.
+	const bump = BUDGET_BUMPS[parsed.verb];
+	const raised = resumeWithRaisedBudget(row, bump);
+	deleteBudgetApproval(parsed.id);
+	const grant =
+		parsed.verb === 'bgt-t10'
+			? `+10 turns (ceiling ${raised.ceilingTurns})`
+			: `+$${raised.ceilingUsd - row.ceilingUsd} (ceiling $${raised.ceilingUsd})`;
+	await answerCallbackQuery({ callback_query_id: query.id, text: `▶️ Resuming — ${grant}` });
+	await editMessageText({
+		chat_id: row.chatJid,
+		message_id: row.messageId,
+		text: `▶️ Resuming \`${row.agentId}\` — ${grant}.\n_(button tapped)_`,
+		parse_mode: 'Markdown',
+	}).catch(() => {});
 }
 
 /** YouTube follow-up branch (ADR-014). Bypasses the orchestrator —

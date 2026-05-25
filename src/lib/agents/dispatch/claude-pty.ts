@@ -99,18 +99,30 @@ export const claudePtyDispatcher: BackendDispatcher = {
 		// ADR-002 Layer 1 — set a deterministic Claude session id so the
 		// transcript is locatable at finish. `runId` stays the 8-char prefix
 		// for display continuity; the full UUID is what `--session-id` needs.
-		const sessionUuid = crypto.randomUUID();
+		// ADR-006 Phase 2 — on resume, reuse the prior session UUID: Claude Code
+		// appends to the SAME `<uuid>.jsonl` (verified spike), so run-tail keeps
+		// summing cost + turns across the resume seam when it tails from offset 0.
+		const resuming = !!opts.resume_session_id;
+		const sessionUuid = opts.resume_session_id ?? crypto.randomUUID();
 		const runId = sessionUuid.slice(0, 8);
 		const started = Date.now();
+		// ADR-006 Phase 2 — pause-on-ceiling. The caller (index.ts) decides this
+		// from the dispatch context: background runs (no chat jid) are pausable;
+		// chat runs keep the hard kill since the operator is already present.
+		const pausable = opts.pausable_on_ceiling === true;
 		// ADR-005 — per-call budget override (Naseej recipe step). Shallow merge:
 		// any field set on `opts.budget_override` shadows the agent default;
 		// undefined fields fall through to `agent.budget`, which itself falls
 		// through to `PRODUCTION_DEFAULTS` inside `resolveBudget`.
+		// ADR-006 — the ceiling overrides ride the same merge so the resume path
+		// can raise the hard ceiling for a granted run.
 		const mergedBudget = opts.budget_override
 			? {
 					max_usd: opts.budget_override.max_usd ?? agent.budget?.max_usd,
 					max_turns: opts.budget_override.max_turns ?? agent.budget?.max_turns,
 					timeout_sec: opts.budget_override.timeout_sec ?? agent.budget?.timeout_sec,
+					ceiling_usd: opts.budget_override.ceiling_usd ?? agent.budget?.ceiling_usd,
+					ceiling_turns: opts.budget_override.ceiling_turns ?? agent.budget?.ceiling_turns,
 				}
 			: agent.budget;
 		const budget = resolveBudget(opts.mode, mergedBudget);
@@ -146,7 +158,11 @@ export const claudePtyDispatcher: BackendDispatcher = {
 				cwd: config.resolved.vaultDir,
 				shell: false,
 				model,
-				claudeSessionId: sessionUuid,
+				// ADR-006 Phase 2 — resume reuses the session via `--resume <id>`
+				// (mutually exclusive with `--session-id`); a fresh run sets a
+				// deterministic `--session-id` so its transcript is locatable.
+				claudeSessionId: resuming ? undefined : sessionUuid,
+				resumeSessionId: resuming ? sessionUuid : undefined,
 				// Dispatched agents are leaf workers by default — deny the sub-agent
 				// dispatch tool so they do the work themselves instead of delegating.
 				// An `--agent <id>` session also sees `<id>` as a callable sub-agent
@@ -266,6 +282,11 @@ export const claudePtyDispatcher: BackendDispatcher = {
 			let timedOut = false;
 			let transcriptDone = false;
 			let budgetExceeded: 'max_turns' | 'max_usd' | null = null;
+			// ADR-006 tier 1 — the soft cap is now an informational checkpoint, not
+			// a kill. Latch so we log the crossing once; the run auto-extends to the
+			// hard ceiling (the "auto-approve band": a near-done run isn't discarded
+			// one turn short of its answer).
+			let softCapLatched = false;
 
 			while (!exited) {
 				if (liveTail && runTail) {
@@ -304,17 +325,36 @@ export const claudePtyDispatcher: BackendDispatcher = {
 						killSession(session.id);
 						break;
 					}
-					if (snap.turns >= budget.max_turns) {
+					// ADR-006 tier 2 — HARD ceiling terminates the run (runaway /
+					// recursion backstop). This is the only budget kill now; the soft
+					// caps below just log + auto-extend.
+					if (snap.turns >= budget.ceiling_turns) {
 						budgetExceeded = 'max_turns';
 						killSession(session.id);
 						break;
 					}
 					// cost is null when any turn had unknown pricing — don't enforce
-					// a dollar cap we can't trust; max_turns still bounds the run.
-					if (snap.costUsd !== null && snap.costUsd >= budget.max_usd) {
+					// a dollar ceiling we can't trust; ceiling_turns still bounds the run.
+					if (snap.costUsd !== null && snap.costUsd >= budget.ceiling_usd) {
 						budgetExceeded = 'max_usd';
 						killSession(session.id);
 						break;
+					}
+					// ADR-006 tier 1 — soft cap crossing: log once, then auto-extend to
+					// the ceiling. No kill. (Telegram-gated ceiling raises land in
+					// Phase 2; for now the band is silently auto-approved.)
+					if (!softCapLatched) {
+						const overTurns = snap.turns >= budget.max_turns;
+						const overCost = snap.costUsd !== null && snap.costUsd >= budget.max_usd;
+						if (overTurns || overCost) {
+							softCapLatched = true;
+							const detail = overCost
+								? `$${snap.costUsd!.toFixed(4)} ≥ soft $${budget.max_usd} (ceiling $${budget.ceiling_usd})`
+								: `${snap.turns} turns ≥ soft ${budget.max_turns} (ceiling ${budget.ceiling_turns})`;
+							console.log(
+								`[agents/claude-pty] ${agent.id} crossed soft budget cap — auto-extending to ceiling: ${detail}`,
+							);
+						}
 					}
 				}
 				if (promptInjected && idle >= stallMs) {
@@ -396,12 +436,27 @@ export const claudePtyDispatcher: BackendDispatcher = {
 			if (transcriptDone) {
 				return finish(runId, agent, started, 'success', finalOutput, undefined, termExtras);
 			}
-			// ADR-004 D4 — a turn/cost cap tripped mid-run (live-tail only).
+			// ADR-004 D4 / ADR-006 — the HARD ceiling tripped mid-run (live-tail
+			// only). If the run is pausable (background), preserve the session and
+			// hand off to the operator budget-approval gate instead of terminating;
+			// otherwise (chat) keep the terminal kill.
 			if (budgetExceeded) {
 				const msg =
 					budgetExceeded === 'max_turns'
-						? `Budget exceeded: ${transcriptTurns ?? '?'} turns ≥ max_turns ${budget.max_turns}`
-						: `Budget exceeded: $${(transcriptCostUsd ?? 0).toFixed(4)} ≥ max_usd $${budget.max_usd}`;
+						? `Budget ceiling reached: ${transcriptTurns ?? '?'} turns ≥ ceiling ${budget.ceiling_turns} (soft ${budget.max_turns})`
+						: `Budget ceiling reached: $${(transcriptCostUsd ?? 0).toFixed(4)} ≥ ceiling $${budget.ceiling_usd} (soft $${budget.max_usd})`;
+				if (pausable) {
+					// ADR-006 Phase 2 — the session lives on disk; index.ts escalates
+					// to Telegram and the resume path picks up via `--resume`.
+					return finish(runId, agent, started, 'awaiting-budget-approval', finalOutput, msg, {
+						...termExtras,
+						budget_pause: {
+							reason: budgetExceeded,
+							ceiling_usd: budget.ceiling_usd,
+							ceiling_turns: budget.ceiling_turns,
+						},
+					});
+				}
 				yield { type: 'error', message: msg, ts: Date.now() };
 				return finish(runId, agent, started, 'budget-exceeded', finalOutput, msg, termExtras);
 			}
@@ -476,7 +531,12 @@ function finish(
 	status: DispatchResult['status'],
 	output: string,
 	error?: string,
-	extras?: { num_turns?: number; cost_usd?: number; claude_session_id?: string },
+	extras?: {
+		num_turns?: number;
+		cost_usd?: number;
+		claude_session_id?: string;
+		budget_pause?: DispatchResult['budget_pause'];
+	},
 ): DispatchResult {
 	return {
 		runId,
@@ -492,6 +552,7 @@ function finish(
 		duration_ms: Date.now() - started,
 		error,
 		claude_session_id: extras?.claude_session_id,
+		budget_pause: extras?.budget_pause,
 	};
 }
 

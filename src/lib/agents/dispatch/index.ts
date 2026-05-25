@@ -23,6 +23,7 @@ import { claudeCliFlagDispatcher } from './claude-cli-flag.js';
 import { claudeStreamJsonDispatcher } from './claude-stream-json.js';
 import { aiSdkDispatcher } from './ai-sdk.js';
 import { recordAgentRun, startAgentRun, finishAgentRun } from '../runs.js';
+import { escalateBudgetApproval } from '../budget-escalation.js';
 
 const dispatchers: Record<AgentSummary['backend'], BackendDispatcher> = {
 	'claude-pty': claudePtyDispatcher,
@@ -54,7 +55,16 @@ export interface DispatchAgentOptions {
 		max_usd?: number;
 		max_turns?: number;
 		timeout_sec?: number;
+		ceiling_usd?: number;
+		ceiling_turns?: number;
 	};
+	/** ADR-006 Phase 2 — pause (instead of kill) at the hard ceiling so the run
+	 *  can be resumed after an operator budget grant. Defaults to `!jid`:
+	 *  background dispatches are pausable, chat dispatches keep the hard kill. */
+	pausableOnCeiling?: boolean;
+	/** ADR-006 Phase 2 — resume an existing Claude session with a raised ceiling
+	 *  (set by the budget-approval resume path). */
+	resumeSessionId?: string;
 }
 
 /** Run an agent. Streams events; the generator's return value is the final
@@ -117,6 +127,10 @@ export async function* dispatchAgent(
 		context: opts.context,
 		goal_condition: opts.goal_condition,
 		budget_override: opts.budget_override,
+		// ADR-006 Phase 2 — background runs (no chat jid) are pausable by default;
+		// an explicit flag overrides. Chat runs keep the hard kill at the ceiling.
+		pausable_on_ceiling: opts.pausableOnCeiling ?? !opts.jid,
+		resume_session_id: opts.resumeSessionId,
 	});
 	let result: DispatchResult;
 	let startRowWritten = false;
@@ -151,6 +165,28 @@ export async function* dispatchAgent(
 	}
 
 	finishRun(result, agent, mode, task, startedAt, opts);
+
+	// ADR-006 Phase 2 — a pausable run that hit its ceiling is recorded as
+	// `awaiting-budget-approval`; escalate to the operator's Telegram so a grant
+	// can resume it. Best-effort + detached: escalation failure never affects the
+	// (already-recorded) dispatch outcome.
+	if (result.status === 'awaiting-budget-approval' && result.budget_pause) {
+		const pause = result.budget_pause;
+		void escalateBudgetApproval({
+			runId: result.runId,
+			agentId: agent.id,
+			sessionUuid: result.claude_session_id ?? '',
+			task,
+			ceilingUsd: pause.ceiling_usd,
+			ceilingTurns: pause.ceiling_turns,
+			reason: pause.reason,
+			spentUsd: result.cost_usd,
+			turns: result.num_turns,
+		}).catch((err) =>
+			console.error('[agents/budget] escalation failed:', (err as Error).message),
+		);
+	}
+
 	return result;
 }
 

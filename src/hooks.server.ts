@@ -37,7 +37,7 @@ import {
 import { getCrmDb, closeCrmDb } from '$lib/crm/index.js';
 import { getFetchPageDb, closeFetchPageDb } from '$lib/fetch-page/index.js';
 import { initAgentsWatcher, shutdownAgentsWatcher } from '$lib/agents/watcher.js';
-import { sweepInterruptedRuns } from '$lib/agents/runs.js';
+import { sweepInterruptedRuns, sweepAbandonedBudgetApprovals } from '$lib/agents/runs.js';
 import { seedDefaultsIfEmpty } from '$lib/explorer-roots.js';
 import { soulHubDataDir, soulHubSettingsPath } from '$lib/paths.js';
 import '$lib/secrets.js'; // Load platform secrets into process.env at startup
@@ -144,6 +144,15 @@ try {
 	if (swept > 0) console.log(`[agents/runs] swept ${swept} interrupted run(s) on startup`);
 } catch (err) {
 	console.error('[agents/runs] interrupted-run sweep failed:', err);
+}
+
+// ADR-006 Phase 2 — sweep budget-approval runs the operator never actioned
+// (still `awaiting-budget-approval` past the 6h window) to `budget-exceeded`.
+try {
+	const swept = sweepAbandonedBudgetApprovals();
+	if (swept > 0) console.log(`[agents/runs] swept ${swept} abandoned budget-approval run(s) on startup`);
+} catch (err) {
+	console.error('[agents/runs] budget-approval sweep failed:', err);
 }
 
 // Register built-in task handlers. Must happen BEFORE initSchedulerCore

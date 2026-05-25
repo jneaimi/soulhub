@@ -50,6 +50,10 @@ const BudgetSchema = z
 		// the wall-clock at 60.1s mid-task. Per-agent overrides (researcher,
 		// lighthouse, etc.) bump higher when the workload warrants it.
 		timeout_sec: z.number().int().positive().default(180),
+		// ADR-006 — optional explicit hard ceilings. When unset, `resolveBudget`
+		// derives them as CEILING_MULTIPLIER × the soft caps.
+		ceiling_usd: z.number().nonnegative().optional(),
+		ceiling_turns: z.number().int().positive().optional(),
 	})
 	.prefault({});
 
@@ -61,6 +65,8 @@ const ReadBudgetSchema = z
 		max_usd: z.number().nonnegative(),
 		max_turns: z.number().int().positive(),
 		timeout_sec: z.number().int().positive(),
+		ceiling_usd: z.number().nonnegative(),
+		ceiling_turns: z.number().int().positive(),
 	})
 	.partial()
 	.optional();

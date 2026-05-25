@@ -242,6 +242,43 @@ export function finishAgentRun(input: AgentRunFinishInput): number {
 	return result.changes;
 }
 
+/** ADR-006 Phase 2 — directly set the terminal status of a run row by runId,
+ *  even one already `finished_at`-stamped. Used by the budget-approval gate:
+ *  a paused run sits at `awaiting-budget-approval` (finished_at set); an
+ *  operator "Stop" flips it to `budget-exceeded`, and the abandonment sweep
+ *  flips stale ones the same way. Returns rows updated. */
+export function setRunStatus(
+	runId: string,
+	status: RunStatus,
+	opts: { errorMessage?: string } = {},
+): number {
+	const result = db()
+		.prepare(
+			`UPDATE agent_runs SET status = ?, error_message = COALESCE(?, error_message)
+			 WHERE run_id = ?`,
+		)
+		.run(status, opts.errorMessage ?? null, runId);
+	return result.changes;
+}
+
+/** ADR-006 Phase 2 — sweep paused budget-approval runs the operator never
+ *  actioned. After `maxAgeMs` (default 6h, matching the Telegram button TTL)
+ *  a still-`awaiting-budget-approval` row is flipped to `budget-exceeded` so it
+ *  doesn't linger as actionable. The session transcript stays on disk; only the
+ *  status changes. Returns rows swept. */
+export function sweepAbandonedBudgetApprovals(maxAgeMs = 6 * 60 * 60 * 1000): number {
+	const cutoff = Date.now() - maxAgeMs;
+	const result = db()
+		.prepare(
+			`UPDATE agent_runs SET
+				status = 'budget-exceeded',
+				error_message = 'budget approval abandoned — no operator grant within the window'
+			WHERE status = 'awaiting-budget-approval' AND started_at < ?`,
+		)
+		.run(cutoff);
+	return result.changes;
+}
+
 /** Startup sweep — flip orphaned `running` rows (lost to a process restart /
  *  crash before they could finish) to `interrupted` so they stay visible.
  *  `maxAgeMs` guards against killing a genuinely-still-running dispatch in a
