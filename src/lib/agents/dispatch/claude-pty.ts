@@ -147,17 +147,19 @@ export const claudePtyDispatcher: BackendDispatcher = {
 				shell: false,
 				model,
 				claudeSessionId: sessionUuid,
-				// Dispatched agents are leaf workers — deny the sub-agent dispatch
-				// tool so they do the work themselves instead of delegating. An
-				// `--agent <id>` session also sees `<id>` as a callable sub-agent
-				// (Claude Code auto-discovers ~/.claude/agents/), so without this
-				// the analyst spawns itself and the work hides in a sidechain.
+				// Dispatched agents are leaf workers by default — deny the sub-agent
+				// dispatch tool so they do the work themselves instead of delegating.
+				// An `--agent <id>` session also sees `<id>` as a callable sub-agent
+				// (Claude Code auto-discovers ~/.claude/agents/), so without this the
+				// analyst spawns itself and the work hides in a sidechain.
+				// Orchestrator agents opt in via `allow_subagents` to KEEP Task/Agent —
+				// they fan out to named sub-agents (parallel, mixed models) and must
+				// summarise the results into their own final response.
 				extraArgs: [
 					'--strict-mcp-config',
 					'--mcp-config',
 					'{"mcpServers":{}}',
-					'--disallowedTools',
-					'Task,Agent',
+					...(agent.allow_subagents ? [] : ['--disallowedTools', 'Task,Agent']),
 				],
 			});
 		} catch (err) {

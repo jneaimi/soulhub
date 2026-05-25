@@ -65,6 +65,9 @@ interface ClaudeMdFrontmatter {
 	chat_dispatchable?: boolean;
 	/** ADR-031 — convergence condition for `/goal`. PTY-only effect today. */
 	goal_condition?: string;
+	/** Orchestrator opt-in — lets this agent spawn sub-agents (drops the
+	 *  `Task,Agent` disallow on the claude-pty dispatch). Soul Hub extension. */
+	allow_subagents?: boolean;
 	/** Soul Hub extension. Claude Code ignores unknown frontmatter keys, so
 	 *  this travels safely alongside the agent's main spec. */
 	budget?: { max_usd?: number; max_turns?: number; timeout_sec?: number };
@@ -134,6 +137,7 @@ function parseLaneA(filePath: string): AgentSummary | null {
 		goal_condition: typeof fm.goal_condition === 'string' && fm.goal_condition.trim().length > 0
 			? fm.goal_condition.trim()
 			: undefined,
+		allow_subagents: fm.allow_subagents === true,
 		budget: extractBudget(fm.budget),
 	};
 }
@@ -233,6 +237,9 @@ function parseLaneB(filePath: string): AgentSummary | null {
 		goal_condition: typeof doc.goal_condition === 'string' && doc.goal_condition.trim().length > 0
 			? doc.goal_condition.trim()
 			: undefined,
+		// Lane B (ai-sdk) agents aren't Claude Code sessions — sub-agent fan-out
+		// (a Claude Code Task-tool capability) doesn't apply.
+		allow_subagents: false,
 		budget: extractBudget((doc as Record<string, unknown>).budget),
 	};
 }

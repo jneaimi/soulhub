@@ -4,6 +4,19 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.0] — 2026-05-25
+
+### Added
+- **Orchestrator agents that fan out to sub-agents (`allow_subagents`).** Agents
+  are leaf workers by default. Set `allow_subagents: true` on an agent and it may
+  use Claude Code's Task/Agent tool to spawn **sub-agents in parallel**, target
+  named agent types, and pick a **model per sub-agent** — e.g. a cheap model for
+  simple pieces, a stronger one for hard pieces — to trade cost for wall-clock
+  speed on compound tasks. Orchestrator agents must synthesise sub-agent results
+  into their own final response. Every existing agent is unchanged (default off).
+  (ADR-005.) Known v1 gaps: a parent's budget caps don't yet account for
+  sub-agent spend, and self-delegation is prevented only by prompt.
+
 ## [2.11.1] — 2026-05-25
 
 ### Fixed

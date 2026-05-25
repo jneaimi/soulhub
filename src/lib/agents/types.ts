@@ -98,6 +98,14 @@ export const AgentSummarySchema = z.object({
 	 *  `/goal` today. Leave undefined for one-shot agents (author / scribe /
 	 *  artifact-producers). Example: "all tests pass and no type-check errors". */
 	goal_condition: z.string().optional(),
+	/** Orchestrator opt-in. When true, the `claude-pty` dispatcher does NOT pass
+	 *  `--disallowedTools Task,Agent`, so this agent may itself spawn sub-agents
+	 *  inside its Claude Code session — parallel fan-out, named agents, mixed
+	 *  models. Default false: agents are leaf workers (the policy that prevents
+	 *  self-delegation + sidechain work-hiding). Set on orchestrator agents only;
+	 *  such agents must summarise sub-agent results into their OWN final response,
+	 *  since transcript extraction skips sidechains. */
+	allow_subagents: z.boolean().default(false),
 	/** Per-agent budget override read from frontmatter (Lane A) or YAML
 	 *  (Lane B). Partial — any subset of fields. Missing fields fall through
 	 *  to `PRODUCTION_DEFAULTS` in `dispatch/budget.ts` at runtime. */
