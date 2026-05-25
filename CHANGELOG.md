@@ -4,6 +4,17 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.17.0] — 2026-05-25
+
+### Added
+- **Sub-agent fan-out detail in the run drill-down (ADR-005 gap #3).** An
+  orchestrator's sub-agent work landed in transcript sidechains the run record
+  skipped — invisible in the UI. Expanding an orchestrator's run now shows each
+  sub-agent's task and final output (plus model/cost/turns), fetched on demand
+  from `GET /api/agents/[id]/runs/[runId]` (re-reads the transcript by session
+  id — no schema change). Completes the ADR-008 footer: a flagged self-spawn's
+  hidden work is now inspectable. With this, all three ADR-005 gaps are closed.
+
 ## [2.16.1] — 2026-05-25
 
 ### Added

@@ -420,6 +420,15 @@ export function listAgentRuns(
 		.all(...args) as AgentRunRow[];
 }
 
+/** ADR-005 gap #3 — fetch a single run by its runId (for the run-detail
+ *  sub-agent drill-down). Returns null if unknown. */
+export function getAgentRun(runId: string): AgentRunRow | null {
+	const row = db()
+		.prepare(`SELECT ${SELECT_COLS} FROM agent_runs WHERE run_id = ? LIMIT 1`)
+		.get(runId);
+	return (row as AgentRunRow) ?? null;
+}
+
 /** ADR-007 — open paused runs awaiting a budget decision, newest-first. The
  *  web budget-approval surface lists these, merges each with its pending
  *  approval detail (ceilings + TTL), and drives the same resume/stop engine the

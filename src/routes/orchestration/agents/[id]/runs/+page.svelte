@@ -43,6 +43,21 @@
 	let modeFilter = $state<ModeFilter>('all');
 	let expanded = $state(new Set<number>());
 
+	// ADR-005 gap #3 — orchestrator sub-agent (fan-out) detail, fetched on demand
+	// when a run is expanded (only for agents that can fan out). Keyed by runId.
+	interface SubAgent {
+		agentId: string;
+		model?: string;
+		costUsd: number | null;
+		turns: number;
+		task: string;
+		finalText: string;
+	}
+	let allowSubagents = $state(false);
+	let subagents = $state<Record<string, { loading: boolean; error: string | null; list: SubAgent[] }>>(
+		{},
+	);
+
 	const id = $derived($page.params.id ?? '');
 
 	async function load() {
@@ -60,6 +75,7 @@
 			runs = runsData.runs ?? [];
 			stats = runsData.stats ?? null;
 			agentName = agentData.agent?.name ?? id;
+			allowSubagents = agentData.agent?.allow_subagents === true;
 			loadError = null;
 		} catch (err) {
 			loadError = (err as Error).message;
@@ -101,11 +117,36 @@
 		'budget-exceeded': 'bg-hub-warning/15 text-hub-warning border-hub-warning/30',
 	};
 
-	function toggleRow(rowId: number) {
+	function toggleRow(run: RunRow) {
 		const next = new Set(expanded);
-		if (next.has(rowId)) next.delete(rowId);
-		else next.add(rowId);
+		if (next.has(run.id)) next.delete(run.id);
+		else {
+			next.add(run.id);
+			// Lazy-load the fan-out detail on first expand (orchestrators only).
+			if (allowSubagents) void loadSubagents(run.runId);
+		}
 		expanded = next;
+	}
+
+	async function loadSubagents(runId: string) {
+		if (subagents[runId]) return; // already loading/loaded
+		subagents = { ...subagents, [runId]: { loading: true, error: null, list: [] } };
+		try {
+			const res = await fetch(
+				`/api/agents/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}`,
+			);
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			const data = await res.json();
+			subagents = {
+				...subagents,
+				[runId]: { loading: false, error: null, list: data.subagents ?? [] },
+			};
+		} catch (e) {
+			subagents = {
+				...subagents,
+				[runId]: { loading: false, error: (e as Error).message, list: [] },
+			};
+		}
 	}
 
 	const filterChips: { id: ModeFilter; label: string }[] = [
@@ -233,7 +274,7 @@
 						<div class="bg-hub-card rounded-lg border border-hub-border overflow-hidden">
 							<button
 								type="button"
-								onclick={() => toggleRow(run.id)}
+								onclick={() => toggleRow(run)}
 								class="w-full text-left px-3 py-2 flex items-center gap-3 hover:bg-hub-bg/40 cursor-pointer"
 							>
 								<span class="px-1.5 py-0.5 rounded text-[10px] font-medium border {statusColor[run.status]}">
@@ -280,6 +321,41 @@
 											<div class="text-[10px] uppercase tracking-wide text-hub-dim mb-1">Output excerpt</div>
 											<pre class="text-[11px] text-hub-muted font-mono bg-hub-card border border-hub-border/60 rounded p-2 overflow-x-auto whitespace-pre-wrap max-h-48 overflow-y-auto">{run.resultExcerpt}</pre>
 										</div>
+									{/if}
+									{#if allowSubagents}
+										{@const sa = subagents[run.runId]}
+										{#if sa?.loading}
+											<div class="text-[11px] text-hub-dim">Loading sub-agents…</div>
+										{:else if sa?.error}
+											<div class="text-[11px] text-hub-danger">Sub-agents: {sa.error}</div>
+										{:else if sa && sa.list.length > 0}
+											<div>
+												<div class="text-[10px] uppercase tracking-wide text-hub-dim mb-1">
+													Sub-agents ({sa.list.length})
+												</div>
+												<div class="space-y-2">
+													{#each sa.list as s (s.agentId)}
+														<div class="bg-hub-card border border-hub-purple/30 rounded p-2">
+															<div class="flex items-center gap-2 mb-1 text-[10px] font-mono">
+																<span class="text-hub-purple">⚙ {s.agentId}</span>
+																{#if s.model}<span class="text-hub-dim">{s.model}</span>{/if}
+																<span class="text-hub-dim ml-auto"
+																	>{s.costUsd == null ? '—' : fmtCost(s.costUsd)} · {s.turns}t</span
+																>
+															</div>
+															{#if s.task}
+																<div class="text-[10px] text-hub-dim mb-0.5">task</div>
+																<pre class="text-[11px] text-hub-muted font-mono bg-hub-bg border border-hub-border/60 rounded p-2 overflow-x-auto whitespace-pre-wrap max-h-24 overflow-y-auto">{s.task}</pre>
+															{/if}
+															{#if s.finalText}
+																<div class="text-[10px] text-hub-dim mt-1 mb-0.5">output</div>
+																<pre class="text-[11px] text-hub-muted font-mono bg-hub-bg border border-hub-border/60 rounded p-2 overflow-x-auto whitespace-pre-wrap max-h-48 overflow-y-auto">{s.finalText}</pre>
+															{/if}
+														</div>
+													{/each}
+												</div>
+											</div>
+										{/if}
 									{/if}
 								</div>
 							{/if}

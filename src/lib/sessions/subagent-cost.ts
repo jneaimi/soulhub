@@ -123,6 +123,90 @@ export async function rollupSubagentCost(parentJsonlPath: string): Promise<Subag
 	};
 }
 
+/** ADR-005 gap #3 — per-sub-agent DETAIL (task + final output), for surfacing a
+ *  fan-out's hidden sidechain work in the run-detail UI. Separate from
+ *  `rollupSubagentCost` (the live 2s sweep path) so the hot path stays lean —
+ *  this runs only on-demand when an operator drills into a run. */
+export interface SubagentDetail {
+	/** Claude-internal sub-agent id (the `agent-<id>.jsonl` filename stem). */
+	agentId: string;
+	model?: string;
+	costUsd: number | null;
+	turns: number;
+	/** The task the orchestrator handed this sub-agent (its first user message). */
+	task: string;
+	/** The sub-agent's final assistant text (its result, hidden from the parent). */
+	finalText: string;
+}
+
+/** Pull plain text out of a message `content` (string or block array). */
+function contentText(content: unknown): string {
+	if (typeof content === 'string') return content.trim();
+	if (Array.isArray(content)) {
+		return content
+			.filter((b) => b?.type === 'text' && typeof b.text === 'string')
+			.map((b) => (b.text as string).trim())
+			.filter(Boolean)
+			.join('\n\n');
+	}
+	return '';
+}
+
+/**
+ * Read every `agent-*.jsonl` sub-agent transcript under a parent session and
+ * extract each one's task (first user message) + final assistant text, plus the
+ * same cost/turns/model `rollupSubagentCost` derives. Returns [] when the parent
+ * had no fan-out. On-demand only (drill-down), never the live sweep.
+ */
+export async function rollupSubagentDetail(parentJsonlPath: string): Promise<SubagentDetail[]> {
+	const saDir = subagentsDir(parentJsonlPath);
+	let files: string[];
+	try {
+		files = readdirSync(saDir).filter((f) => f.startsWith('agent-') && f.endsWith('.jsonl'));
+	} catch {
+		return [];
+	}
+	if (files.length === 0) return [];
+
+	const out: SubagentDetail[] = [];
+	for (const file of files) {
+		const agentId = basename(file, '.jsonl').replace(/^agent-/, '');
+		const path = join(saDir, file);
+		const requestIds = new Set<string>();
+		let model: string | undefined;
+		let cost = 0;
+		let unknown = false;
+		let task = '';
+		let finalText = '';
+
+		try {
+			for await (const e of streamEvents(path)) {
+				const ev = e as ClaudeEvent;
+				if (ev.type === 'user' && !task) {
+					const t = contentText(ev.message?.content);
+					if (t) task = t;
+				} else if (ev.type === 'assistant') {
+					if (ev.requestId) requestIds.add(ev.requestId);
+					const msg = ev.message;
+					if (!model && msg?.model) model = msg.model;
+					if (msg?.usage) {
+						const usd = priceUsage(msg.model, msg.usage);
+						if (usd === null) unknown = true;
+						else cost += usd;
+					}
+					const text = contentText(msg?.content);
+					if (text) finalText = text;
+				}
+			}
+		} catch {
+			unknown = true;
+		}
+
+		out.push({ agentId, model, costUsd: unknown ? null : cost, turns: requestIds.size, task, finalText });
+	}
+	return out;
+}
+
 /**
  * Fold a sub-agent rollup into a parent `CostBreakdown` in place: records the
  * fan-out portion in `subagentUsd` and makes `totalUsd` the grand total
