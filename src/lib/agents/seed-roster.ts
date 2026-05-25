@@ -163,6 +163,7 @@ function buildDrafts(): AgentDraft[] {
 		system_prompt: s.system_prompt,
 		provenance: 'builtin',
 		chat_dispatchable: s.chat_dispatchable === true,
+		allow_subagents: false,
 		spec: { backend: 'claude-pty', worktree_isolated: true },
 	}));
 }

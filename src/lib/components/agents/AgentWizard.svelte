@@ -9,6 +9,8 @@
 		max_usd: number;
 		max_turns: number;
 		timeout_sec: number;
+		ceiling_usd?: number;
+		ceiling_turns?: number;
 	}
 
 	interface Initial {
@@ -22,6 +24,7 @@
 		system_prompt?: string;
 		backend?: Backend;
 		chat_dispatchable?: boolean;
+		allow_subagents?: boolean;
 		/** ADR-031 — when set, the PTY dispatcher sends `/goal <condition>`
 		 *  into the session before the task so the agent self-iterates
 		 *  until the condition is met or the budget timeout fires. */
@@ -187,10 +190,19 @@
 	let maxTurns = $state(seed.budget?.max_turns ?? 20);
 	let timeoutSec = $state(seed.budget?.timeout_sec ?? 60);
 
+	// ADR-006 — hard ceilings. The configured budget above is a SOFT cap; the
+	// run auto-extends to these before pausing/terminating. Blank → runtime
+	// uses 2× the soft cap.
+	let ceilingUsd = $state<number | null>(seed.budget?.ceiling_usd ?? null);
+	let ceilingTurns = $state<number | null>(seed.budget?.ceiling_turns ?? null);
+
 	// Per WhatsApp ADR-005 — explicit per-agent flag for chat dispatch.
 	// Off by default; users opt in agents whose work is safe to trigger
 	// from a single WhatsApp message.
 	let chatDispatchable = $state(seed.chat_dispatchable ?? false);
+
+	// ADR-005 — orchestrator opt-in to fan out to parallel sub-agents.
+	let allowSubagents = $state(seed.allow_subagents ?? false);
 
 	// ADR-031 — convergence condition for `/goal`. PTY-only effect today.
 	// Empty string → one-shot (legacy behavior). Non-empty → goal-mode.
@@ -225,10 +237,13 @@
 				max_usd: Number(maxUsd) || 0,
 				max_turns: Number(maxTurns) || 1,
 				timeout_sec: Number(timeoutSec) || 1,
+				...(ceilingUsd != null && ceilingUsd !== ('' as unknown) ? { ceiling_usd: Number(ceilingUsd) } : {}),
+				...(ceilingTurns != null && ceilingTurns !== ('' as unknown) ? { ceiling_turns: Number(ceilingTurns) } : {}),
 			},
 			system_prompt: systemPrompt,
 			provenance: 'user-created',
 			chat_dispatchable: chatDispatchable,
+			allow_subagents: allowSubagents,
 			goal_condition: goalCondition.trim() || undefined,
 		};
 
@@ -596,6 +611,24 @@
 			</label>
 		</div>
 
+		<!-- Allow sub-agents (ADR-005) -->
+		<div>
+			<div class="text-xs text-hub-muted mb-1.5">Allow sub-agents</div>
+			<label class="flex items-start gap-2 px-2.5 py-2 rounded-lg bg-hub-bg border border-hub-border text-xs text-hub-muted cursor-pointer hover:text-hub-text transition-colors">
+				<input
+					type="checkbox"
+					bind:checked={allowSubagents}
+					class="accent-hub-cta cursor-pointer mt-0.5"
+				/>
+				<span>
+					<span class="text-hub-text font-medium">Allow sub-agents</span>
+					<span class="block text-[10px] text-hub-dim mt-0.5 leading-snug">
+						When on, this agent may fan out to parallel sub-agents (Claude Code Task tool) — e.g. an orchestrator that splits work across cheaper models. Leave off for normal leaf agents.
+					</span>
+				</span>
+			</label>
+		</div>
+
 		<!-- Goal condition (ADR-031) -->
 		<div>
 			<div class="text-xs text-hub-muted mb-1.5">Goal condition <span class="text-hub-dim font-normal">(optional)</span></div>
@@ -647,6 +680,35 @@
 					/>
 				</div>
 			</div>
+			<!-- ADR-006 — hard ceilings. Soft cap above auto-extends to these before pausing. -->
+			<div class="grid grid-cols-2 gap-2 mt-2">
+				<div>
+					<label for="agent-ceiling-usd" class="block text-[10px] text-hub-dim mb-0.5 uppercase tracking-wider">Ceiling USD</label>
+					<input
+						id="agent-ceiling-usd"
+						type="number"
+						min="0"
+						step="0.05"
+						bind:value={ceilingUsd}
+						placeholder={maxUsd ? String(Number(maxUsd) * 2) : 'auto (2× soft)'}
+						class="w-full px-2 py-1.5 rounded bg-hub-bg border border-hub-border text-xs font-mono text-hub-text placeholder:text-hub-dim focus:outline-none focus:ring-1 focus:ring-hub-cta/50"
+					/>
+				</div>
+				<div>
+					<label for="agent-ceiling-turns" class="block text-[10px] text-hub-dim mb-0.5 uppercase tracking-wider">Ceiling turns</label>
+					<input
+						id="agent-ceiling-turns"
+						type="number"
+						min="1"
+						bind:value={ceilingTurns}
+						placeholder={maxTurns ? String(Number(maxTurns) * 2) : 'auto (2× soft)'}
+						class="w-full px-2 py-1.5 rounded bg-hub-bg border border-hub-border text-xs font-mono text-hub-text placeholder:text-hub-dim focus:outline-none focus:ring-1 focus:ring-hub-cta/50"
+					/>
+				</div>
+			</div>
+			<p class="text-[10px] text-hub-dim mt-1 leading-snug">
+				Hard ceilings (ADR-006). The budget above is a soft cap — a run auto-extends to these before pausing or terminating. Leave blank to use 2× the soft cap.
+			</p>
 		</div>
 
 		<!-- Backend-specific -->

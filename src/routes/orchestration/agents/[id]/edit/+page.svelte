@@ -18,6 +18,8 @@
 		skills: string[];
 		system_prompt: string;
 		chat_dispatchable?: boolean;
+		allow_subagents?: boolean;
+		budget?: { max_usd?: number; max_turns?: number; timeout_sec?: number; ceiling_usd?: number; ceiling_turns?: number };
 		goal_condition?: string;
 	}
 

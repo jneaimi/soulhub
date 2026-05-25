@@ -4,6 +4,48 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.14.0] — 2026-05-25
+
+### Added
+- **Budget velocity warning + in-flight ceiling raise (ADR-006 Phase 3).** A
+  background run is now watched for *pace*: the dispatcher projects one turn ahead
+  from its observed cost-per-turn and, when the next turn is likely to cross the
+  hard ceiling, sends an early Telegram warning with pre-approve buttons
+  (`➕ $2 / ➕ $5 / ➕ 10 turns`). Tapping one raises the ceiling **in-flight** —
+  the still-running session keeps going with no kill and no `claude --resume`
+  restart (which would re-create the model's context cache). Ignore it and the
+  run simply falls through to the Phase 2 pause at the ceiling. Grants accumulate
+  across taps.
+
+## [2.13.0] — 2026-05-25
+
+### Added
+- **Dynamic, human-gated dispatch budget (ADR-006 Phase 1 + 2).** The single hard
+  budget cap is replaced by tiers. The configured cap (`max_usd` / `max_turns`) is
+  now a **soft** checkpoint — a run that crosses it auto-extends to a **hard
+  ceiling** (default 2× the soft cap) instead of being killed one turn short of its
+  answer; only the ceiling terminates. Background runs (scheduler / recipe /
+  fire-and-forget) that hit the ceiling **pause** instead of dying: the Claude
+  session is preserved and the operator gets a Telegram message with
+  `➕ $2 / ➕ $5 / ➕ 10 turns / 🛑 Stop` (plus an optional "⚙️ More options"
+  dashboard deep-link when `SOUL_HUB_PUBLIC_URL` is set). A bump resumes the run
+  via `claude --resume` with a raised ceiling; Stop keeps the partial result. A
+  6h sweep closes out un-actioned pauses. Chat dispatches keep the hard kill
+  (the operator is already present). Per-agent `budget.ceiling_usd` /
+  `ceiling_turns` overrides the 2× default.
+
+## [2.12.1] — 2026-05-25
+
+### Fixed
+- **Recorded dispatch cost now includes sub-agent (fan-out) spend (ADR-005 gap
+  #1).** A `allow_subagents` orchestrator's sub-agents write to separate
+  transcripts, so the recorded `cost_usd` previously counted only the parent and
+  **undercounted** a fan-out — and the budget caps bound only the parent. Cost is
+  now rolled up across the parent plus every sub-agent transcript, each priced
+  with **its own model** (fixing a separate bug where haiku sub-agents under a
+  sonnet parent were priced ~3× too high). The honest total flows into the live
+  budget signal, the recorded run cost, and the session-browser list.
+
 ## [2.12.0] — 2026-05-25
 
 ### Added

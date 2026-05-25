@@ -163,6 +163,7 @@ export const AgentDraftSchema = z.object({
 	system_prompt: z.string().default(''),
 	provenance: Provenance.default('user-created'),
 	chat_dispatchable: z.boolean().default(false),
+	allow_subagents: z.boolean().default(false),
 	/** ADR-031 — optional convergence condition for the `/goal` command on
 	 *  PTY-backed agents. Empty string or omitted → one-shot dispatch (today's
 	 *  behavior). Non-empty string → goal-mode. Only applied on

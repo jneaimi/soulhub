@@ -70,7 +70,7 @@ interface ClaudeMdFrontmatter {
 	allow_subagents?: boolean;
 	/** Soul Hub extension. Claude Code ignores unknown frontmatter keys, so
 	 *  this travels safely alongside the agent's main spec. */
-	budget?: { max_usd?: number; max_turns?: number; timeout_sec?: number };
+	budget?: { max_usd?: number; max_turns?: number; timeout_sec?: number; ceiling_usd?: number; ceiling_turns?: number };
 }
 
 /** Parse `~/.claude/agents/<id>.md`. Tools is a comma-separated string per Anthropic's
@@ -148,12 +148,15 @@ function parseLaneA(filePath: string): AgentSummary | null {
 function extractBudget(raw: unknown): AgentSummary['budget'] {
 	if (!raw || typeof raw !== 'object') return undefined;
 	const o = raw as Record<string, unknown>;
-	const out: { max_usd?: number; max_turns?: number; timeout_sec?: number } = {};
+	const out: { max_usd?: number; max_turns?: number; timeout_sec?: number; ceiling_usd?: number; ceiling_turns?: number } = {};
 	if (typeof o.max_usd === 'number' && o.max_usd >= 0) out.max_usd = o.max_usd;
 	if (typeof o.max_turns === 'number' && o.max_turns > 0 && Number.isInteger(o.max_turns))
 		out.max_turns = o.max_turns;
 	if (typeof o.timeout_sec === 'number' && o.timeout_sec > 0 && Number.isInteger(o.timeout_sec))
 		out.timeout_sec = o.timeout_sec;
+	if (typeof o.ceiling_usd === 'number' && o.ceiling_usd >= 0) out.ceiling_usd = o.ceiling_usd;
+	if (typeof o.ceiling_turns === 'number' && o.ceiling_turns > 0 && Number.isInteger(o.ceiling_turns))
+		out.ceiling_turns = o.ceiling_turns;
 	return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -387,6 +390,7 @@ function writeLaneA(draft: AgentDraft): string {
 		backend: draft.spec.backend, // Soul Hub extension
 		provenance: draft.provenance,
 		chat_dispatchable: draft.chat_dispatchable === true ? true : undefined,
+		allow_subagents: draft.allow_subagents === true ? true : undefined,
 		goal_condition: draft.goal_condition && draft.goal_condition.trim().length > 0
 			? draft.goal_condition.trim()
 			: undefined,
@@ -421,6 +425,7 @@ function writeLaneB(draft: AgentDraft): string {
 		budget: draft.budget,
 		provenance: draft.provenance,
 		chat_dispatchable: draft.chat_dispatchable === true,
+		allow_subagents: draft.allow_subagents === true,
 		goal_condition: draft.goal_condition && draft.goal_condition.trim().length > 0
 			? draft.goal_condition.trim()
 			: undefined,
