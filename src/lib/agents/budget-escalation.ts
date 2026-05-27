@@ -303,6 +303,43 @@ export async function escalateVelocityWarning(
 	return { ok: true };
 }
 
+// ─── ADR-026 P2 — operator-input escalation ────────────────────────────────
+
+export interface OperatorInputEscalateInput {
+	runId: string;
+	agentId: string;
+	question: string;
+}
+
+function formatOperatorInputMessage(input: OperatorInputEscalateInput): string {
+	return [
+		`🟡 *${input.agentId}* is waiting on you: ${input.question}`,
+		'',
+		`Resume with your answer via \`--resume\` — the answer rides in as the task.`,
+		'',
+		`_run \`${input.runId}\`_`,
+	].join('\n');
+}
+
+/** Notify the operator that an agent emitted an `ask_operator` sentinel.
+ *  Sends the question to Telegram. No keyboard or persistence is needed —
+ *  the operator answers by resuming the session; the answer rides back in as
+ *  the `task` text on `--resume`. Best-effort; never throws into dispatch. */
+export async function escalateOperatorInput(
+	input: OperatorInputEscalateInput,
+): Promise<{ ok: boolean; error?: string }> {
+	const chatId = resolveTelegramChatId();
+	if (!chatId) return { ok: false, error: 'no-telegram-chat-id' };
+	const delivery = soulHubConfig.channels?.telegram?.delivery;
+	if (!delivery) return { ok: false, error: 'no-telegram-delivery-config' };
+
+	const result = await sendText(chatId, formatOperatorInputMessage(input), delivery);
+	if (!result.ok || result.messageIds.length === 0) {
+		return { ok: false, error: result.error ?? 'send-failed' };
+	}
+	return { ok: true };
+}
+
 /** Operator chose Stop — flip the paused run to a terminal `budget-exceeded`
  *  and forget the pending approval. The partial result already lives in the
  *  run record's `result_excerpt`. */

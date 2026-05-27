@@ -10,6 +10,30 @@ function validateVaultPath(path: string): boolean {
 	return true;
 }
 
+/** Frontmatter relationship fields whose `[[wikilink]]` values the AdrDrawer
+ *  renders as clickable dependency edges. */
+const REL_FIELDS = [
+	'blocked_by',
+	'blocks',
+	'extends',
+	'supersedes',
+	'superseded_by',
+	'relates_to',
+] as const;
+
+/** Extract the `[[target|alias]]` → `target` raws from a frontmatter value
+ *  (string or string[]); strips the `|alias` suffix. */
+function relWikilinks(raw: unknown): string[] {
+	const arr = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
+	const out: string[] = [];
+	for (const item of arr) {
+		if (typeof item !== 'string') continue;
+		const m = item.match(/^\s*\[\[(.+?)(?:\|.+?)?\]\]\s*$/);
+		if (m) out.push(m[1].trim());
+	}
+	return out;
+}
+
 /** GET /api/vault/notes/[...path] — Read a single note */
 export const GET: RequestHandler = async ({ params }) => {
 	const engine = getVaultEngine();
@@ -37,6 +61,20 @@ export const GET: RequestHandler = async ({ params }) => {
 		const contentIsRtl = isRtl(note.content);
 		const titleIsRtl = isRtl(note.title);
 
+		// Resolve every relationship-field wikilink through the SAME engine
+		// resolver that body links use (global slug + alias index). The drawer's
+		// naive same-directory `resolveRelLink` breaks on cross-project bare
+		// slugs (e.g. a soul-hub-agents ADR `blocked_by` a soul-hub-whatsapp
+		// ADR) — it resolves to a 404 path and the dependency edge won't open.
+		// Surfacing the authoritative resolution here lets the drawer prefer it.
+		const depResolved: Record<string, string | null> = {};
+		for (const field of REL_FIELDS) {
+			for (const raw of relWikilinks(note.meta[field])) {
+				if (raw in depResolved) continue;
+				depResolved[raw] = engine.resolveLink(raw, note.path);
+			}
+		}
+
 		return json({
 			path: note.path,
 			title: note.title,
@@ -46,6 +84,7 @@ export const GET: RequestHandler = async ({ params }) => {
 			contentIsRtl,
 			titleIsRtl,
 			links: note.links,
+			depResolved,
 			backlinks: engine.getBacklinks(path).map(n => n.path),
 			zone: note.path.split('/')[0] || 'inbox',
 			mtime: note.mtime,

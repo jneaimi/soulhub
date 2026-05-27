@@ -116,6 +116,12 @@ export const AgentSummarySchema = z.object({
 	 *  (Lane B). Partial — any subset of fields. Missing fields fall through
 	 *  to `PRODUCTION_DEFAULTS` in `dispatch/budget.ts` at runtime. */
 	budget: ReadBudgetSchema,
+	/** ADR-010 (soul-hub-agents) — when set, this agent operates on a git repo,
+	 *  not the vault. The dispatcher provisions a per-run git WORKTREE of this
+	 *  repo before spawn and injects its path into the task; the agent cd's there
+	 *  and works on its own branch — never the shared checkout or the live build.
+	 *  Absent for vault/clerical agents. Absolute path (may use `~`). */
+	repo: z.string().optional(),
 });
 export type AgentSummary = z.infer<typeof AgentSummarySchema>;
 

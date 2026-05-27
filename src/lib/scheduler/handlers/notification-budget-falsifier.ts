@@ -1,80 +1,73 @@
 /** Task handler: notification-budget-falsifier (soul-hub-governance ADR-002).
  *
- *  Falsifier for the `notification-budget` contract — the runtime guard for
- *  soul-hub-hygiene ADR-005's hard NFR: the vault-hygiene keeper must send
- *  ≤ 1 Telegram message/day from the heartbeat shape (notification is owned by
- *  the once-daily `hygiene-digest`, action by `/hygiene`).
+ *  Repointed per ADR-008 step 4 — keeper retirement (2026-05-26).
  *
- *  This exact invariant regressed silently for a day: the b732551 cutover
- *  retired the inline per-tick sender but left the keeper's own task-prompt
- *  instruction + keeper.md escalation snippet in place, so keeper kept pushing
- *  every 30 min (~tens/day). No falsifier existed to catch it. This is that
- *  falsifier: it counts keeper heartbeat runs in the trailing 24h whose output
- *  reports a Telegram send, and goes RED (errors → red on /hygiene) if > 1. */
+ *  Original contract (pre-retirement): keeper heartbeat sends ≤ 1 Telegram/day.
+ *  The contract was needed because keeper's own task-prompt + keeper.md
+ *  escalation snippet caused ~48× Telegram pushes/day (the regression that
+ *  triggered this falsifier in the first place).
+ *
+ *  Post-retirement contract: keeper is fully retired — zero `agent_runs` rows
+ *  with `agent_id LIKE '%keeper%'` dated after the ADR-008 retirement date.
+ *  Any hit means keeper's roster seed was re-added or a manual dispatch ran —
+ *  both are regressions that need immediate operator attention.
+ *
+ *  This is NOT vacuously-green: it actively checks that keeper never runs
+ *  after retirement (the "dark contract" failure mode ADR-008 §Migration 4
+ *  explicitly guards against). The overall notification-budget invariant
+ *  (hygiene system sends ≤ 1 Telegram/day) is now covered by the
+ *  `operator-notification-budget-falsifier` task, which counts digest-tier
+ *  `notifyOperator` sends. */
 
 import type { TaskFn } from '../task-types.js';
 import { getHeartbeatDb } from '../../channels/whatsapp/heartbeat-state.js';
 
-/** ≤ 1/day per ADR-005; the day-boundary slop of a trailing window means a
- *  single legitimate daily-digest-era send won't trip it, but the ~48×/day
- *  regression will, loudly. */
-const MAX_KEEPER_TG_SENDS_24H = 1;
-
-/** A budget falsifier should page on a *current* breach, not on a healed spike
- *  still inside the trailing 24h window. Anchored to the keeper's heartbeat
- *  cadence (every 30 min): pre-fix it pushed on nearly every tick that had
- *  escalations, so three consecutive clean ticks (90 min) with zero sends is
- *  unambiguous proof the regression is dead. If the 24h count exceeds budget but
- *  the newest send is older than this, we report green-with-`clearing` instead of
- *  throwing — the fix is in, the window is just rolling over. A real ≥2/day
- *  violation still trips it: the 2nd send is always recent at fire time. */
-const RECENCY_GUARD_MS = 90 * 60_000;
-
-/** Keeper's heartbeat output reports a push with phrasing like
- *  "Escalations sent to Telegram: N items". Match the send signal, not the
- *  (legitimate) "needs review … NOT pushed" summary the post-cutover keeper writes. */
-const SENT_SIGNAL = /escalation[s]?\s+sent\s+to\s+telegram|sent\s+to\s+telegram\s*:/i;
+/** ISO timestamp after which a keeper run is a regression, not history.
+ *
+ *  ADR-008 landed 2026-05-26, but keeper kept running on its 30-min heartbeat
+ *  through that transition day until the cutover actually took effect — its
+ *  final legitimate runs were 06:30–23:00 (Dubai) on 2026-05-26. Full
+ *  de-registration (keeper.md deleted, roster seed removed) completed
+ *  2026-05-27. A start-of-2026-05-26 cutoff therefore false-flagged those
+ *  transition-day runs; the cutoff is the day AFTER keeper truly stopped, so
+ *  only a genuine resurrection (a run on/after 2026-05-27) trips it. */
+const RETIREMENT_DATE_MS = new Date('2026-05-27T00:00:00Z').getTime();
 
 interface RunRow {
 	startedAt: number;
-	excerpt: string | null;
+	agentId: string;
+	sourceMessage: string | null;
 }
 
 export function notificationBudgetFalsifierFactory(_params: unknown): TaskFn {
 	return async () => {
-		const since = Date.now() - 24 * 3_600_000;
 		const rows = getHeartbeatDb()
 			.prepare(
-				`SELECT started_at AS startedAt, result_excerpt AS excerpt
+				`SELECT started_at AS startedAt, agent_id AS agentId, source_message AS sourceMessage
 				 FROM agent_runs
 				 WHERE agent_id LIKE '%keeper%'
-				   AND source_message LIKE 'heartbeat:%'
 				   AND started_at > ?
-				 ORDER BY started_at DESC`,
+				 ORDER BY started_at DESC
+				 LIMIT 5`,
 			)
-			.all(since) as RunRow[];
+			.all(RETIREMENT_DATE_MS) as RunRow[];
 
-		const sends = rows.filter((r) => r.excerpt && SENT_SIGNAL.test(r.excerpt));
-		const newestSendAt = sends[0]?.startedAt ?? null;
-		const recentBreach = newestSendAt !== null && newestSendAt > Date.now() - RECENCY_GUARD_MS;
-		const overBudget = sends.length > MAX_KEEPER_TG_SENDS_24H;
-		const summary = {
-			keeperHeartbeatRuns24h: rows.length,
-			telegramSends24h: sends.length,
-			budget: MAX_KEEPER_TG_SENDS_24H,
-			lastSendAt: newestSendAt ? new Date(newestSendAt).toISOString() : null,
-		};
-
-		// RED only on a *current* breach: over budget AND a send within the recency
-		// window. A spike that's over budget but already stopped is healing — report
-		// green-with-`clearing` so the window can roll over without paging the operator.
-		if (overBudget && recentBreach) {
+		if (rows.length > 0) {
+			const latest = new Date(rows[0].startedAt).toISOString();
 			throw new Error(
-				`notification-budget RED: keeper sent ${sends.length} Telegram escalations in 24h ` +
-					`(budget ${MAX_KEEPER_TG_SENDS_24H}, ADR-005 P1), most recent at ${summary.lastSendAt}. ` +
-					`The heartbeat-shape push is regressing NOW — check buildKeeperTask() + keeper.md.`,
+				`keeper-retired RED: ${rows.length} agent_run(s) with agent_id LIKE '%keeper%' ` +
+					`found after ADR-008 retirement date (${new Date(RETIREMENT_DATE_MS).toISOString().slice(0, 10)}). ` +
+					`Latest at ${latest} (source: ${rows[0].sourceMessage ?? 'unknown'}). ` +
+					`The keeper roster seed was re-added or a manual dispatch ran — ` +
+					`check seed-roster.ts and ~/.claude/agents/keeper.md.`,
 			);
 		}
-		return { ok: true, clearing: overBudget && !recentBreach, ...summary };
+
+		return {
+			ok: true,
+			keeperRunsAfterRetirement: 0,
+			retirementDate: new Date(RETIREMENT_DATE_MS).toISOString(),
+			detail: 'keeper fully retired — zero agent_runs after ADR-008 retirement date',
+		};
 	};
 }

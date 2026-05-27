@@ -49,6 +49,9 @@ interface DecisionRow {
 	falsifierDaysAway: number | null;
 	tags: string[];
 	blockedBy: string[];
+	/** projects-graph ADR-025 D5 — routing inputs for DecisionActions D5 UX. */
+	work_type: string | null;
+	assignee: string | null;
 	/** ADR-LEVEL phase milestones — only `source: 'adr-body'` phases
 	 *  (in-body markers like `**Phase 1 SHIPPED**`). Project-level roadmap
 	 *  phases were retired by project-phases ADR-013 (2026-05-18): the
@@ -508,6 +511,9 @@ export const GET: RequestHandler = async ({ url }) => {
 						falsifierDaysAway: falsifier ? daysBetween(falsifier) : null,
 						tags: asStringArray(full.meta.tags),
 						blockedBy: asStringArray(full.meta.blocked_by ?? full.meta.blockedBy),
+						// projects-graph ADR-025 D5 — routing inputs for the D5 button model.
+						work_type: typeof full.meta.work_type === 'string' ? full.meta.work_type : null,
+						assignee: typeof full.meta.assignee === 'string' ? full.meta.assignee : null,
 					};
 					decisions.push(row);
 					phaseTargets.push({ row, body: full.content, meta: full.meta });

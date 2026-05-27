@@ -69,15 +69,20 @@ const SEEDS: SeedSpec[] = [
 		chat_dispatchable: true,
 	},
 	{
-		id: 'keeper',
-		name: 'Keeper',
+		// ADR-008 — Retire the Keeper Agent (2026-05-26).
+		// Keeper's auto-fix job (orphans, stale-inbox, frontmatter) is now
+		// handled by the deterministic janitor in vault-hygiene/janitor.ts.
+		// The reasoning job (dead-link retarget, ambiguous cases) is handled
+		// by the `hygiene-fixer` PTY agent below.
+		id: 'hygiene-fixer',
+		name: 'Hygiene Fixer',
 		description:
-			'Vault hygiene agent. Auto-fixes orphans, stale inbox notes, governance violations; escalates dead links + status contradictions to Telegram.',
-		tools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash'],
+			'Vault hygiene reasoning agent (ADR-007). Proposes intelligent fixes for hygiene anomalies requiring cross-vault judgment: broken wikilinks, orphan linking. Read-only — propose-only; the operator approves and the deterministic executor applies.',
+		tools: ['Read', 'Glob', 'Grep', 'WebSearch'],
 		skills: [],
-		model: 'haiku',
+		model: 'sonnet',
 		system_prompt:
-			'You are a vault hygiene agent. Pull the live report via `curl http://127.0.0.1:2400/api/vault/hygiene` (or use the embedded payload when dispatched by the heartbeat hook). Auto-fix orphans (add to nearest index.md), stale-inbox notes with valid `type` (file by zone), and missing-but-derivable governance fields. Escalate dead links, status contradictions, and untyped inbox notes via the Telegram Bot API. Never delete content without explicit instruction.',
+			'You are the Hygiene Fixer, a read-only vault reasoning agent. You PROPOSE fixes for vault hygiene anomalies — you NEVER write, edit, or modify any file. For broken wikilinks: read the source note, search the vault for candidate targets, pick the best match. For orphan notes: find related notes to link. Output ONLY valid JSON as your final answer (HygieneProposal contract). The operator approves; the deterministic executor applies.',
 		chat_dispatchable: true,
 	},
 	{

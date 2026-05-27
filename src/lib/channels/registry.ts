@@ -8,6 +8,7 @@ import type {
 } from './types.js';
 import { adapter as telegramAdapter, bootstrap as telegramBootstrap } from './telegram/index.js';
 import { adapter as whatsappAdapter, bootstrap as whatsappBootstrap } from './whatsapp/index.js';
+import { adapter as webAdapter, bootstrap as webBootstrap } from './web/index.js';
 
 /** All registered channel adapters */
 const adapters = new Map<string, ChannelAdapter>();
@@ -15,6 +16,9 @@ const adapters = new Map<string, ChannelAdapter>();
 // Register built-in adapters
 adapters.set('telegram', telegramAdapter);
 adapters.set('whatsapp', whatsappAdapter);
+// ADR-003 — web channel: always-configured, no external credentials.
+// Turns flow through POST /api/chat/web, not through this adapter's send().
+adapters.set('web', webAdapter);
 
 // Wire the WhatsApp inbound dispatcher and auto-start when settings has
 // `channels.whatsapp.enabled: true` + creds on disk. Safe no-op otherwise.
@@ -25,6 +29,9 @@ whatsappBootstrap();
 // /api/channels/telegram/setup so it runs once when the user wires the
 // channel up — not on every restart.
 telegramBootstrap();
+
+// Web channel bootstrap is a no-op but called for parity.
+webBootstrap();
 
 /** Get all registered adapter metadata (for settings UI) */
 export function getAllChannelMeta(): ChannelMeta[] {

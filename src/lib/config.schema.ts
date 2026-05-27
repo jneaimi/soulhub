@@ -56,6 +56,11 @@ export const FeaturesSchema = z.object({
 	// command center develops features before they ship, so it wants this OFF
 	// (default false). The public export seeds it true in release-export.sh.
 	updateCheck: z.boolean().default(false),
+	// ADR-016 — operator-only deploy-pending detector + one-click rebuild &
+	// reload banner. Default ON for the operator's private instance (which
+	// benefits from the guard); the public export seeds it OFF (public installs
+	// don't use pm2 in the same way and have no local HEAD to track).
+	localRedeploy: z.boolean().default(true),
 });
 export type FeaturesConfig = z.infer<typeof FeaturesSchema>;
 

@@ -85,6 +85,16 @@ export interface InboxDecisionIssue {
 	recommendation?: InboxRouteRecommendation;
 }
 
+/** ADR-009 — Implementation drift: the ADR slug appears in a `git log main`
+ *  commit but the status is still `proposed` or `accepted`. */
+export interface AdrImplementationDriftIssue {
+	path: string;
+	project: string | null;
+	slug: string;
+	currentStatus: 'proposed' | 'accepted';
+	mergeEvidence: string;
+}
+
 export interface HygieneTotals {
 	indexed: number;
 	orphans: number;
@@ -94,6 +104,9 @@ export interface HygieneTotals {
 	governanceViolations: number;
 	misplacedNotes: number;
 	inboxDecisions: number;
+	/** ADR-009 — ADRs that are still `proposed`/`accepted` but whose code
+	 *  has already merged to main. */
+	adrImplementationDrift: number;
 }
 
 export interface HygieneReport {
@@ -107,6 +120,8 @@ export interface HygieneReport {
 	governanceViolations: GovernanceViolationIssue[];
 	misplacedNotes: MisplacedNoteIssue[];
 	inboxDecisions: InboxDecisionIssue[];
+	/** ADR-009 — implementation drift: code merged to main but ADR status stale. */
+	adrImplementationDrift: AdrImplementationDriftIssue[];
 }
 
 /** Heartbeat dispatch threshold — defaults match ADR-010 open Q2.

@@ -28,6 +28,11 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { sendText } from '../channels/telegram/outbound.js';
+// ADR-006 P1.0 — canonical key fn lives in suppression-reader.ts. Import
+// for local use; re-export so existing callers of vault-escalator.ts don't
+// need to change their import paths.
+import { vaultHygieneKeyFor } from './suppression-reader.js';
+export { vaultHygieneKeyFor };
 import {
 	buildFixBatchKeyboard,
 	buildVaultHygieneOrphanKeyboard,
@@ -70,13 +75,6 @@ interface SuppressionEntry {
 	key?: string;
 	bucket: string;
 	until: string;
-}
-
-/** Build the composite key for a broken-link suppression. Uses the
- *  source path + literal raw text so multiple broken links in the
- *  same file can be suppressed independently. */
-export function vaultHygieneKeyFor(source: string, raw: string): string {
-	return `${source}::${raw}`;
 }
 
 async function loadActiveSuppressions(bucket: string): Promise<Set<string>> {

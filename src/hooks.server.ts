@@ -18,12 +18,14 @@ import { hygieneButtonEscalatorFactory } from '$lib/scheduler/handlers/hygiene-b
 import { auditAssumptionRateFactory } from '$lib/scheduler/handlers/audit-assumption-rate.js';
 import { auditNudgeTelegramFactory } from '$lib/scheduler/handlers/audit-nudge-telegram.js';
 import { adrStatusDriftWeeklyFactory } from '$lib/scheduler/handlers/adr-status-drift-weekly.js';
+import { adrImplementationDriftWeeklyFactory } from '$lib/scheduler/handlers/adr-implementation-drift-weekly.js';
 import { heartbeatTaskFactory } from '$lib/scheduler/handlers/heartbeat.js';
 import { vaultHygieneTaskFactory } from '$lib/scheduler/handlers/vault-hygiene.js';
 import { hygieneDigestFactory } from '$lib/scheduler/handlers/hygiene-digest.js';
 import { contractFalsifierFactory } from '$lib/scheduler/handlers/contract-falsifier.js';
 import { notificationBudgetFalsifierFactory } from '$lib/scheduler/handlers/notification-budget-falsifier.js';
 import { operatorNotificationBudgetFalsifierFactory } from '$lib/scheduler/handlers/operator-notification-budget-falsifier.js';
+import { hygieneAgentProposeOnlyCheckFactory } from '$lib/scheduler/handlers/hygiene-agent-propose-only-check.js';
 import { updateCheckTaskFactory } from '$lib/scheduler/handlers/update-check.js';
 import { initVault, getVaultEngine } from '$lib/vault/index.js';
 import { initSystemHealth, getSystemHealth } from '$lib/system/index.js';
@@ -37,11 +39,15 @@ import {
 import { getCrmDb, closeCrmDb } from '$lib/crm/index.js';
 import { getFetchPageDb, closeFetchPageDb } from '$lib/fetch-page/index.js';
 import { initAgentsWatcher, shutdownAgentsWatcher } from '$lib/agents/watcher.js';
-import { sweepInterruptedRuns, sweepAbandonedBudgetApprovals } from '$lib/agents/runs.js';
+import { sweepInterruptedRuns, sweepAbandonedBudgetApprovals, sweepAbandonedOperatorInputs } from '$lib/agents/runs.js';
+import { pruneWorktrees } from '$lib/orchestration/worktree.js';
+import { expandHome } from '$lib/agents/dispatch/worktree-provision.js';
 import { seedDefaultsIfEmpty } from '$lib/explorer-roots.js';
 import { soulHubDataDir, soulHubSettingsPath } from '$lib/paths.js';
 import '$lib/secrets.js'; // Load platform secrets into process.env at startup
 import { existsSync } from 'node:fs';
+import { reconcileRedeployStatusOnBoot } from '$lib/redeploy/index.js';
+import { BUILD_SHA } from '$lib/build-info.js';
 
 const DATA_DIR = soulHubDataDir();
 
@@ -146,6 +152,15 @@ try {
 	console.error('[agents/runs] interrupted-run sweep failed:', err);
 }
 
+// ADR-010 (soul-hub-agents) — prune stale git-worktree bookkeeping left by
+// coding dispatches whose worktree dir was already removed (e.g. after a ship
+// or a crash). `git worktree prune` only clears admin entries for directories
+// that no longer exist — it never touches a live worktree pending human review,
+// so it's safe to run unconditionally on boot. Best-effort + detached.
+void pruneWorktrees(expandHome('~/dev/soul-hub'))
+	.then((n) => { if (n > 0) console.log(`[agents/worktree] pruned ${n} stale worktree entr${n === 1 ? 'y' : 'ies'} on startup`); })
+	.catch((err) => console.error('[agents/worktree] boot prune failed (non-fatal):', (err as Error).message));
+
 // ADR-006 Phase 2 — sweep budget-approval runs the operator never actioned
 // (still `awaiting-budget-approval` past the 6h window) to `budget-exceeded`.
 try {
@@ -153,6 +168,28 @@ try {
 	if (swept > 0) console.log(`[agents/runs] swept ${swept} abandoned budget-approval run(s) on startup`);
 } catch (err) {
 	console.error('[agents/runs] budget-approval sweep failed:', err);
+}
+
+// ADR-026 P2 — sweep operator-input runs the operator never answered
+// (still `awaiting-operator-input` past the 6h window) to `timeout`.
+try {
+	const swept = sweepAbandonedOperatorInputs();
+	if (swept > 0) console.log(`[agents/runs] swept ${swept} abandoned operator-input run(s) on startup`);
+} catch (err) {
+	console.error('[agents/runs] operator-input sweep failed:', err);
+}
+
+// ADR-018 — reconcile any non-terminal redeploy status left frozen when the
+// detached worker was killed by its own `pm2 reload` before it could write
+// `done`. A fresh server start proves no redeploy is still in flight, so we
+// derive truth from BUILD_SHA: matching toSha → done; mismatch → failed.
+// Gated on localRedeploy to skip on public installs that never write the file.
+if (config.features.localRedeploy === true) {
+	try {
+		reconcileRedeployStatusOnBoot(BUILD_SHA);
+	} catch (err) {
+		console.error('[redeploy] boot reconcile failed (non-fatal):', err);
+	}
 }
 
 // Register built-in task handlers. Must happen BEFORE initSchedulerCore
@@ -220,6 +257,11 @@ try {
 		'Weekly digest of ADRs whose frontmatter status disagrees with body Status section (per soul-hub/decisions/2026-05-18-adr-status-body-frontmatter-consistency).',
 	);
 	registerTaskHandler(
+		'adr-implementation-drift-weekly',
+		adrImplementationDriftWeeklyFactory,
+		'soul-hub-hygiene ADR-009 — Weekly digest of ADRs still proposed/accepted whose slug appears in a git log main merge commit. Detect-only; surfaces "Mark shipped" / "Not yet" via /hygiene dashboard.',
+	);
+	registerTaskHandler(
 		'heartbeat',
 		heartbeatTaskFactory,
 		'ADR-001 P3 — proactive ambient-agent tick (runHeartbeatOnce). Fires every 30m; internal active-hours/mute/cap gates no-op outside the window. Replaces the engine\'s retired private timer.',
@@ -227,7 +269,7 @@ try {
 	registerTaskHandler(
 		'vault-hygiene',
 		vaultHygieneTaskFactory,
-		'ADR-001 P3 — keeper auto-fix + escalation tick (tickVaultHygiene), decoupled from the heartbeat onto its own 30m cadence.',
+		'ADR-001 P3 / ADR-008 — deterministic janitor pass (tickVaultHygiene): orphans→index, stale-inbox→zone, frontmatter backfill. Keeper retired 2026-05-26.',
 	);
 	registerTaskHandler(
 		'hygiene-digest',
@@ -242,12 +284,17 @@ try {
 	registerTaskHandler(
 		'notification-budget-falsifier',
 		notificationBudgetFalsifierFactory,
-		'soul-hub-governance ADR-002 — falsifier for the notification-budget contract: counts keeper heartbeat Telegram escalations in 24h and errors red on /hygiene if >1 (ADR-005 P1 ≤1/day NFR).',
+		'soul-hub-governance ADR-002 / ADR-008 — keeper-retirement falsifier: asserts zero agent_runs with keeper agent_id after ADR-008 retirement date (2026-05-26). Red on any post-retirement keeper run.',
 	);
 	registerTaskHandler(
 		'operator-notification-budget-falsifier',
 		operatorNotificationBudgetFalsifierFactory,
 		'soul-hub-governance ADR-004 — falsifier for the operator-notification-budget contract: counts digest-tier operator sends in 24h and errors red on /hygiene if over budget (convergence pile-creep guard).',
+	);
+	registerTaskHandler(
+		'hygiene-agent-propose-only-check',
+		hygieneAgentProposeOnlyCheckFactory,
+		'ADR-007 P1 — falsifier for hygiene-agent-propose-only contract: asserts zero vault writes attributed to the hygiene-fixer agent (propose-only boundary). Must be green before first fixer dispatch.',
 	);
 	registerTaskHandler(
 		'update-check',

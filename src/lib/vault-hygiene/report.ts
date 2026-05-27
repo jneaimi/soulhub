@@ -2,14 +2,24 @@
  *  endpoint and heartbeat hook both call. Pulls fresh data from the
  *  live vault engine — applies a 5-minute staleness guard so PM2
  *  cold-starts don't return data from before the watcher caught up
- *  (per ADR-010 open Q1 decision: trust + staleness guard). */
+ *  (per ADR-010 open Q1 decision: trust + staleness guard).
+ *
+ *  ADR-006 P1.0 — the report now filters suppressed items before returning
+ *  them. Suppression keys use the 4-consumer cross-language contract
+ *  (actions.ts write / vault-escalator.ts TS read / project_hygiene.py
+ *  Python read / this reader). Key schema:
+ *    unresolved bucket → composite `${source}::${raw}` (vaultHygieneKeyFor)
+ *    all other buckets → bare note path
+ *  An expired suppression (until <= today) must NOT hide the item. */
 
 import { getVaultEngine } from '../vault/index.js';
 import { getStaleInbox } from './stale-inbox.js';
 import { getStatusContradictions } from './status-contradictions.js';
 import { getMisplacedNotes } from './misplaced-notes.js';
 import { getInboxDecisions } from './inbox-decisions.js';
+import { getAdrImplementationDrift } from './adr-implementation-drift.js';
 import { computeHealthScore } from './health-score.js';
+import { loadSuppressedKeys, vaultHygieneKeyFor } from './suppression-reader.js';
 import { ISSUE_LIST_CAP } from './types.js';
 import type { HygieneReport, OrphanIssue, UnresolvedIssue } from './types.js';
 
@@ -76,25 +86,66 @@ export async function getHygieneReport(): Promise<HygieneReport> {
 			suggestedFix: `Fuzzy-match \`${u.raw}\` against vault titles in \`${u.source}\` directory; correct the link or remove the line.`,
 		}));
 
-	const staleInbox = getStaleInbox(engine);
-	const statusContradictions = getStatusContradictions(engine);
+	const staleInboxRaw = getStaleInbox(engine);
+	const statusContradictionsRaw = getStatusContradictions(engine);
 	const governanceViolationsRaw = engine.getGovernanceViolations();
 	const governanceViolations = governanceViolationsRaw.map((v) => ({
 		path: v.path,
 		violations: v.violations,
 	}));
-	const misplacedNotes = getMisplacedNotes(engine);
+	const misplacedNotesRaw = getMisplacedNotes(engine);
 	const inboxDecisions = getInboxDecisions();
+	// ADR-009 — async git check; runs a single bounded `git log main` call.
+	// Failures are caught inside getAdrImplementationDrift (returns []).
+	const adrImplementationDriftRaw = await getAdrImplementationDrift(engine);
+
+	// ADR-006 P1.0 — load active suppressions for every actionable bucket so
+	// dismissed items disappear from the report until their suppression expires.
+	// Failures are silently swallowed (empty Set) so a missing suppressions file
+	// never breaks the report. All six bucket loads run in parallel.
+	const [
+		suppressedOrphans,
+		suppressedUnresolved,
+		suppressedStale,
+		suppressedStatus,
+		suppressedMisplaced,
+		suppressedImplDrift,
+	] = await Promise.all([
+		loadSuppressedKeys('orphan_note'),
+		loadSuppressedKeys('unresolved'),
+		loadSuppressedKeys('stale_inbox_item'),
+		loadSuppressedKeys('status_contradiction'),
+		loadSuppressedKeys('misplaced_note'),
+		loadSuppressedKeys('adr_implementation_drift'),
+	]);
+
+	// Apply suppression filters. Keys match the 4-consumer cross-language
+	// contract: `${source}::${raw}` for unresolved (vaultHygieneKeyFor),
+	// bare path for every other bucket.
+	const orphansFiltered = orphans.filter((o) => !suppressedOrphans.has(o.path));
+	const unresolvedFiltered = unresolved.filter(
+		(u) => !suppressedUnresolved.has(vaultHygieneKeyFor(u.source, u.raw)),
+	);
+	const staleInbox = staleInboxRaw.filter((s) => !suppressedStale.has(s.path));
+	const statusContradictions = statusContradictionsRaw.filter(
+		(sc) => !suppressedStatus.has(sc.path),
+	);
+	const misplacedNotes = misplacedNotesRaw.filter((m) => !suppressedMisplaced.has(m.path));
+	// ADR-009 — bare path key (same as orphan/stale/status_contradiction buckets).
+	const adrImplementationDrift = adrImplementationDriftRaw.filter(
+		(d) => !suppressedImplDrift.has(d.path),
+	);
 
 	const totals = {
 		indexed: stats.totalNotes,
-		orphans: orphans.length,
-		unresolved: unresolved.length,
+		orphans: orphansFiltered.length,
+		unresolved: unresolvedFiltered.length,
 		staleInbox: staleInbox.length,
 		statusContradictions: statusContradictions.length,
 		governanceViolations: governanceViolations.length,
 		misplacedNotes: misplacedNotes.length,
 		inboxDecisions: inboxDecisions.length,
+		adrImplementationDrift: adrImplementationDrift.length,
 	};
 
 	return {
@@ -104,12 +155,13 @@ export async function getHygieneReport(): Promise<HygieneReport> {
 		// Cap the issue lists in the report payload so a 458-orphan vault
 		// doesn't blow up the keeper prompt or the API response. Totals
 		// remain accurate; the lists are a triage sample.
-		orphans: orphans.slice(0, ISSUE_LIST_CAP),
-		unresolved: unresolved.slice(0, ISSUE_LIST_CAP),
+		orphans: orphansFiltered.slice(0, ISSUE_LIST_CAP),
+		unresolved: unresolvedFiltered.slice(0, ISSUE_LIST_CAP),
 		staleInbox: staleInbox.slice(0, ISSUE_LIST_CAP),
 		statusContradictions: statusContradictions.slice(0, ISSUE_LIST_CAP),
 		governanceViolations: governanceViolations.slice(0, ISSUE_LIST_CAP),
 		misplacedNotes: misplacedNotes.slice(0, ISSUE_LIST_CAP),
 		inboxDecisions: inboxDecisions.slice(0, ISSUE_LIST_CAP),
+		adrImplementationDrift: adrImplementationDrift.slice(0, ISSUE_LIST_CAP),
 	};
 }

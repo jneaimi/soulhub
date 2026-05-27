@@ -129,8 +129,9 @@ export interface ToolDeps {
 	timezone?: string;
 	/** ADR-025 — chat channel for this turn. `scheduleReminder` reads this
 	 *  to refuse off-channel (Telegram has no heartbeat reader for
-	 *  commitments). Undefined → tool degrades to graceful refusal. */
-	channel?: 'whatsapp' | 'telegram';
+	 *  commitments). ADR-003 adds 'web'. Undefined → tool degrades to
+	 *  graceful refusal. */
+	channel?: 'whatsapp' | 'telegram' | 'web';
 	/** ADR-025 — reminders config snapshot. Gates `scheduleReminder`. */
 	remindersConfig?: RemindersConfigSlice;
 	/** ADR-025 — heartbeat config snapshot. `scheduleReminder` uses this to

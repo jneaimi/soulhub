@@ -39,6 +39,9 @@
 		falsifierDaysAway: number | null;
 		tags: string[];
 		blockedBy: string[];
+		/** projects-graph ADR-025 D5 — routing inputs for DecisionActions. */
+		work_type?: string | null;
+		assignee?: string | null;
 		phases?: Phase[];
 	}
 
@@ -177,6 +180,14 @@
 	let loading = $state(true);
 	let error = $state('');
 	let drawerPath = $state<string | null>(null);
+	/** projects-graph ADR-025 D5 — when set, the drawer opens + auto-dispatches once. */
+	let drawerAutoDispatch = $state(false);
+	/** projects-graph ADR-025 D5 — live roster loaded ONCE; passed to every
+	 *  DecisionActions row so no per-row fetch is needed. */
+	let agentIds = $state<Set<string>>(new Set());
+	/** ADR-014 D1 — repo map populated alongside agentIds; passed to DecisionActions
+	 *  so the AI button is hidden when the resolved coding agent has no repo. */
+	let agentRepos = $state<Map<string, string | undefined>>(new Map());
 
 	// projects-graph ADR-011 — breadcrumb + sibling switcher.
 	// The full project list is fetched once on mount and used to derive the
@@ -236,10 +247,15 @@
 	let worklistError = $state('');
 	let worklistLoaded = $state(false);
 
-	async function loadWorklist() {
-		if (worklistLoaded || worklistLoading) return;
-		worklistLoading = true;
-		worklistError = '';
+	// projects-graph ADR-026 — silent mode: bypass the one-shot guard, don't
+	// toggle the loading spinner, and don't clear existing data on error (avoids
+	// flicker on background polls). First-load behavior is unchanged.
+	async function loadWorklist({ silent = false }: { silent?: boolean } = {}) {
+		if (!silent && (worklistLoaded || worklistLoading)) return;
+		if (!silent) {
+			worklistLoading = true;
+			worklistError = '';
+		}
 		try {
 			const res = await fetch(`/api/vault/projects/${encodeURIComponent(slug)}/worklist`);
 			if (!res.ok) {
@@ -250,15 +266,25 @@
 			worklist = data.lanes ?? null;
 			worklistLoaded = true;
 		} catch (e) {
-			worklistError = e instanceof Error ? e.message : 'Failed to load worklist';
+			if (!silent) worklistError = e instanceof Error ? e.message : 'Failed to load worklist';
+			// silent: preserve existing data on error — avoids flicker
 		} finally {
-			worklistLoading = false;
+			if (!silent) worklistLoading = false;
 		}
 	}
 
 	// Fetch the worklist the first time the operator switches to the Work view.
 	$effect(() => {
 		if (view === 'work') loadWorklist();
+	});
+
+	// projects-graph ADR-026 — poll every ≈4 s while on the Work view so a run
+	// that starts after initial load appears in the in_flight lane without a
+	// manual reload. The interval auto-clears when leaving the view or unmounting.
+	$effect(() => {
+		if (view !== 'work') return;
+		const id = setInterval(() => loadWorklist({ silent: true }), 4000);
+		return () => clearInterval(id);
 	});
 
 	// `[slug]` route — params.slug is always present at runtime; SvelteKit
@@ -457,6 +483,35 @@
 			nextActions = await res.json();
 		} catch {
 			nextActions = null;
+		}
+	}
+
+	/** projects-graph ADR-025 D5 — load the live roster ONCE on mount.
+	 *  Mirrors AdrDrawer.loadAgentIds(). Passed to every DecisionActions row
+	 *  so no per-row fetch is needed.
+	 *  ADR-014 D1 — also captures repo so routing refuses repo-less coding agents. */
+	async function loadAgentIds() {
+		if (agentIds.size > 0) return;
+		try {
+			const res = await fetch('/api/agents');
+			if (!res.ok) return;
+			const data = await res.json();
+			const list = Array.isArray(data) ? data : (data.agents ?? data.results ?? []);
+			const newIds = new Set<string>();
+			const newRepos = new Map<string, string | undefined>();
+			for (const a of list as Array<{ id?: string; repo?: string }>) {
+				const id = (a.id ?? '').toLowerCase();
+				if (!id) continue;
+				newIds.add(id);
+				newRepos.set(
+					id,
+					typeof a.repo === 'string' && a.repo.trim() ? a.repo.trim() : undefined,
+				);
+			}
+			agentIds = newIds;
+			agentRepos = newRepos;
+		} catch {
+			/* roster unavailable — DecisionActions falls back to plain Accept */
 		}
 	}
 
@@ -659,7 +714,7 @@
 		return `>30 days away — on track`;
 	}
 
-	$effect(() => { if (slug) load(); });
+	$effect(() => { if (slug) { load(); loadAgentIds(); } });
 
 	// projects-graph ADR-013 — auto-expand Plan widget when the project is
 	// small (< 5 ADRs) and the operator hasn't manually collapsed it before.
@@ -1247,7 +1302,17 @@
 											</h3>
 											<p class="text-[11px] text-hub-dim font-mono truncate mt-1">{d.path}</p>
 										</button>
-										<DecisionActions path={d.path} size="md" onTransition={handleTransition} />
+										<DecisionActions
+											path={d.path}
+											size="md"
+											onTransition={handleTransition}
+											work_type={d.work_type ?? null}
+											assignee={d.assignee ?? null}
+											tags={d.tags}
+											{agentIds}
+											{agentRepos}
+											onDispatch={(p) => { drawerPath = p; drawerAutoDispatch = true; }}
+										/>
 									</div>
 									{#if d.tags.length > 0}
 										<div class="flex flex-wrap items-center gap-1 mt-2">
@@ -1458,6 +1523,8 @@
 
 <AdrDrawer
 	path={drawerPath}
-	onClose={() => drawerPath = null}
+	autoDispatch={drawerAutoDispatch}
+	onClose={() => { drawerPath = null; drawerAutoDispatch = false; loadWorklist({ silent: true }); }}
 	onTransition={handleTransition}
+	onDispatch={(p) => { drawerPath = p; drawerAutoDispatch = true; }}
 />

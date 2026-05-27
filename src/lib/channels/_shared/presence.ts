@@ -28,7 +28,7 @@ import { placeholderTextForRoute, type PlaceholderOpts } from './placeholder.js'
 
 export interface PresenceAdapter {
 	/** Channel name — used in logs and intent_log. */
-	channel: 'whatsapp' | 'telegram';
+	channel: 'whatsapp' | 'telegram' | 'web';
 	/** Send a fresh text message. Returns the message id for later edit
 	 *  if the channel can edit; returns no id (or an ok=false) when the
 	 *  send itself fails. */

@@ -32,6 +32,10 @@ const PENALTIES: Record<keyof HygieneTotals, Penalty | null> = {
 	// transactional). Capped at 15 so a backlog doesn't dominate the
 	// score but is visible.
 	inboxDecisions: { perItem: 1, max: 15 },
+	// ADR-009 — implementation drift: code shipped but ADR status stale.
+	// Same weight as status contradictions (3 pts) but capped lower (10)
+	// because this is a documentation gap, not a correctness failure.
+	adrImplementationDrift: { perItem: 3, max: 10 },
 };
 
 export function computeHealthScore(totals: HygieneTotals): number {

@@ -13,12 +13,23 @@
 		falsifierDaysAway: number | null;
 		tags: string[];
 		blockedBy: string[];
+		/** projects-graph ADR-025 D5 — routing inputs for DecisionActions. */
+		work_type: string | null;
+		assignee: string | null;
 	}
 
 	let rows = $state<QueueRow[]>([]);
 	let loading = $state(true);
 	let error = $state('');
 	let drawerPath = $state<string | null>(null);
+	/** projects-graph ADR-025 D5 — when set, the drawer opens + auto-dispatches once. */
+	let drawerAutoDispatch = $state(false);
+	/** projects-graph ADR-025 D5 — live roster loaded ONCE on mount.
+	 *  Passed to every DecisionActions so no per-row fetch is needed. */
+	let agentIds = $state<Set<string>>(new Set());
+	/** ADR-014 D1 — repo map populated alongside agentIds; passed to DecisionActions
+	 *  so the AI button is hidden when the resolved coding agent has no repo. */
+	let agentRepos = $state<Map<string, string | undefined>>(new Map());
 
 	async function load() {
 		error = '';
@@ -53,7 +64,34 @@
 		return `${daysAway}d → ${date}`;
 	}
 
-	onMount(() => { load(); });
+	/** projects-graph ADR-025 D5 — load the live roster ONCE.
+	 *  Mirrors the same logic in AdrDrawer.loadAgentIds().
+	 *  ADR-014 D1 — also captures repo so routing refuses repo-less coding agents. */
+	async function loadAgentIds() {
+		try {
+			const res = await fetch('/api/agents');
+			if (!res.ok) return;
+			const data = await res.json();
+			const list = Array.isArray(data) ? data : (data.agents ?? data.results ?? []);
+			const newIds = new Set<string>();
+			const newRepos = new Map<string, string | undefined>();
+			for (const a of list as Array<{ id?: string; repo?: string }>) {
+				const id = (a.id ?? '').toLowerCase();
+				if (!id) continue;
+				newIds.add(id);
+				newRepos.set(
+					id,
+					typeof a.repo === 'string' && a.repo.trim() ? a.repo.trim() : undefined,
+				);
+			}
+			agentIds = newIds;
+			agentRepos = newRepos;
+		} catch {
+			/* roster unavailable — DecisionActions falls back to plain Accept */
+		}
+	}
+
+	onMount(() => { load(); loadAgentIds(); });
 </script>
 
 <svelte:head>
@@ -134,7 +172,17 @@
 									</h3>
 									<p class="text-[11px] text-hub-dim font-mono truncate mt-1">{row.path}</p>
 								</button>
-								<DecisionActions path={row.path} size="md" onTransition={handleTransition} />
+								<DecisionActions
+									path={row.path}
+									size="md"
+									onTransition={handleTransition}
+									work_type={row.work_type}
+									assignee={row.assignee}
+									tags={row.tags}
+									{agentIds}
+									{agentRepos}
+									onDispatch={(p) => { drawerPath = p; drawerAutoDispatch = true; }}
+								/>
 							</div>
 
 							{#if row.tags.length > 0}
@@ -157,6 +205,8 @@
 
 <AdrDrawer
 	path={drawerPath}
-	onClose={() => drawerPath = null}
+	autoDispatch={drawerAutoDispatch}
+	onClose={() => { drawerPath = null; drawerAutoDispatch = false; }}
 	onTransition={handleTransition}
+	onDispatch={(p) => { drawerPath = p; drawerAutoDispatch = true; }}
 />

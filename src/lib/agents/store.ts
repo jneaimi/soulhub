@@ -71,6 +71,9 @@ interface ClaudeMdFrontmatter {
 	/** Soul Hub extension. Claude Code ignores unknown frontmatter keys, so
 	 *  this travels safely alongside the agent's main spec. */
 	budget?: { max_usd?: number; max_turns?: number; timeout_sec?: number; ceiling_usd?: number; ceiling_turns?: number };
+	/** ADR-010 — repo this agent operates on (triggers per-run worktree
+	 *  provisioning on dispatch). Soul Hub extension; Claude Code ignores it. */
+	repo?: string;
 }
 
 /** Parse `~/.claude/agents/<id>.md`. Tools is a comma-separated string per Anthropic's
@@ -139,6 +142,7 @@ function parseLaneA(filePath: string): AgentSummary | null {
 			: undefined,
 		allow_subagents: fm.allow_subagents === true,
 		budget: extractBudget(fm.budget),
+		repo: typeof fm.repo === 'string' && fm.repo.trim().length > 0 ? fm.repo.trim() : undefined,
 	};
 }
 

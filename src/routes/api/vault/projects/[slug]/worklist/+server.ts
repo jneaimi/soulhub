@@ -18,12 +18,30 @@
  *  rejected/superseded are terminal and excluded. Pure read transform over
  *  engine.getNotes(); no explicit cache. */
 
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { RequestHandler } from './$types';
 import { json } from '@sveltejs/kit';
 import { getVaultEngine } from '$lib/vault/index.js';
 import { listAgents } from '$lib/agents/store.js';
-import { listRunningSubjectPaths } from '$lib/agents/runs.js';
+import {
+	listRunningRuns,
+	listAwaitingOperatorInput,
+	listReviewableRuns,
+	listNoArtifactRuns,
+} from '$lib/agents/runs.js';
+import type { RunningRunTelemetry } from '$lib/agents/runs.js';
+import { computeLaneAndProgress } from '$lib/projects/worklist-lane.js';
+import type {
+	AwaitingOperatorPayload,
+	ReviewHandoffPayload,
+	NoArtifactPayload,
+} from '$lib/projects/worklist-lane.js';
+import { safeId } from '$lib/agents/dispatch/worktree-provision.js';
+import { parseHandback, handbackGatesGreen } from '$lib/agents/handback.js';
 import type { VaultMeta } from '$lib/vault/types.js';
+
+const execFileAsync = promisify(execFile);
 
 // projects-graph ADR-021 — design + requirements added so design/brand-heavy
 // legacy projects (e.g. triden) surface their real work, not just decisions.
@@ -56,6 +74,14 @@ interface WorklistItem {
 	/** Subset whose upstream is not shipped (the reason it's gated). */
 	blockedByUnmet: string[];
 	lane: Lane;
+	/** projects-graph ADR-026 — live run telemetry for in_flight items. */
+	progress?: { costUsd: number; numTurns: number; startedAt: number };
+	/** ADR-026 P2b — populated when a paused run is awaiting operator input. */
+	awaitingOperator?: AwaitingOperatorPayload;
+	/** ADR-026 D3 — populated when a finished, un-merged coding run is awaiting review. */
+	reviewHandoff?: ReviewHandoffPayload;
+	/** ADR-012 P1 — populated when a success-like run left no reviewable artifact. */
+	noArtifact?: NoArtifactPayload;
 }
 
 interface WorklistResponse {
@@ -80,10 +106,18 @@ function toSlug(raw: string): string | null {
 	const last = target.split('/').pop() ?? target;
 	return last.replace(/\.md$/i, '') || null;
 }
+/** Inner `[[target|alias]]` → `target` (path or bare slug), for the engine's
+ *  global link resolver. Unlike toSlug it keeps any `../project/...` prefix so
+ *  cross-project blockers resolve to the right note. Null for non-wikilinks. */
+function wikilinkTarget(raw: string): string | null {
+	const m = /^\[\[([^\]|#]+?)(?:\|[^\]]*)?\]\]$/.exec(raw.trim());
+	return m ? m[1].trim() : null;
+}
 
 function asStr(v: unknown): string | null {
 	return typeof v === 'string' && v.trim().length > 0 ? v.trim() : null;
 }
+
 
 function extractTitle(meta: VaultMeta, body: string, slug: string): string {
 	const t = meta.title;
@@ -107,13 +141,107 @@ export const GET: RequestHandler = async ({ params }) => {
 		return agentIds.has(assignee.toLowerCase()) ? 'ai' : 'human';
 	};
 
-	// projects-graph ADR-018 S2b — artifacts with an in-flight agent run sit in
-	// the in_flight lane regardless of their computed readiness.
-	let runningSubjects: Set<string>;
+	// projects-graph ADR-026 — artifacts with an in-flight agent run sit in
+	// the in_flight lane, enriched with live telemetry (cost/turns/elapsed).
+	let runningRuns: Map<string, RunningRunTelemetry>;
 	try {
-		runningSubjects = listRunningSubjectPaths();
+		runningRuns = listRunningRuns();
 	} catch {
-		runningSubjects = new Set(); // runs DB unavailable — lane just stays empty
+		runningRuns = new Map(); // runs DB unavailable — lane just stays empty
+	}
+
+	// ADR-026 P2b — paused runs awaiting an operator answer. The question lives
+	// in error_message prefixed with `OPERATOR_QUESTION: `. Branch is
+	// reconstructed from (startedAt, subjectPath) — no schema change needed.
+	let awaitingBySubject: Map<string, AwaitingOperatorPayload>;
+	try {
+		const awaitingRows = listAwaitingOperatorInput();
+		awaitingBySubject = new Map();
+		for (const row of awaitingRows) {
+			if (!row.subjectPath) continue;
+			const question = (row.errorMessage ?? '').replace(/^OPERATOR_QUESTION:\s*/, '');
+			const sessionId = row.claudeSessionId ?? '';
+			const branch = `orchestration/run-${row.startedAt}/${safeId(row.subjectPath)}`;
+			awaitingBySubject.set(row.subjectPath, {
+				question,
+				sessionId,
+				branch,
+				agentId: row.agentId,
+			});
+		}
+	} catch {
+		awaitingBySubject = new Map(); // DB unavailable — awaiting lane behaves as before
+	}
+
+	// ADR-026 D3 — reviewable (finished, un-merged) runs per subject_path.
+	// We only surface runs whose worktree branch still exists in the repo; a
+	// discarded branch means the run was already handled (merged or abandoned).
+	let reviewBySubject: Map<string, ReviewHandoffPayload>;
+	try {
+		const reviewableRuns = listReviewableRuns();
+
+		// ONE git branch list call for all orchestration/* branches.
+		let liveBranches = new Set<string>();
+		try {
+			const { stdout } = await execFileAsync(
+				'git',
+				['branch', '--list', 'orchestration/*', '--format=%(refname:short)'],
+				{ cwd: process.cwd() },
+			);
+			liveBranches = new Set(
+				stdout
+					.split('\n')
+					.map((b) => b.trim())
+					.filter(Boolean),
+			);
+		} catch {
+			// git unavailable or no orchestration branches — treat all runs as discarded
+		}
+
+		reviewBySubject = new Map();
+		for (const [subjectPath, run] of reviewableRuns) {
+			const branch = `orchestration/run-${run.startedAt}/${safeId(subjectPath)}`;
+			// Only surface if the branch still exists (un-merged) in the repo.
+			if (!liveBranches.has(branch)) continue;
+
+			// ADR-026 D3 — prefer the full untruncated `handback` column; fall
+			// back to `resultExcerpt` for runs predating this migration (null
+			// handback) so existing rows still render something rather than blank.
+			const hb = parseHandback(run.handback ?? run.resultExcerpt);
+			reviewBySubject.set(subjectPath, {
+				branch: hb?.branch ?? branch,
+				summary: hb?.summary ?? '',
+				followUps: hb?.follow_ups ?? [],
+				gatesGreen: hb ? handbackGatesGreen(hb) : false,
+				costUsd: run.costUsd,
+			});
+		}
+	} catch {
+		reviewBySubject = new Map(); // runs DB unavailable — review lane stays empty
+	}
+
+	// ADR-012 P1 — success-like runs that produced no reviewable artifact.
+	// Surfaced in Waiting-on-you with a short summary so they don't fall back
+	// to a silent ready_for_ai. A subject with a live review branch (above)
+	// takes precedence in the lane logic, so we don't need to cross-filter here.
+	let noArtifactBySubject: Map<string, NoArtifactPayload>;
+	try {
+		noArtifactBySubject = new Map();
+		for (const [subjectPath, run] of listNoArtifactRuns()) {
+			// Use the first non-empty line of the excerpt as a one-line summary.
+			const summary =
+				(run.resultExcerpt ?? '')
+					.split('\n')
+					.map((l) => l.trim())
+					.find((l) => l.length > 0) ?? '';
+			noArtifactBySubject.set(subjectPath, {
+				summary: summary.length > 200 ? summary.slice(0, 200) + '…' : summary,
+				costUsd: run.costUsd,
+				numTurns: run.numTurns,
+			});
+		}
+	} catch {
+		noArtifactBySubject = new Map(); // runs DB unavailable — lane stays empty
 	}
 
 	const notes = engine
@@ -145,22 +273,48 @@ export const GET: RequestHandler = async ({ params }) => {
 
 		const assignee = asStr(r.meta.assignee);
 		const owner = classifyOwner(assignee);
-		const blockedBy = asStringArray(r.meta.blocked_by ?? r.meta.blockedBy)
+		const blockedByRaw = asStringArray(r.meta.blocked_by ?? r.meta.blockedBy);
+		const blockedBy = blockedByRaw.map(toSlug).filter((s): s is string => !!s);
+		// A blocker is unmet unless its status is 'shipped'. Project-local
+		// blockers resolve from the fast in-project index; CROSS-PROJECT blockers
+		// resolve through the engine's global link resolver so they're gated on
+		// their real status. (Previously cross-project blockers were treated as
+		// permanently unmet — a soul-hub-agents ADR blocked_by a *shipped*
+		// soul-hub-whatsapp ADR stayed stuck in waiting_on_ai forever.)
+		const blockedByUnmet = blockedByRaw
+			.filter((raw) => {
+				const slug = toSlug(raw);
+				if (!slug) return false;
+				const local = statusBySlug.get(slug);
+				if (local !== undefined) return local !== 'shipped';
+				const target = wikilinkTarget(raw);
+				const resolved = target ? engine.resolveLink(target, r.path) : null;
+				const st = resolved
+					? String(engine.getNote(resolved)?.meta.status ?? '').toLowerCase()
+					: '';
+				return st !== 'shipped';
+			})
 			.map(toSlug)
 			.filter((s): s is string => !!s);
-		// A blocker is unmet when its status is anything other than shipped.
-		// Cross-project blockers (not in this project's index) are conservatively
-		// treated as unmet — the operator resolves them manually.
-		const blockedByUnmet = blockedBy.filter((dep) => statusBySlug.get(dep) !== 'shipped');
 
-		let lane: Lane;
-		if (runningSubjects.has(r.path)) {
-			lane = 'in_flight';
-		} else if (blockedByUnmet.length === 0) {
-			lane = owner === 'ai' ? 'ready_for_ai' : 'ready_for_you';
-		} else {
-			lane = owner === 'ai' ? 'waiting_on_you' : 'waiting_on_ai';
-		}
+		const awaitingOperator = awaitingBySubject.get(r.path);
+		const reviewHandoff = reviewBySubject.get(r.path);
+		const noArtifact = noArtifactBySubject.get(r.path);
+		const {
+			lane,
+			progress,
+			awaitingOperator: awaitingResult,
+			reviewHandoff: reviewResult,
+			noArtifact: noArtifactResult,
+		} = computeLaneAndProgress(
+			r.path,
+			owner,
+			blockedByUnmet,
+			runningRuns,
+			awaitingOperator,
+			reviewHandoff,
+			noArtifact,
+		);
 
 		items.push({
 			id: r.path,
@@ -174,6 +328,10 @@ export const GET: RequestHandler = async ({ params }) => {
 			blockedBy,
 			blockedByUnmet,
 			lane,
+			progress,
+			awaitingOperator: awaitingResult,
+			reviewHandoff: reviewResult,
+			noArtifact: noArtifactResult,
 		});
 	}
 

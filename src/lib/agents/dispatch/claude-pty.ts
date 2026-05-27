@@ -38,6 +38,9 @@ import { claudeCliFlagDispatcher } from './claude-cli-flag.js';
 import { loadAgentRunRecord } from '$lib/sessions/run-record.js';
 import { createRunTail, type RunTail } from '$lib/sessions/run-tail.js';
 import { getLiveGrant, clearLiveGrant } from '../budget-grants.js';
+import { parseAskOperator } from './ask-operator.js';
+
+export { parseAskOperator } from './ask-operator.js';
 
 /** Default silence-after-activity threshold before treating the session as
  *  done. 30s is fine for chat-shaped agents that emit progress text every
@@ -71,6 +74,7 @@ const GOAL_ACHIEVED_RE = /Goal achieved\s*\(([^)]+)\)/i;
  *  because the marker is itself the terminal signal — anything after is
  *  scenery, not content. */
 const GOAL_GRACE_MS = 1500;
+
 
 function resolveStallMs(timeoutMs: number): number {
 	const scaled = Math.floor(timeoutMs / 8);
@@ -146,6 +150,12 @@ export const claudePtyDispatcher: BackendDispatcher = {
 		// emits `end_turn` every iteration, so it keeps the `Goal achieved` marker
 		// as its termination signal (it still reports transcript cost/turns).
 		const liveTail = process.env.PTY_LIVE_TRANSCRIPT !== '0' && !goalActive;
+		// ADR-026 follow-up — tail the transcript for COST/TURNS on ALL backends
+		// (goal-mode included) so the board chip shows live progress. This is
+		// decoupled from `liveTail`: `liveTail` still gates streaming + live
+		// termination/budget kills (which stay non-goal-only); `transcriptTail`
+		// only governs whether a `runTail` exists to read cost from.
+		const transcriptTail = process.env.PTY_LIVE_TRANSCRIPT !== '0';
 		const taskPayload = composePrompt(opts.task, opts.context);
 		const initialPrompt = goalActive ? `/goal ${goalCondition}` : taskPayload;
 
@@ -195,9 +205,12 @@ export const claudePtyDispatcher: BackendDispatcher = {
 		// ADR-004 D1 — begin tailing this run's transcript live (the
 		// `--session-id` set on spawn makes it locatable immediately).
 		let runTail: RunTail | undefined;
-		if (liveTail) {
+		if (transcriptTail) {
 			runTail = createRunTail(sessionUuid, { cwd: config.resolved.vaultDir });
-			console.log(`[agents/claude-pty] live-transcript termination active for ${agent.id}`);
+			console.log(
+				`[agents/claude-pty] transcript tail active for ${agent.id}` +
+					`${liveTail ? ' (live termination + budget)' : ' (cost/turns only — goal-mode)'}`,
+			);
 		}
 
 		// Buffer stdout chunks and a stripped accumulator for the final result.
@@ -216,6 +229,10 @@ export const claudePtyDispatcher: BackendDispatcher = {
 		let goalAchieved = false;
 		let goalMetricsRaw: string | undefined;
 		let goalGraceTimer: ReturnType<typeof setTimeout> | undefined;
+		// ADR-026 P2 — ask-operator detection. Set when parseAskOperator
+		// finds the sentinel in the accumulator. Non-null → session is
+		// killed immediately (agent is blocked waiting for input).
+		let operatorQuestion: string | null = null;
 
 		const onOutput = (data: string) => {
 			lastActivity = Date.now();
@@ -237,6 +254,22 @@ export const claudePtyDispatcher: BackendDispatcher = {
 					goalGraceTimer = setTimeout(() => {
 						if (!exited) killSession(session.id);
 					}, GOAL_GRACE_MS);
+				}
+			}
+			// ADR-026 P2 — ask-operator detection. Scan the ANSI-stripped
+			// accumulator so the marker survives chunk-straddle and cursor
+			// moves. No grace delay — the agent is blocked; kill immediately.
+			// `taskPayload` is passed as the prompt-echo guard: the injected
+			// task is echoed into the PTY, so a sentinel that's part of the
+			// instructions must NOT self-trigger (found live 2026-05-26).
+			if (pausable && !operatorQuestion) {
+				const q = parseAskOperator(stripAnsi(combined), taskPayload);
+				if (q !== null) {
+					operatorQuestion = q;
+					console.log(
+						`[agents/claude-pty] ask-operator from ${agent.id}: "${q.slice(0, 120)}${q.length > 120 ? '…' : ''}" — killing session`,
+					);
+					killSession(session.id);
 				}
 			}
 		};
@@ -295,6 +328,11 @@ export const claudePtyDispatcher: BackendDispatcher = {
 			let ceilingUsd = budget.ceiling_usd;
 			let ceilingTurns = budget.ceiling_turns;
 			let velocityWarned = false;
+			// ADR-026 P3 — live progress dedup: only emit a `progress` event when
+			// cost or turns actually changed since the last tick. Avoids flooding
+			// index.ts with identical updates on idle ticks (200ms loop).
+			let lastProgCost = -1;
+			let lastProgTurns = -1;
 
 			while (!exited) {
 				if (liveTail && runTail) {
@@ -328,6 +366,21 @@ export const claudePtyDispatcher: BackendDispatcher = {
 				// an agent that lands its answer ON the last allowed turn succeeded.
 				if (runTail) {
 					const snap = runTail.snapshot();
+					// ADR-026 P3 — emit a `progress` event whenever cost or turns
+					// changed since the last loop tick. Additive yield only — no
+					// control-flow change. index.ts persists these into the `running`
+					// DB row so the board chip shows live cost/turns mid-run.
+					const sc = snap.costUsd ?? 0;
+					if (sc !== lastProgCost || snap.turns !== lastProgTurns) {
+						lastProgCost = sc;
+						lastProgTurns = snap.turns;
+						yield { type: 'progress' as const, runId, costUsd: sc, numTurns: snap.turns, ts: Date.now() };
+					}
+					// ADR-026 follow-up — live termination + budget kills are liveTail-only
+					// (non-goal). Goal-mode tails for cost/turns (progress yield above) but
+					// keeps its `Goal achieved` termination; transcriptDone/ceilings must
+					// NOT change goal-mode behavior, so everything below stays gated.
+					if (liveTail) {
 					if (snap.done) {
 						transcriptDone = true;
 						killSession(session.id);
@@ -408,6 +461,7 @@ export const claudePtyDispatcher: BackendDispatcher = {
 							};
 						}
 					}
+					} // ADR-026 follow-up — end liveTail-only termination/budget
 				}
 				if (promptInjected && idle >= stallMs) {
 					stalled = true;
@@ -500,6 +554,18 @@ export const claudePtyDispatcher: BackendDispatcher = {
 			// ADR-004 D2 — transcript-confirmed completion is authoritative.
 			if (transcriptDone) {
 				return finish(runId, agent, started, 'success', finalOutput, undefined, termExtras);
+			}
+			// ADR-026 P2 — operator-input pause wins over a coincident budget
+			// ceiling (question is a pending intent; ceiling is a resource gate).
+			// pausable guard already checked in onOutput where the kill fired.
+			if (operatorQuestion && pausable) {
+				return finish(
+					runId, agent, started,
+					'awaiting-operator-input',
+					finalOutput,
+					`OPERATOR_QUESTION: ${operatorQuestion}`,
+					{ ...termExtras, operator_pause: { question: operatorQuestion } },
+				);
 			}
 			// ADR-004 D4 / ADR-006 — the HARD ceiling tripped mid-run (live-tail
 			// only). If the run is pausable (background), preserve the session and
@@ -606,6 +672,7 @@ function finish(
 		cost_usd?: number;
 		claude_session_id?: string;
 		budget_pause?: DispatchResult['budget_pause'];
+		operator_pause?: DispatchResult['operator_pause'];
 	},
 ): DispatchResult {
 	return {
@@ -623,6 +690,7 @@ function finish(
 		error,
 		claude_session_id: extras?.claude_session_id,
 		budget_pause: extras?.budget_pause,
+		operator_pause: extras?.operator_pause,
 	};
 }
 

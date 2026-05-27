@@ -14,17 +14,38 @@
 export type ContractGlob = string;
 
 /** A static, change-local build-time assertion (soul-hub-governance ADR-003 P3).
- *  Run by the `contract-precommit` gate against the staged diff. P1 supports
- *  only the `diff-regex` form (safe + declarative — no arbitrary shell from a
- *  vault note); a match on ADDED lines REFUSES when `mustNotMatch` (default). */
-export interface ContractBuildCheck {
+ *  Run by the `contract-precommit` gate. Two forms:
+ *
+ *  `diff-regex` — tested against ADDED lines of the staged diff for the
+ *    contract's files. A match REFUSES when `mustNotMatch` (default). Good for
+ *    catching re-introduction of retired patterns.
+ *
+ *  `file-regex` — tested against the FULL CONTENT of an absolute file path.
+ *    The file is read at commit time; a match REFUSES when `mustNotMatch`.
+ *    Good for static invariants in files outside the soul-hub repo (e.g.
+ *    agent profiles at `~/.claude/agents/`) — ADR-007 hygiene-fixer buildCheck.
+ */
+export type ContractBuildCheck = DiffRegexBuildCheck | FileRegexBuildCheck;
+
+export interface DiffRegexBuildCheck {
 	type: 'diff-regex';
 	/** Optional subset of the contract's `files` to scope the check to. */
 	files?: ContractGlob[];
 	/** Regex (JS/PCRE-ish) tested against added (`+`) lines of the staged diff. */
 	pattern: string;
-	/** When true (default), a match means the change is REFUSED — the pattern is
-	 *  something that must NOT reappear (e.g. a retired Telegram-push instruction). */
+	/** When true (default), a match means the change is REFUSED. */
+	mustNotMatch?: boolean;
+	/** Operator-facing reason shown on refuse. */
+	message: string;
+}
+
+export interface FileRegexBuildCheck {
+	type: 'file-regex';
+	/** Absolute path of the file to inspect (supports `~` expansion and `abs:` prefix). */
+	file: string;
+	/** Regex (JS/PCRE-ish) tested against the full file content. */
+	pattern: string;
+	/** When true (default), a match means the change is REFUSED. */
 	mustNotMatch?: boolean;
 	/** Operator-facing reason shown on refuse. */
 	message: string;

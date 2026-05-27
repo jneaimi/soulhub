@@ -1,5 +1,11 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
+	import {
+		computeActionableCounts,
+		sumActionable,
+		type ActionableCounts,
+		type DispositionableKey,
+	} from '$lib/vault-hygiene/tile-counts.js';
 
 	// ─── Types (mirror the three source endpoints) ───
 	type RunStatus = 'started' | 'success' | 'error' | 'overlap-skipped';
@@ -13,6 +19,8 @@
 		governanceViolations: number;
 		misplacedNotes: number;
 		inboxDecisions: number;
+		/** ADR-009 — code merged to main but ADR status still proposed/accepted. */
+		adrImplementationDrift: number;
 	}
 	interface UnresolvedIssue {
 		source: string;
@@ -30,6 +38,31 @@
 		ageDays: number;
 		suggestedFix: string;
 	}
+	/** ADR-006 P1.2 — status-contradiction bucket (FM done + open tasks). */
+	interface StatusContradictionIssue {
+		path: string;
+		status: string;
+		openTaskCount: number;
+		suggestedFix: string;
+	}
+	/** ADR-006 P1.2 — misplaced-note bucket (inbox note in wrong zone). */
+	interface MisplacedNoteIssue {
+		path: string;
+		title: string;
+		currentZone: string;
+		suggestedZone: string;
+		confidence: 'high' | 'low';
+		reason: string;
+		suggestedFix: string;
+	}
+	/** ADR-009 — implementation drift: code merged to main but ADR status stale. */
+	interface AdrImplementationDriftIssue {
+		path: string;
+		project: string | null;
+		slug: string;
+		currentStatus: 'proposed' | 'accepted';
+		mergeEvidence: string;
+	}
 	interface VaultHygiene {
 		generatedAt: string;
 		healthScore: number;
@@ -37,6 +70,11 @@
 		unresolved: UnresolvedIssue[];
 		orphans: OrphanIssue[];
 		staleInbox: StaleInboxIssue[];
+		/** ADR-006 P1.2 — previously rendered only in tiles, now wired into the disposition list. */
+		statusContradictions: StatusContradictionIssue[];
+		misplacedNotes: MisplacedNoteIssue[];
+		/** ADR-009 — code merged to main but ADR status still proposed/accepted. */
+		adrImplementationDrift: AdrImplementationDriftIssue[];
 	}
 
 	interface AutomationHealth {
@@ -77,6 +115,8 @@
 	}
 
 	let vault = $state<VaultHygiene | null>(null);
+	/** ADR-006 P2 — single source of truth: tiles and list both read from this. */
+	const actionableCounts = $derived(vault ? computeActionableCounts(vault) : null);
 	let automations = $state<AutomationsResponse | null>(null);
 	let system = $state<SystemHealth | null>(null);
 	let projectRows = $state<ProjectRow[]>([]);
@@ -107,14 +147,169 @@
 		}
 	}
 
-	// ─── Disposition (ADR-005 P2) ───
-	type RemAction = 'unlink' | 'archive-orphan' | 'drop-stale' | 'dismiss';
+	// ─── Disposition (ADR-005 P2 / ADR-006 P1.2 / ADR-009) ───
+	type RemAction = 'unlink' | 'archive-orphan' | 'drop-stale' | 'dismiss' | 'move' | 'reopen-status' | 'mark-shipped';
 	let acting = $state<string | null>(null); // the row key currently in-flight
 	let actError = $state<string | null>(null);
 
+	// ─── ADR-007 P1: Agent fix state ───────────────────────────────────────────
+	/** States per rowKey: dispatching → ready | error | approving */
+	type AgentFixState = 'dispatching' | 'ready' | 'error' | 'approving';
+
+	interface LocalProposal {
+		bucket: string;
+		target: string;
+		summary: string;
+		confidence: 'high' | 'medium' | 'low';
+		edits: { op: string; [k: string]: unknown }[];
+		alternatives: { op: string; [k: string]: unknown }[][];
+	}
+
+	let agentFixStates = $state<Record<string, AgentFixState>>({});
+	let agentProposals = $state<Record<string, LocalProposal>>({});
+	let agentErrors = $state<Record<string, string>>({});
+	/** -1 = primary; ≥0 = alternatives[index] */
+	let selectedAlts = $state<Record<string, number>>({});
+
+	/** Active poll intervals keyed by rowKey. Cleared on onDestroy. */
+	const pollIntervals: Record<string, ReturnType<typeof setInterval>> = {};
+
+	function stopPolling(rowKey: string): void {
+		if (pollIntervals[rowKey]) {
+			clearInterval(pollIntervals[rowKey]);
+			delete pollIntervals[rowKey];
+		}
+	}
+
+	function startPolling(rowKey: string): void {
+		stopPolling(rowKey);
+		const interval = setInterval(async () => {
+			try {
+				const res = await fetch(`/api/hygiene/agent-fix/status?rowKey=${encodeURIComponent(rowKey)}`);
+				const data = (await res.json()) as { status: string; proposal?: LocalProposal; error?: string };
+				if (data.status === 'ready' && data.proposal) {
+					stopPolling(rowKey);
+					agentFixStates = { ...agentFixStates, [rowKey]: 'ready' };
+					agentProposals = { ...agentProposals, [rowKey]: data.proposal };
+					agentErrors = Object.fromEntries(Object.entries(agentErrors).filter(([k]) => k !== rowKey));
+				} else if (data.status === 'error' || data.status === 'not-found') {
+					stopPolling(rowKey);
+					agentFixStates = { ...agentFixStates, [rowKey]: 'error' };
+					agentErrors = { ...agentErrors, [rowKey]: data.error ?? 'Proposal not found or expired' };
+				}
+				// else: still dispatching — keep polling
+			} catch {
+				/* network hiccup — keep polling */
+			}
+		}, 2000);
+		pollIntervals[rowKey] = interval;
+	}
+
+	async function dispatchAgentFix(rowKey: string, bucket: string, context: unknown): Promise<void> {
+		stopPolling(rowKey);
+		agentFixStates = { ...agentFixStates, [rowKey]: 'dispatching' };
+		const { [rowKey]: _p, ...restP } = agentProposals;
+		agentProposals = restP;
+		const { [rowKey]: _e, ...restE } = agentErrors;
+		agentErrors = restE;
+		selectedAlts = Object.fromEntries(Object.entries(selectedAlts).filter(([k]) => k !== rowKey));
+		actError = null;
+		try {
+			const res = await fetch('/api/hygiene/agent-fix', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ rowKey, bucket, context }),
+			});
+			const result = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+			if (!res.ok || !result.ok) throw new Error(result.error ?? `HTTP ${res.status}`);
+			startPolling(rowKey);
+		} catch (err) {
+			agentFixStates = { ...agentFixStates, [rowKey]: 'error' };
+			agentErrors = { ...agentErrors, [rowKey]: (err as Error).message };
+		}
+	}
+
+	async function approveProposal(rowKey: string): Promise<void> {
+		const alt = selectedAlts[rowKey] ?? -1;
+		agentFixStates = { ...agentFixStates, [rowKey]: 'approving' };
+		actError = null;
+		try {
+			const body: Record<string, unknown> = { rowKey };
+			if (alt >= 0) body.alternativeIndex = alt;
+			const res = await fetch('/api/hygiene/agent-approve', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(body),
+			});
+			const result = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+			if (res.status === 409) {
+				// TOCTOU stale — clear state, refresh report
+				const { [rowKey]: _s, ...restS } = agentFixStates;
+				agentFixStates = restS;
+				const { [rowKey]: _p, ...restP } = agentProposals;
+				agentProposals = restP;
+				actError = 'Stale — row was already fixed. Refreshing.';
+				await load();
+				return;
+			}
+			if (!res.ok || !result.ok) throw new Error(result.error ?? `HTTP ${res.status}`);
+			// Success — clear state + refresh
+			const { [rowKey]: _s, ...restS } = agentFixStates;
+			agentFixStates = restS;
+			const { [rowKey]: _p2, ...restP2 } = agentProposals;
+			agentProposals = restP2;
+			await load();
+		} catch (err) {
+			agentFixStates = { ...agentFixStates, [rowKey]: 'error' };
+			agentErrors = { ...agentErrors, [rowKey]: (err as Error).message };
+		}
+	}
+
+	function rejectProposal(rowKey: string): void {
+		stopPolling(rowKey);
+		const { [rowKey]: _s, ...restS } = agentFixStates;
+		agentFixStates = restS;
+		const { [rowKey]: _p, ...restP } = agentProposals;
+		agentProposals = restP;
+		const { [rowKey]: _e, ...restE } = agentErrors;
+		agentErrors = restE;
+		selectedAlts = Object.fromEntries(Object.entries(selectedAlts).filter(([k]) => k !== rowKey));
+	}
+
+	function confidenceClass(c: string): string {
+		if (c === 'high') return 'text-emerald-300 border-hub-cta/30 bg-hub-cta/10';
+		if (c === 'medium') return 'text-amber-300 border-hub-warning/30 bg-hub-warning/10';
+		return 'text-red-300 border-hub-danger/30 bg-hub-danger/10';
+	}
+
+	function describeOp(op: { op: string; [k: string]: unknown }): string {
+		if (op.op === 'retarget-link') return `Retarget [[${op.raw as string}]] → [[${op.newTarget as string}]] in ${op.source as string}`;
+		if (op.op === 'add-links') return `Add links to ${op.path as string}: ${(op.targets as string[]).map((t) => `[[${t}]]`).join(', ')}`;
+		return JSON.stringify(op);
+	}
+
+	/** Pick the canonical "open" status for a Reopen action.
+	 *  Project-pair files (projects/<slug>/index|project.md) flip to 'active';
+	 *  everything else uses 'proposed' — the canonical open value for ADR notes
+	 *  (ADR-006 edge case #7). Both are valid for dispatchStatusFlip: project
+	 *  paths use setProjectStatus (accepts /^[a-z][a-z-]*$/), non-project paths
+	 *  use setNoteStatus (validates against CANONICAL_STATUSES). */
+	function reopenStatusFor(path: string): string {
+		return /^projects\/[a-z][a-z0-9-]*\/(?:index|project)\.md$/.test(path)
+			? 'active'
+			: 'proposed';
+	}
+
 	async function remediate(
 		rowKey: string,
-		body: { action: RemAction; bucket: string; source: string; raw?: string },
+		body: {
+			action: RemAction;
+			bucket?: string;
+			source: string;
+			raw?: string;
+			targetZone?: string;
+			status?: string;
+		},
 		confirmMsg?: string,
 	) {
 		if (confirmMsg && !confirm(confirmMsg)) return;
@@ -188,6 +383,11 @@
 		void load();
 	});
 
+	onDestroy(() => {
+		// Clean up all active poll intervals on page teardown.
+		for (const id of Object.values(pollIntervals)) clearInterval(id);
+	});
+
 	// ─── Formatting + status palette ───
 	function fmtRelative(iso: string | null): string {
 		if (!iso) return 'never';
@@ -211,16 +411,22 @@
 		started: 'bg-hub-info/15 text-blue-300 border-hub-info/30',
 	};
 
-	// Vault bucket tiles — which buckets are actionable (amber when > 0)
-	const BUCKETS: { key: keyof HygieneTotals; label: string; actionable: boolean }[] = [
-		{ key: 'governanceViolations', label: 'Governance', actionable: true },
-		{ key: 'unresolved', label: 'Broken links', actionable: true },
-		{ key: 'statusContradictions', label: 'Status drift', actionable: true },
-		{ key: 'staleInbox', label: 'Stale inbox', actionable: true },
-		{ key: 'orphans', label: 'Orphans', actionable: true },
-		{ key: 'misplacedNotes', label: 'Misplaced', actionable: true },
-		{ key: 'inboxDecisions', label: 'Inbox decisions', actionable: true },
-		{ key: 'indexed', label: 'Indexed notes', actionable: false },
+	// ─── Tile grid definitions (ADR-006 P2 — tile honesty) ───────────────────────
+	// 'dispositionable' → amber when count > 0; count = actionableCounts[key]
+	//   (array .length, post-suppression, same source as the list — never vault.totals)
+	// 'informational'   → neutral text; no amber; count = vault.totals[key]
+	// 'inbox-link'      → neutral text; no amber; shows an "Open Inbox" deep-link
+	type BucketKind = 'dispositionable' | 'informational' | 'inbox-link';
+	const BUCKETS: { key: keyof HygieneTotals; label: string; kind: BucketKind; link?: string }[] = [
+		{ key: 'governanceViolations', label: 'Governance', kind: 'informational' },
+		{ key: 'unresolved', label: 'Broken links', kind: 'dispositionable' },
+		{ key: 'statusContradictions', label: 'Status drift', kind: 'dispositionable' },
+		{ key: 'adrImplementationDrift', label: 'Impl drift', kind: 'dispositionable' },
+		{ key: 'staleInbox', label: 'Stale inbox', kind: 'dispositionable' },
+		{ key: 'orphans', label: 'Orphans', kind: 'dispositionable' },
+		{ key: 'misplacedNotes', label: 'Misplaced', kind: 'dispositionable' },
+		{ key: 'inboxDecisions', label: 'Inbox decisions', kind: 'inbox-link', link: '/inbox' },
+		{ key: 'indexed', label: 'Indexed notes', kind: 'informational' },
 	];
 
 	function scoreClass(score: number): string {
@@ -276,14 +482,22 @@
 			{#if vault}
 				<div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
 					{#each BUCKETS as b (b.key)}
-						{@const n = vault.totals[b.key]}
+						{@const n = b.kind === 'dispositionable'
+							? ((actionableCounts as ActionableCounts | null)?.[b.key as DispositionableKey] ?? 0)
+							: vault.totals[b.key]}
 						<div class="rounded border border-hub-border/60 bg-hub-bg/30 px-3 py-2">
 							<div
-								class="text-lg font-semibold {b.actionable && n > 0 ? 'text-amber-300' : 'text-hub-text'}"
+								class="text-lg font-semibold {b.kind === 'dispositionable' && n > 0 ? 'text-amber-300' : 'text-hub-text'}"
 							>
 								{n}
 							</div>
 							<div class="text-[11px] text-hub-muted">{b.label}</div>
+							{#if b.kind === 'inbox-link' && b.link}
+								<a
+									href={b.link}
+									class="text-[10px] text-hub-info hover:underline mt-0.5 inline-block"
+								>Open Inbox →</a>
+							{/if}
 						</div>
 					{/each}
 				</div>
@@ -292,9 +506,10 @@
 			{/if}
 		</section>
 
-		<!-- ─── A2. Needs disposition (ADR-005 P2) ─── -->
+		<!-- ─── A2. Needs disposition (ADR-005 P2 / ADR-006 P1.2) ─── -->
+		<!-- ADR-006 P2: total derives from the same actionableCounts the tiles use. -->
 		{#if vault}
-			{@const total = vault.unresolved.length + vault.orphans.length + vault.staleInbox.length}
+			{@const total = actionableCounts ? sumActionable(actionableCounts) : 0}
 			<section class="rounded-lg border border-hub-border bg-hub-surface/40 p-4">
 				<div class="flex items-center justify-between mb-3">
 					<h2 class="text-sm font-semibold text-hub-text">Needs your call</h2>
@@ -311,36 +526,171 @@
 					<ul class="space-y-2">
 						{#each vault.unresolved as u (u.source + u.raw)}
 							{@const key = `unresolved:${u.source}:${u.raw}`}
-							<li class="flex flex-wrap items-center justify-between gap-2 rounded border border-hub-border/60 bg-hub-bg/30 px-3 py-2">
-								<div class="min-w-0">
-									<div class="text-xs text-hub-text truncate">🔗 Broken link in <code class="text-hub-info">{u.source}</code></div>
-									<div class="text-[11px] text-hub-muted truncate">→ <code>{u.raw}</code></div>
+							{@const agentState = agentFixStates[key]}
+							{@const proposal = agentProposals[key]}
+							<li class="rounded border border-hub-border/60 bg-hub-bg/30 px-3 py-2 space-y-2">
+								<div class="flex flex-wrap items-center justify-between gap-2">
+									<div class="min-w-0">
+										<div class="text-xs text-hub-text truncate">🔗 Broken link in <code class="text-hub-info">{u.source}</code></div>
+										<div class="text-[11px] text-hub-muted truncate">→ <code>{u.raw}</code></div>
+									</div>
+									<div class="flex gap-1.5 shrink-0flex-wrap">
+										<!-- Quick actions (ADR-006) -->
+										<button class="text-[11px] px-2 py-1 rounded border border-hub-danger/30 text-red-300 hover:bg-hub-danger/10 disabled:opacity-40" disabled={acting === key || !!agentState} onclick={() => remediate(key, { action: 'unlink', bucket: 'unresolved', source: u.source, raw: u.raw }, `Remove the broken wikilink \`${u.raw}\` from ${u.source}? (git-revertible)`)}>
+											{acting === key ? '…' : 'Unlink'}
+										</button>
+										<button class="text-[11px] px-2 py-1 rounded border border-hub-border text-hub-muted hover:text-hub-text disabled:opacity-40" disabled={acting === key || !!agentState} onclick={() => remediate(key, { action: 'dismiss', bucket: 'unresolved', source: u.source, raw: u.raw })}>
+											Dismiss 30d
+										</button>
+										<!-- ADR-007: Agent fix affordance -->
+										{#if !agentState}
+											<button
+												class="text-[11px] px-2 py-1 rounded border border-hub-info/30 text-blue-300 hover:bg-hub-info/10 disabled:opacity-40"
+												disabled={acting === key}
+												onclick={() => dispatchAgentFix(key, 'unresolved', { source: u.source, raw: u.raw, suggestedFix: u.suggestedFix })}
+											>🤖 Agent fix</button>
+										{:else if agentState === 'dispatching'}
+											<span class="text-[11px] px-2 py-1 rounded border border-hub-info/30 text-blue-300 opacity-70 animate-pulse">🔍 Investigating…</span>
+											<button class="text-[11px] px-2 py-1 rounded border border-hub-border text-hub-muted hover:text-hub-text" onclick={() => rejectProposal(key)}>Cancel</button>
+										{:else if agentState === 'error'}
+											<span class="text-[11px] text-red-300" title={agentErrors[key]}>⚠ Agent failed</span>
+											<button class="text-[11px] px-2 py-1 rounded border border-hub-border text-hub-muted hover:text-hub-text" onclick={() => rejectProposal(key)}>Clear</button>
+										{/if}
+									</div>
 								</div>
-								<div class="flex gap-1.5 shrink-0">
-									<button class="text-[11px] px-2 py-1 rounded border border-hub-danger/30 text-red-300 hover:bg-hub-danger/10 disabled:opacity-40" disabled={acting === key} onclick={() => remediate(key, { action: 'unlink', bucket: 'unresolved', source: u.source, raw: u.raw }, `Remove the broken wikilink \`${u.raw}\` from ${u.source}? (git-revertible)`)}>
-										{acting === key ? '…' : 'Unlink'}
-									</button>
-									<button class="text-[11px] px-2 py-1 rounded border border-hub-border text-hub-muted hover:text-hub-text disabled:opacity-40" disabled={acting === key} onclick={() => remediate(key, { action: 'dismiss', bucket: 'unresolved', source: u.source, raw: u.raw })}>
-										Dismiss 30d
-									</button>
-								</div>
+								<!-- Proposal card (ADR-007) -->
+								{#if agentState === 'ready' && proposal}
+									<div class="rounded border border-hub-info/30 bg-hub-info/5 px-3 py-2 space-y-2">
+										<div class="flex items-start justify-between gap-2">
+											<div class="text-[11px] text-hub-text">{proposal.summary}</div>
+											<span class="text-[10px] px-1.5 py-0.5 rounded border {confidenceClass(proposal.confidence)} shrink-0">{proposal.confidence}</span>
+										</div>
+										<!-- Primary edits -->
+										<div class="text-[11px] text-hub-muted">
+											{#if (selectedAlts[key] ?? -1) < 0}
+												{#each proposal.edits as edit}
+													<div class="font-mono truncate">→ {describeOp(edit)}</div>
+												{/each}
+											{:else}
+												{#each (proposal.alternatives[selectedAlts[key]] ?? []) as edit}
+													<div class="font-mono truncate">→ {describeOp(edit)}</div>
+												{/each}
+											{/if}
+										</div>
+										<!-- Alternative picker -->
+										{#if proposal.alternatives.length > 0}
+											<div class="flex items-center gap-2 flex-wrap">
+												<span class="text-[10px] text-hub-muted">Use:</span>
+												<button
+													class="text-[10px] px-1.5 py-0.5 rounded border {(selectedAlts[key] ?? -1) < 0 ? 'border-hub-cta/50 text-emerald-300' : 'border-hub-border text-hub-muted'}"
+													onclick={() => { selectedAlts = { ...selectedAlts, [key]: -1 }; }}
+												>Primary</button>
+												{#each proposal.alternatives as _alt, i}
+													<button
+														class="text-[10px] px-1.5 py-0.5 rounded border {selectedAlts[key] === i ? 'border-hub-cta/50 text-emerald-300' : 'border-hub-border text-hub-muted'}"
+														onclick={() => { selectedAlts = { ...selectedAlts, [key]: i }; }}
+													>Alt {i + 1}</button>
+												{/each}
+											</div>
+										{/if}
+										<!-- Approve / Reject -->
+										<div class="flex gap-2">
+											<button
+												class="text-[11px] px-2 py-1 rounded border border-hub-cta/40 text-emerald-300 hover:bg-hub-cta/10 disabled:opacity-40"
+												disabled={agentFixStates[key] === 'approving'}
+												onclick={() => approveProposal(key)}
+											>{agentFixStates[key] === 'approving' ? '…' : '✓ Approve'}</button>
+											<button
+												class="text-[11px] px-2 py-1 rounded border border-hub-border text-hub-muted hover:text-hub-text disabled:opacity-40"
+												disabled={agentFixStates[key] === 'approving'}
+												onclick={() => rejectProposal(key)}
+											>✗ Reject</button>
+										</div>
+									</div>
+								{/if}
 							</li>
 						{/each}
 						{#each vault.orphans as o (o.path)}
 							{@const key = `orphan:${o.path}`}
-							<li class="flex flex-wrap items-center justify-between gap-2 rounded border border-hub-border/60 bg-hub-bg/30 px-3 py-2">
-								<div class="min-w-0">
-									<div class="text-xs text-hub-text truncate">🪨 Orphan: <code class="text-hub-info">{o.path}</code></div>
-									<div class="text-[11px] text-hub-muted truncate">{o.suggestedFix}</div>
+							{@const agentState = agentFixStates[key]}
+							{@const proposal = agentProposals[key]}
+							<li class="rounded border border-hub-border/60 bg-hub-bg/30 px-3 py-2 space-y-2">
+								<div class="flex flex-wrap items-center justify-between gap-2">
+									<div class="min-w-0">
+										<div class="text-xs text-hub-text truncate">🪨 Orphan: <code class="text-hub-info">{o.path}</code></div>
+										<div class="text-[11px] text-hub-muted truncate">{o.suggestedFix}</div>
+									</div>
+									<div class="flex gap-1.5 shrink-0 flex-wrap">
+										<!-- Quick actions (ADR-006) -->
+										<button class="text-[11px] px-2 py-1 rounded border border-hub-warning/30 text-amber-300 hover:bg-hub-warning/10 disabled:opacity-40" disabled={acting === key || !!agentState} onclick={() => remediate(key, { action: 'archive-orphan', bucket: 'orphan_note', source: o.path }, `Archive orphan note ${o.path}? (git-revertible)`)}>
+											{acting === key ? '…' : 'Archive'}
+										</button>
+										<button class="text-[11px] px-2 py-1 rounded border border-hub-border text-hub-muted hover:text-hub-text disabled:opacity-40" disabled={acting === key || !!agentState} onclick={() => remediate(key, { action: 'dismiss', bucket: 'orphan_note', source: o.path })}>
+											Dismiss 30d
+										</button>
+										<!-- ADR-007: Agent fix affordance -->
+										{#if !agentState}
+											<button
+												class="text-[11px] px-2 py-1 rounded border border-hub-info/30 text-blue-300 hover:bg-hub-info/10 disabled:opacity-40"
+												disabled={acting === key}
+												onclick={() => dispatchAgentFix(key, 'orphan_note', { path: o.path, title: o.title, suggestedFix: o.suggestedFix })}
+											>🤖 Agent fix</button>
+										{:else if agentState === 'dispatching'}
+											<span class="text-[11px] px-2 py-1 rounded border border-hub-info/30 text-blue-300 opacity-70 animate-pulse">🔍 Investigating…</span>
+											<button class="text-[11px] px-2 py-1 rounded border border-hub-border text-hub-muted hover:text-hub-text" onclick={() => rejectProposal(key)}>Cancel</button>
+										{:else if agentState === 'error'}
+											<span class="text-[11px] text-red-300" title={agentErrors[key]}>⚠ Agent failed</span>
+											<button class="text-[11px] px-2 py-1 rounded border border-hub-border text-hub-muted hover:text-hub-text" onclick={() => rejectProposal(key)}>Clear</button>
+										{/if}
+									</div>
 								</div>
-								<div class="flex gap-1.5 shrink-0">
-									<button class="text-[11px] px-2 py-1 rounded border border-hub-warning/30 text-amber-300 hover:bg-hub-warning/10 disabled:opacity-40" disabled={acting === key} onclick={() => remediate(key, { action: 'archive-orphan', bucket: 'orphan_note', source: o.path }, `Archive orphan note ${o.path}? (git-revertible)`)}>
-										{acting === key ? '…' : 'Archive'}
-									</button>
-									<button class="text-[11px] px-2 py-1 rounded border border-hub-border text-hub-muted hover:text-hub-text disabled:opacity-40" disabled={acting === key} onclick={() => remediate(key, { action: 'dismiss', bucket: 'orphan_note', source: o.path })}>
-										Dismiss 30d
-									</button>
-								</div>
+								<!-- Proposal card (ADR-007) -->
+								{#if agentState === 'ready' && proposal}
+									<div class="rounded border border-hub-info/30 bg-hub-info/5 px-3 py-2 space-y-2">
+										<div class="flex items-start justify-between gap-2">
+											<div class="text-[11px] text-hub-text">{proposal.summary}</div>
+											<span class="text-[10px] px-1.5 py-0.5 rounded border {confidenceClass(proposal.confidence)} shrink-0">{proposal.confidence}</span>
+										</div>
+										<div class="text-[11px] text-hub-muted">
+											{#if (selectedAlts[key] ?? -1) < 0}
+												{#each proposal.edits as edit}
+													<div class="font-mono truncate">→ {describeOp(edit)}</div>
+												{/each}
+											{:else}
+												{#each (proposal.alternatives[selectedAlts[key]] ?? []) as edit}
+													<div class="font-mono truncate">→ {describeOp(edit)}</div>
+												{/each}
+											{/if}
+										</div>
+										{#if proposal.alternatives.length > 0}
+											<div class="flex items-center gap-2 flex-wrap">
+												<span class="text-[10px] text-hub-muted">Use:</span>
+												<button
+													class="text-[10px] px-1.5 py-0.5 rounded border {(selectedAlts[key] ?? -1) < 0 ? 'border-hub-cta/50 text-emerald-300' : 'border-hub-border text-hub-muted'}"
+													onclick={() => { selectedAlts = { ...selectedAlts, [key]: -1 }; }}
+												>Primary</button>
+												{#each proposal.alternatives as _alt, i}
+													<button
+														class="text-[10px] px-1.5 py-0.5 rounded border {selectedAlts[key] === i ? 'border-hub-cta/50 text-emerald-300' : 'border-hub-border text-hub-muted'}"
+														onclick={() => { selectedAlts = { ...selectedAlts, [key]: i }; }}
+													>Alt {i + 1}</button>
+												{/each}
+											</div>
+										{/if}
+										<div class="flex gap-2">
+											<button
+												class="text-[11px] px-2 py-1 rounded border border-hub-cta/40 text-emerald-300 hover:bg-hub-cta/10 disabled:opacity-40"
+												disabled={agentFixStates[key] === 'approving'}
+												onclick={() => approveProposal(key)}
+											>{agentFixStates[key] === 'approving' ? '…' : '✓ Approve'}</button>
+											<button
+												class="text-[11px] px-2 py-1 rounded border border-hub-border text-hub-muted hover:text-hub-text disabled:opacity-40"
+												disabled={agentFixStates[key] === 'approving'}
+												onclick={() => rejectProposal(key)}
+											>✗ Reject</button>
+										</div>
+									</div>
+								{/if}
 							</li>
 						{/each}
 						{#each vault.staleInbox as s (s.path)}
@@ -355,6 +705,106 @@
 										{acting === key ? '…' : 'Drop'}
 									</button>
 									<button class="text-[11px] px-2 py-1 rounded border border-hub-border text-hub-muted hover:text-hub-text disabled:opacity-40" disabled={acting === key} onclick={() => remediate(key, { action: 'dismiss', bucket: 'stale_inbox_item', source: s.path })}>
+										Dismiss 30d
+									</button>
+								</div>
+							</li>
+						{/each}
+						<!-- ADR-006 P1.2: Status-drift rows -->
+						{#each (vault.statusContradictions ?? []) as sc (sc.path)}
+							{@const key = `status-drift:${sc.path}`}
+							<li class="flex flex-wrap items-center justify-between gap-2 rounded border border-hub-border/60 bg-hub-bg/30 px-3 py-2">
+								<div class="min-w-0">
+									<div class="text-xs text-hub-text truncate">&#9888;&#65039; Status drift: <code class="text-hub-info">{sc.path}</code></div>
+									<div class="text-[11px] text-hub-muted truncate">status=<code>{sc.status}</code> with {sc.openTaskCount} open task{sc.openTaskCount === 1 ? '' : 's'}</div>
+								</div>
+								<div class="flex gap-1.5 shrink-0">
+									<a
+										href={`/vault?note=${encodeURIComponent(sc.path)}`}
+										target="_blank"
+										rel="noopener noreferrer"
+										class="text-[11px] px-2 py-1 rounded border border-hub-border text-hub-muted hover:text-hub-text"
+									>Open &#8599;</a>
+									<button
+										class="text-[11px] px-2 py-1 rounded border border-hub-cta/30 text-emerald-300 hover:bg-hub-cta/10 disabled:opacity-40"
+										disabled={acting === key}
+										onclick={() => remediate(key, { action: 'reopen-status', source: sc.path, status: reopenStatusFor(sc.path) })}
+									>
+										{acting === key ? '...' : `Reopen → ${reopenStatusFor(sc.path)}`}
+									</button>
+									<button
+										class="text-[11px] px-2 py-1 rounded border border-hub-border text-hub-muted hover:text-hub-text disabled:opacity-40"
+										disabled={acting === key}
+										onclick={() => remediate(key, { action: 'dismiss', bucket: 'status_contradiction', source: sc.path })}
+									>
+										Dismiss 30d
+									</button>
+								</div>
+							</li>
+						{/each}
+						<!-- ADR-009: Implementation drift rows -->
+						{#each (vault.adrImplementationDrift ?? []) as d (d.path)}
+							{@const key = `impl-drift:${d.path}`}
+							<li class="flex flex-wrap items-center justify-between gap-2 rounded border border-hub-border/60 bg-hub-bg/30 px-3 py-2">
+								<div class="min-w-0">
+									<div class="text-xs text-hub-text truncate">&#128256; Impl drift: <code class="text-hub-info">{d.path}</code></div>
+									<div class="text-[11px] text-hub-muted truncate">status=<code>{d.currentStatus}</code> — merged: <code>{d.mergeEvidence}</code></div>
+								</div>
+								<div class="flex gap-1.5 shrink-0">
+									<a
+										href={`/vault?note=${encodeURIComponent(d.path)}`}
+										target="_blank"
+										rel="noopener noreferrer"
+										class="text-[11px] px-2 py-1 rounded border border-hub-border text-hub-muted hover:text-hub-text"
+									>Open &#8599;</a>
+									<button
+										class="text-[11px] px-2 py-1 rounded border border-hub-cta/30 text-emerald-300 hover:bg-hub-cta/10 disabled:opacity-40"
+										disabled={acting === key}
+										onclick={() => remediate(
+											key,
+											{ action: 'mark-shipped', source: d.path },
+											`Mark "${d.slug}" as shipped?\n\nEvidence: ${d.mergeEvidence}\n\n(Multi-phase ADRs: use "Not yet" if more code is pending. git-revertible.)`,
+										)}
+									>
+										{acting === key ? '...' : 'Mark shipped'}
+									</button>
+									<button
+										class="text-[11px] px-2 py-1 rounded border border-hub-border text-hub-muted hover:text-hub-text disabled:opacity-40"
+										disabled={acting === key}
+										onclick={() => remediate(key, { action: 'dismiss', bucket: 'adr_implementation_drift', source: d.path })}
+									>
+										Not yet (30d)
+									</button>
+								</div>
+							</li>
+						{/each}
+						<!-- ADR-006 P1.2: Misplaced-note rows -->
+						{#each (vault.misplacedNotes ?? []) as m (m.path)}
+							{@const key = `misplaced:${m.path}`}
+							<li class="flex flex-wrap items-center justify-between gap-2 rounded border border-hub-border/60 bg-hub-bg/30 px-3 py-2">
+								<div class="min-w-0">
+									<div class="text-xs text-hub-text truncate">&#128194; Misplaced: <code class="text-hub-info">{m.path}</code></div>
+									<div class="text-[11px] text-hub-muted truncate">→ {m.suggestedZone} ({m.confidence} confidence) — {m.reason}</div>
+								</div>
+								<div class="flex gap-1.5 shrink-0">
+									<button
+										class="text-[11px] px-2 py-1 rounded border border-hub-warning/30 text-amber-300 hover:bg-hub-warning/10 disabled:opacity-40"
+										disabled={acting === key}
+										onclick={() => remediate(
+											key,
+											{ action: 'move', source: m.path, targetZone: m.suggestedZone },
+											`Move "${m.path}" → ${m.suggestedZone}/?
+
+High confidence ≠ correct — confirm the destination is right. (git-revertible)`,
+										)}
+									>
+										{acting === key ? '...' : `Move → ${m.suggestedZone}`}
+									</button>
+									<button
+										class="text-[11px] px-2 py-1 rounded border border-hub-border text-hub-muted hover:text-hub-text disabled:opacity-40"
+										disabled={acting === key}
+										onclick={() => remediate(key, { action: 'dismiss', bucket: 'misplaced_note', source: m.path })}
+									>
 										Dismiss 30d
 									</button>
 								</div>

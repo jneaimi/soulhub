@@ -9,6 +9,10 @@ export {
 	type AdrStatusDriftIssue,
 } from './adr-status-drift.js';
 export {
+	getAdrImplementationDrift,
+	groupByProject as groupAdrImplementationDrift,
+} from './adr-implementation-drift.js';
+export {
 	parseBodyStatus,
 	compareStatuses,
 	isCanonicalStatus,
@@ -25,6 +29,7 @@ export type {
 	StaleInboxIssue,
 	StatusContradictionIssue,
 	GovernanceViolationIssue,
+	AdrImplementationDriftIssue,
 } from './types.js';
 export type { HygieneTickResult } from './heartbeat-tick.js';
 export { DEFAULT_HYGIENE_THRESHOLD } from './types.js';

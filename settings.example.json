@@ -98,6 +98,7 @@
     "naseej": false,
     "workspaces": false,
     "playbook": false,
-    "updateCheck": true
+    "updateCheck": true,
+    "localRedeploy": false
   }
 }

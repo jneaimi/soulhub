@@ -61,7 +61,6 @@ import {
 import { getMessage as getInboxMessage } from '../../inbox/index.js';
 import { findContactByEmail } from '../../crm/index.js';
 import { getVaultEngine } from '../../vault/index.js';
-import { dispatchAgent } from '../../agents/dispatch/index.js';
 import {
 	getBudgetApproval,
 	deleteBudgetApproval,
@@ -73,11 +72,10 @@ import {
 } from '../../agents/budget-escalation.js';
 import { applyLiveGrant } from '../../agents/budget-grants.js';
 import {
-	formatKeeperTask,
-	parseKeeperResult,
-	formatTelegramResult,
+	formatHealResult,
 	formatBatchList,
 } from '../../vault-hygiene/link-fix-payload.js';
+import { healBrokenLinks } from '$lib/system/healers/vault-healer.js';
 import {
 	getYoutubeCount,
 	incrementYoutubeCount,
@@ -158,9 +156,9 @@ type VaultHygieneVerb =
 	| 'vh-inbox-drop-y' // confirmed → dropStaleInboxItem()
 	| 'vh-inbox-drop-n' // cancelled
 	// Bulk fix-broken-links — aggregate digest with one button row per batch.
-	// vh-fix-all dispatches the keeper agent against the batch; the other
+	// vh-fix-all runs the deterministic healBrokenLinks pass; the other
 	// two are pure text-edits on the aggregate message.
-	| 'vh-fix-all' // dispatch keeper to bulk-fix the batch
+	| 'vh-fix-all' // deterministic auto-fix for the batch (healBrokenLinks)
 	| 'vh-fix-list' // expand the aggregate to a text-only enumeration
 	| 'vh-fix-skip'; // dismiss this batch (reappears in next digest)
 
@@ -1410,7 +1408,7 @@ export function buildFixBatchKeyboard(
 	return {
 		inline_keyboard: [
 			[
-				{ text: `🤖 Fix all (${batch.length})`, callback_data: `vh-fix-all:${id}` },
+				{ text: `🔧 Auto-fix (${batch.length})`, callback_data: `vh-fix-all:${id}` },
 				{ text: '📋 Show list', callback_data: `vh-fix-list:${id}` },
 				{ text: '⏭ Skip', callback_data: `vh-fix-skip:${id}` },
 			],
@@ -1755,15 +1753,15 @@ export function buildInboxDigestKeyboard(messageId: number): InlineKeyboardMarku
 
 /** Bulk fix-batch callback branch. Three verbs share the per-batch
  *  pending map:
- *   - vh-fix-all : edit message to "running…", spawn keeper dispatch
- *                  async, on completion edit to the result summary
+ *   - vh-fix-all : edit message to "running…", run healBrokenLinks
+ *                  deterministically (ADR-008 — no LLM, no agent),
+ *                  on completion edit to the result summary
  *   - vh-fix-list: edit message body to a text-only enumeration of
- *                  the batch (no agent dispatch)
+ *                  the batch
  *   - vh-fix-skip: edit message to "skipped — reappears next digest"
  *
- *  The dispatch is fire-and-forget — the callback handler answers
- *  Telegram within a few seconds (well inside the callback_query
- *  timeout) while the keeper runs in the background. */
+ *  The fix is fire-and-forget (IIFE) — the callback handler answers
+ *  Telegram within a few seconds while the healer runs in the background. */
 async function handleFixBatchCallback(
 	query: TgCallbackQuery,
 	parsed: VaultHygieneParse,
@@ -1815,17 +1813,17 @@ async function handleFixBatchCallback(
 		}
 
 		case 'vh-fix-all': {
+			// ADR-008 step 3 — deterministic auto-fix replaces keeper dispatch.
 			// 1. Immediately edit the message to a "running" state so the
-			//    operator gets feedback within seconds. Drop the keyboard
-			//    so they can't double-fire while keeper is mid-flight.
+			//    operator gets feedback within seconds.
 			try {
 				await editMessageText({
 					chat_id: row.chatJid,
 					message_id: row.messageId,
 					text:
-						`🔄 Dispatching keeper to bulk-fix ${row.batch.length} broken ` +
+						`🔧 Auto-fixing ${row.batch.length} broken ` +
 						`wikilink${row.batch.length === 1 ? '' : 's'}…\n\n` +
-						`Typically takes 1–3 minutes. This message will update when done.`,
+						`Running deterministic fuzzy-match repair. This message will update when done.`,
 					parse_mode: 'Markdown',
 				});
 			} catch {
@@ -1833,56 +1831,29 @@ async function handleFixBatchCallback(
 			}
 			await answerCallbackQuery({
 				callback_query_id: query.id,
-				text: '🤖 Keeper dispatched',
+				text: '🔧 Running auto-fix',
 			});
 
-			// 2. Fire-and-forget background dispatch. Wrapped in an async
-			//    IIFE so errors are logged but don't crash the channel
-			//    handler.
+			// 2. Fire-and-forget background IIFE — healBrokenLinks is synchronous
+			//    I/O but can take a few seconds on large batches.
 			void (async () => {
 				try {
-					const task = formatKeeperTask(row.batch);
-					const generator = dispatchAgent('keeper', task, {
-						mode: 'production',
-					});
-					// Manual drain — TReturn carries the DispatchResult per
-					// `feedback_asyncgenerator_return_value_loop`.
-					let final: Awaited<ReturnType<typeof generator.next>> | null = null;
-					while (true) {
-						const next = await generator.next();
-						if (next.done) {
-							final = next;
-							break;
-						}
-					}
-					const result = final?.value;
-					if (!result || result.status === 'error') {
+					const engine = getVaultEngine();
+					if (!engine) {
 						await editMessageText({
 							chat_id: row.chatJid,
 							message_id: row.messageId,
-							text:
-								`❌ Keeper dispatch failed — ${result?.error ?? 'unknown error'}\n\n` +
-								`Batch unchanged. Tap the digest button again or use \`/api/hygiene/vault-escalate-buttons\` to resurface.`,
+							text: '❌ Auto-fix failed — vault engine unavailable.',
 							parse_mode: 'Markdown',
 						});
 						return;
 					}
-					const parsedResult = parseKeeperResult(result.output);
-					if (!parsedResult) {
-						await editMessageText({
-							chat_id: row.chatJid,
-							message_id: row.messageId,
-							text:
-								`❌ Keeper output unparseable — no JSON result block found.\n\n` +
-								`First 800 chars:\n\`\`\`\n${result.output.slice(0, 800)}\n\`\`\``,
-							parse_mode: 'Markdown',
-						});
-						return;
-					}
+					const allNotes = engine.getAllNotes();
+					const healResult = await healBrokenLinks(engine.vaultDir, row.batch, allNotes);
 					await editMessageText({
 						chat_id: row.chatJid,
 						message_id: row.messageId,
-						text: formatTelegramResult(parsedResult, row.batch.length),
+						text: formatHealResult(healResult, row.batch.length),
 						parse_mode: 'Markdown',
 					});
 					pendingFixBatchButtons.delete(parsed.id);
@@ -1891,7 +1862,7 @@ async function handleFixBatchCallback(
 						await editMessageText({
 							chat_id: row.chatJid,
 							message_id: row.messageId,
-							text: `❌ Keeper crashed: ${(err as Error).message}`,
+							text: `❌ Auto-fix crashed: ${(err as Error).message}`,
 							parse_mode: 'Markdown',
 						});
 					} catch {

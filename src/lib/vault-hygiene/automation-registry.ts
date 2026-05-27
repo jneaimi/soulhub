@@ -41,7 +41,7 @@ export const HEALTH_AUTOMATIONS: readonly HealthAutomation[] = [
 		taskId: 'vault-hygiene',
 		label: 'Vault hygiene',
 		category: 'hygiene',
-		purpose: 'Keeper pass over vault links, orphans, stale inbox, governance.',
+		purpose: 'Deterministic janitor pass: orphans → index, stale-inbox → zone, missing frontmatter → backfill (ADR-008; keeper retired).',
 		expectedMaxStaleHours: 4, // every 30m
 	},
 	{
@@ -49,6 +49,13 @@ export const HEALTH_AUTOMATIONS: readonly HealthAutomation[] = [
 		label: 'ADR status drift',
 		category: 'hygiene',
 		purpose: 'Flags ADRs whose status contradicts their open tasks / phase markers.',
+		expectedMaxStaleHours: 192, // weekly + buffer
+	},
+	{
+		taskId: 'adr-implementation-drift-weekly',
+		label: 'ADR implementation drift',
+		category: 'hygiene',
+		purpose: 'Flags ADRs still proposed/accepted whose slug appears in a git log main merge commit (ADR-009).',
 		expectedMaxStaleHours: 192, // weekly + buffer
 	},
 	{
@@ -60,9 +67,9 @@ export const HEALTH_AUTOMATIONS: readonly HealthAutomation[] = [
 	},
 	{
 		taskId: 'notification-budget-falsifier',
-		label: 'Notification budget',
+		label: 'Keeper retirement',
 		category: 'falsifier',
-		purpose: 'Counts keeper heartbeat Telegram escalations/24h; red if >1 (ADR-005 P1 ≤1/day).',
+		purpose: 'Asserts zero agent_runs with keeper agent_id after ADR-008 retirement date; red on any post-retirement keeper run (regression guard).',
 		expectedMaxStaleHours: 18, // every 6h + buffer
 	},
 	{

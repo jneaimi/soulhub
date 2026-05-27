@@ -12,7 +12,7 @@ const config = {
 		}
 	},
 	kit: {
-		adapter: adapter({ out: 'build' }),
+		adapter: adapter({ out: process.env.BUILD_OUT_DIR ?? 'build' }),
 		csrf: {
 			checkOrigin: false
 		}

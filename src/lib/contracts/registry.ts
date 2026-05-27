@@ -66,17 +66,30 @@ function parseContract(raw: unknown, idx: number): Contract {
 }
 
 /** Parse + validate an optional `buildCheck` (ADR-003 P3). Throws on a malformed
- *  one so compile refuses rather than ship a broken gate rule. */
+ *  one so compile refuses rather than ship a broken gate rule.
+ *  Supports `diff-regex` (original) and `file-regex` (ADR-007 addition). */
 function parseBuildCheck(raw: unknown, idx: number): ContractBuildCheck | undefined {
 	if (raw === undefined || raw === null) return undefined;
 	if (typeof raw !== 'object') throw new Error(`contracts[${idx}].buildCheck must be an object`);
 	const b = raw as Record<string, unknown>;
-	if (b.type !== 'diff-regex') throw new Error(`contracts[${idx}].buildCheck.type must be 'diff-regex'`);
-	if (typeof b.pattern !== 'string' || !b.pattern) throw new Error(`contracts[${idx}].buildCheck.pattern required`);
-	if (typeof b.message !== 'string' || !b.message) throw new Error(`contracts[${idx}].buildCheck.message required`);
-	const files = Array.isArray(b.files) ? b.files.filter((f): f is string => typeof f === 'string') : undefined;
-	const mustNotMatch = b.mustNotMatch === undefined ? true : Boolean(b.mustNotMatch);
-	return { type: 'diff-regex', pattern: b.pattern, message: b.message, files, mustNotMatch };
+
+	if (b.type === 'diff-regex') {
+		if (typeof b.pattern !== 'string' || !b.pattern) throw new Error(`contracts[${idx}].buildCheck.pattern required`);
+		if (typeof b.message !== 'string' || !b.message) throw new Error(`contracts[${idx}].buildCheck.message required`);
+		const files = Array.isArray(b.files) ? b.files.filter((f): f is string => typeof f === 'string') : undefined;
+		const mustNotMatch = b.mustNotMatch === undefined ? true : Boolean(b.mustNotMatch);
+		return { type: 'diff-regex', pattern: b.pattern, message: b.message, files, mustNotMatch };
+	}
+
+	if (b.type === 'file-regex') {
+		if (typeof b.file !== 'string' || !b.file) throw new Error(`contracts[${idx}].buildCheck.file required for file-regex`);
+		if (typeof b.pattern !== 'string' || !b.pattern) throw new Error(`contracts[${idx}].buildCheck.pattern required`);
+		if (typeof b.message !== 'string' || !b.message) throw new Error(`contracts[${idx}].buildCheck.message required`);
+		const mustNotMatch = b.mustNotMatch === undefined ? true : Boolean(b.mustNotMatch);
+		return { type: 'file-regex', file: b.file, pattern: b.pattern, message: b.message, mustNotMatch };
+	}
+
+	throw new Error(`contracts[${idx}].buildCheck.type must be 'diff-regex' or 'file-regex'`);
 }
 
 /** Read + validate the raw contracts from the vault registry note. Returns the
@@ -254,7 +267,10 @@ const KNOWN_TASK_IDS = new Set<string>([
 	'vault-hygiene',
 	'project-hygiene',
 	'adr-status-drift-weekly',
+	'adr-implementation-drift-weekly',
 	'contract-registry-falsifier',
 	'notification-budget-falsifier',
 	'operator-notification-budget-falsifier',
+	// ADR-007 P1 — propose-only guard for the hygiene-fixer agent.
+	'hygiene-agent-propose-only-check',
 ]);

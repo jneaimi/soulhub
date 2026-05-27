@@ -43,7 +43,7 @@ await build({
 	build: {
 		ssr: true,
 		target: 'node22',
-		outDir: 'build',
+		outDir: process.env.BUILD_OUT_DIR ?? 'build',
 		emptyOutDir: false,
 		minify: false,
 		sourcemap: true,
@@ -58,4 +58,5 @@ await build({
 	},
 });
 
-console.log('[build-worker] wrote build/whatsapp-worker.js');
+const outDir = process.env.BUILD_OUT_DIR ?? 'build';
+console.log(`[build-worker] wrote ${outDir}/whatsapp-worker.js`);

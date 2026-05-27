@@ -128,6 +128,24 @@ def main():
             if hit == bool(must_not_match):
                 refusals.append(f"  ✗ {cid}: {bc.get('message', 'buildCheck failed')}")
 
+        if bc and bc.get("type") == "file-regex":
+            # ADR-007 — file-regex: read the full content of an absolute file path
+            # and run the pattern against it. Supports ~ expansion and abs: prefix.
+            raw_file = bc.get("file", "")
+            if raw_file.startswith("abs:"):
+                raw_file = raw_file[4:]
+            file_path = Path(raw_file.replace("~", str(Path.home())))
+            try:
+                file_content = file_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                # File missing = fail-open (agent profile may not be installed yet).
+                continue
+            pat = re.compile(bc["pattern"], re.IGNORECASE)
+            hit = bool(pat.search(file_content))
+            must_not_match = bc.get("mustNotMatch", True)
+            if hit == bool(must_not_match):
+                refusals.append(f"  ✗ {cid}: {bc.get('message', 'buildCheck failed')}")
+
     if warnings:
         sys.stderr.write("[contract-chokepoint] WARN (ADR-003 — not blocking):\n" + "\n".join(warnings) + "\n")
 

@@ -77,6 +77,7 @@ export function getOrchestratorMetrics(days = DEFAULT_DAYS): OrchestratorMetrics
 				COALESCE(SUM(CASE WHEN status='budget-exceeded' THEN 1 ELSE 0 END), 0)           AS s_budget,
 				COALESCE(SUM(CASE WHEN status='goal_achieved'   THEN 1 ELSE 0 END), 0)           AS s_goal_achieved,
 				COALESCE(SUM(CASE WHEN status='awaiting-budget-approval' THEN 1 ELSE 0 END), 0)   AS s_awaiting,
+				COALESCE(SUM(CASE WHEN status='awaiting-operator-input' THEN 1 ELSE 0 END), 0)  AS s_awaiting_operator,
 				COALESCE(SUM(cost_usd), 0)                                                        AS costUsd,
 				COALESCE(AVG(duration_ms), 0)                                                     AS avgDurationMs
 			 FROM agent_runs
@@ -91,6 +92,7 @@ export function getOrchestratorMetrics(days = DEFAULT_DAYS): OrchestratorMetrics
 			s_budget: number;
 			s_goal_achieved: number;
 			s_awaiting: number;
+			s_awaiting_operator: number;
 			costUsd: number;
 			avgDurationMs: number;
 		};
@@ -173,6 +175,8 @@ export function getOrchestratorMetrics(days = DEFAULT_DAYS): OrchestratorMetrics
 				'budget-exceeded': Number(aggRow.s_budget),
 				goal_achieved: Number(aggRow.s_goal_achieved),
 				'awaiting-budget-approval': Number(aggRow.s_awaiting),
+				// ADR-026 P2 — operator-input paused runs.
+				'awaiting-operator-input': Number(aggRow.s_awaiting_operator),
 			},
 		},
 		cancelRate: total > 0 ? Number(aggRow.s_cancelled) / total : 0,

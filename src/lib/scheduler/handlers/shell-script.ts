@@ -25,7 +25,31 @@
 
 import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
+import { delimiter } from 'node:path';
 import type { TaskFn } from '../task-types.js';
+
+/** Standard system bin dirs that must always be resolvable when we spawn a
+ *  task. A PM2 daemon resurrected at boot by launchd can inherit a stripped
+ *  environment whose PATH lacks `/bin` — then Node can't even find `bash` to
+ *  launch a shell-script task and fails with `spawn bash ENOENT`. We append
+ *  these to whatever PATH was inherited (operator-set entries keep priority)
+ *  so every install's shell-script tasks survive a bad-context restart. */
+const SYSTEM_PATH_DIRS = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
+
+/** Return a PATH string that's guaranteed to contain the system bin dirs,
+ *  preserving the caller's existing entries and their order — we only append
+ *  the standard dirs that aren't already present. */
+export function hardenPath(inheritedPath: string | undefined): string {
+	const entries = (inheritedPath ?? '').split(delimiter).filter(Boolean);
+	const seen = new Set(entries);
+	for (const dir of SYSTEM_PATH_DIRS) {
+		if (!seen.has(dir)) {
+			entries.push(dir);
+			seen.add(dir);
+		}
+	}
+	return entries.join(delimiter);
+}
 
 interface ShellScriptParams {
 	command: string[];
@@ -94,9 +118,16 @@ export function shellScriptFactory(params: unknown): TaskFn {
 		const externalSignal = ctx?.signal;
 
 		return await new Promise((resolvePromise, rejectPromise) => {
+			// Merge env, then guarantee PATH carries the system bin dirs so the
+			// interpreter (and the tools the script calls) resolve even under a
+			// minimal PM2-inherited PATH. An explicit PATH in `extraEnv` still
+			// wins — we only append what's missing.
+			const childEnv = { ...process.env, ...extraEnv };
+			childEnv.PATH = hardenPath(childEnv.PATH);
+
 			const child = spawn(bin, args, {
 				cwd,
-				env: { ...process.env, ...extraEnv },
+				env: childEnv,
 				stdio: ['ignore', 'pipe', 'pipe'],
 			});
 

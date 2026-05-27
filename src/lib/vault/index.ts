@@ -1268,82 +1268,27 @@ export class VaultEngine {
 	}
 
 	async moveNote(path: string, targetZone: string): Promise<WriteResult | WriteError> {
-		const existing = this.indexer.get(path);
-		if (!existing) {
-			return { success: false, error: `Note not found: ${path}` };
+		// ADR-006 P1.0 — inbound-wikilink-rewrite primitive.
+		// Delegate to relocateNotes which: (1) validates zone governance +
+		// collision, (2) captures all inbound-link rewrites BEFORE the
+		// physical move (resolver still sees the old path in the index),
+		// (3) moves the file via _relocateFile (logs + enqueues commit),
+		// (4) applies the precomputed rewrites atomically.
+		//
+		// This is additive / internal only — the public signature
+		// (path, targetZone) → WriteResult | WriteError is unchanged.
+		//
+		// Callers that need dry-run, batch moves, or an explicit rename
+		// alongside the zone change should call relocateNote / relocateNotes
+		// directly (ADR-007 promote, etc.).
+		const result = await this.relocateNotes([{ src: path, targetZone }]);
+		if (!result.success) {
+			return { success: false, error: result.error ?? 'Move failed' };
 		}
-
-		// Validate against target zone governance
-		const zone = this.governance.resolve(targetZone);
-		if (zone.allowedTypes.length > 0 && existing.meta.type && !zone.allowedTypes.includes(existing.meta.type)) {
-			return { success: false, error: `Type "${existing.meta.type}" not allowed in zone "${targetZone}"` };
+		if (result.moves.length === 0) {
+			return { success: false, error: 'No moves performed' };
 		}
-
-		const filename = path.split('/').pop()!;
-		const newPath = join(targetZone, filename);
-		const absSource = resolve(this.config.rootDir, path);
-		const absTarget = resolve(this.config.rootDir, newPath);
-
-		if (newPath === path) {
-			return { success: false, error: `Target zone equals source zone: ${path}` };
-		}
-
-		// Collision guard — `rename()` silently clobbers on POSIX. Refuse loud
-		// so the caller knows the target is occupied (mirrors ADR-012 archive
-		// guard).
-		try {
-			await stat(absTarget);
-			return { success: false, error: `Move target already exists: ${newPath}` };
-		} catch {
-			// Good — destination free.
-		}
-
-		try {
-			await mkdir(dirname(absTarget), { recursive: true });
-			await rename(absSource, absTarget);
-		} catch (err) {
-			this.logWrite({
-				action: 'move',
-				path: newPath,
-				previousPath: path,
-				agent: existing.meta.source_agent as string | undefined,
-				context: existing.meta.source_context as string | undefined,
-				zone: targetZone.split('/')[0],
-				type: existing.meta.type as string | undefined,
-				success: false,
-				error: err instanceof Error ? err.message : String(err),
-			});
-			return { success: false, error: `Move failed: ${err instanceof Error ? err.message : String(err)}` };
-		}
-
-		this.indexer.remove(path);
-		this.searcher.remove(path);
-		await this.indexer.reindex(newPath);
-		const note = this.indexer.get(newPath);
-		if (note) this.searcher.upsert(note);
-
-		this.logWrite({
-			action: 'move',
-			path: newPath,
-			previousPath: path,
-			agent: existing.meta.source_agent as string | undefined,
-			context: existing.meta.source_context as string | undefined,
-			zone: targetZone.split('/')[0],
-			type: existing.meta.type as string | undefined,
-			success: true,
-		});
-
-		this.committer.enqueue({
-			action: 'move',
-			path: newPath,
-			previousPath: path,
-			zone: targetZone.split('/')[0],
-			type: existing.meta.type as string | undefined,
-			agent: existing.meta.source_agent as string | undefined,
-			context: existing.meta.source_context as string | undefined,
-		});
-
-		return { success: true, path: newPath };
+		return { success: true, path: result.moves[0].dst };
 	}
 
 	/** ADR-004 (soul-hub-cli) — link-safe relocation. Moves one note (optionally

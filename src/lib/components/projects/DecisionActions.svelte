@@ -1,11 +1,27 @@
 <script lang="ts">
 	/** Inline accept / reject / park buttons for a proposed ADR.
 	 *
+	 *  projects-graph ADR-025 D5 — Legible dispatch UX.
+	 *
 	 *  Used by the Decision Queue (/projects/queue) and the project detail page
 	 *  (/projects/[slug]). Wraps POST /api/vault/decisions/transition and emits
 	 *  a typed callback when the transition lands so the parent can drop or
 	 *  refresh the row.
+	 *
+	 *  Button layout (D5 — two named buttons):
+	 *  - Agent resolved  → primary "Accept → 🤖 {agent}" (confirm → accept + dispatch)
+	 *                     + secondary "Accept (I'll handle it)" (plain human accept)
+	 *                     + Reject  + Park
+	 *  - No agent routes → plain "Accept" + Reject + Park (no AI affordance)
+	 *
+	 *  The confirm dialog shows agent / mode / cost estimate before dispatching,
+	 *  eliminating blind-spend risk (D5 finding #4).  On confirm the component
+	 *  accepts the decision (sets assignee to the agent) then signals the page
+	 *  via `onDispatch` so the page opens the AdrDrawer with autoDispatch=true
+	 *  and reuses the existing stream + code-review card (no duplicate UI).
 	 */
+
+	import { decisionActionModel, buildConfirmMessage } from '$lib/projects/decision-actions-model.js';
 
 	type Action = 'accept' | 'reject' | 'park';
 
@@ -13,23 +29,54 @@
 		path: string;
 		size?: 'sm' | 'md';
 		onTransition?: (info: { path: string; action: Action; newStatus: string }) => void;
+		/** projects-graph ADR-025 D5 — routing inputs.
+		 *  Passed from the page which loads the roster ONCE and has full row meta.
+		 *  All optional so existing call sites without routing context get a plain
+		 *  Accept button (safe fallback). */
+		work_type?: string | null;
+		assignee?: string | null;
+		tags?: string[];
+		agentIds?: Set<string>;
+		/** ADR-014 D1 — repo map from the roster load (agent-id → repo path).
+		 *  When provided, coding candidates without a repo are skipped so the AI
+		 *  button is hidden rather than showing a dispatch that would fail. */
+		agentRepos?: Map<string, string | undefined>;
+		/** Called after a successful accept+dispatch confirm.
+		 *  The page opens the AdrDrawer for `path` with autoDispatch=true,
+		 *  reusing the drawer's existing stream + code-review card. */
+		onDispatch?: (path: string) => void;
 	}
 
-	let { path, size = 'md', onTransition }: Props = $props();
+	let {
+		path,
+		size = 'md',
+		onTransition,
+		work_type = null,
+		assignee = null,
+		tags = [],
+		agentIds = new Set<string>(),
+		agentRepos,
+		onDispatch,
+	}: Props = $props();
 
-	/** Default executor for the "Accept → AI" handoff (soul-hub-governance
-	 *  dispose→execute step). The conductor coordinates + dispatches to the right
-	 *  specialist; reassign in the drawer for a specific agent. */
-	const HANDOFF_AGENT = 'conductor';
+	type Mode = null | 'reject' | 'park' | 'confirm-ai';
 
 	let acting = $state<Action | null>(null);
-	let mode = $state<null | 'reject' | 'park'>(null);
+	let mode = $state<Mode>(null);
 	let rejectReason = $state('');
 	let parkReviewAfter = $state('');
 	let result = $state<{ status: 'ok' | 'error'; message: string } | null>(null);
 
 	const padding = $derived(size === 'sm' ? 'px-2.5 py-1' : 'px-3 py-1.5');
 	const textSize = $derived(size === 'sm' ? 'text-[11px]' : 'text-xs');
+
+	/** D5 — resolved agent + showAiButton flag. Recomputed when roster or
+	 *  metadata changes (agentIds is a Set, so reassignment triggers reactivity).
+	 *  ADR-014 D1 — agentRepos passed so repo-less coding agents are hidden. */
+	const actionModel = $derived(decisionActionModel(work_type, assignee, tags, agentIds, agentRepos));
+	const resolvedAgent = $derived(actionModel.resolvedAgent);
+	const showAiButton = $derived(actionModel.showAiButton);
+	const confirmMessage = $derived(resolvedAgent ? buildConfirmMessage(resolvedAgent) : '');
 
 	async function transition(action: Action, body: Record<string, unknown> = {}) {
 		acting = action;
@@ -56,24 +103,59 @@
 			acting = null;
 		}
 	}
+
+	/** D5 confirm path — accept the decision with the resolved agent as assignee,
+	 *  then signal the page to open the AdrDrawer with autoDispatch=true.
+	 *  The drawer reuses its existing dispatchToAI() + stream + code-review card. */
+	async function confirmDispatch() {
+		if (!resolvedAgent) return;
+		const agent = resolvedAgent;
+		mode = null;
+		await transition('accept', { assignee: agent });
+		// Signal the page AFTER the transition completes so the row has been
+		// removed / refreshed before the drawer is (re-)opened.
+		onDispatch?.(path);
+	}
+
+	/** Move a node to <body> so a `position: fixed` overlay escapes any ancestor
+	 *  with a transform / filter / overflow (which would otherwise become its
+	 *  containing block and trap it). The confirm modal renders in both the
+	 *  constrained list row and the drawer, so it must be portal-safe. */
+	function portal(node: HTMLElement) {
+		document.body.appendChild(node);
+		return { destroy() { node.parentNode?.removeChild(node); } };
+	}
 </script>
 
+<!-- Button row -->
 <div class="flex items-center gap-1 flex-shrink-0">
-	<button
-		onclick={() => transition('accept')}
-		disabled={acting !== null}
-		class="{padding} rounded {textSize} font-medium bg-hub-info/15 text-hub-info hover:bg-hub-info/25 transition-colors cursor-pointer disabled:opacity-50"
-	>
-		{acting === 'accept' ? '…' : 'Accept'}
-	</button>
-	<button
-		onclick={() => transition('accept', { assignee: HANDOFF_AGENT })}
-		disabled={acting !== null}
-		title="Accept and hand to AI ({HANDOFF_AGENT}) — moves to Ready for AI. Reassign in the drawer for a specific agent."
-		class="{padding} rounded {textSize} font-medium bg-hub-cta/15 text-hub-cta hover:bg-hub-cta/25 transition-colors cursor-pointer disabled:opacity-50"
-	>
-		{acting === 'accept' ? '…' : 'Accept → AI'}
-	</button>
+	{#if showAiButton}
+		<!-- D5 primary: Accept → 🤖 {agent} — opens the confirm panel -->
+		<button
+			onclick={() => { mode = mode === 'confirm-ai' ? null : 'confirm-ai'; }}
+			disabled={acting !== null}
+			class="{padding} rounded {textSize} font-medium bg-hub-cta/15 text-hub-cta hover:bg-hub-cta/25 transition-colors cursor-pointer disabled:opacity-50"
+		>
+			{acting === 'accept' ? '…' : `Accept → 🤖 ${resolvedAgent}`}
+		</button>
+		<!-- D5 secondary: human-owned accept (no AI) -->
+		<button
+			onclick={() => transition('accept')}
+			disabled={acting !== null}
+			class="{padding} rounded {textSize} font-medium bg-hub-info/15 text-hub-info hover:bg-hub-info/25 transition-colors cursor-pointer disabled:opacity-50"
+		>
+			{acting === 'accept' ? '…' : "Accept (I'll handle it)"}
+		</button>
+	{:else}
+		<!-- No agent routes — plain accept, no AI affordance -->
+		<button
+			onclick={() => transition('accept')}
+			disabled={acting !== null}
+			class="{padding} rounded {textSize} font-medium bg-hub-info/15 text-hub-info hover:bg-hub-info/25 transition-colors cursor-pointer disabled:opacity-50"
+		>
+			{acting === 'accept' ? '…' : 'Accept'}
+		</button>
+	{/if}
 	<button
 		onclick={() => { mode = mode === 'reject' ? null : 'reject'; }}
 		disabled={acting !== null}
@@ -89,6 +171,39 @@
 		Park
 	</button>
 </div>
+
+<!-- D5 confirm — centered modal overlay so it never competes with the
+     constrained list-row / drawer layout (a sibling inline panel squished
+     the row + wrapped the title; live walkthrough 2026-05-26). -->
+{#if mode === 'confirm-ai' && resolvedAgent}
+	<div use:portal class="fixed inset-0 z-[60] flex items-center justify-center p-4">
+		<button
+			type="button"
+			aria-label="Cancel dispatch"
+			class="absolute inset-0 bg-black/50 cursor-default"
+			onclick={() => { mode = null; }}
+		></button>
+		<div class="relative w-full max-w-md p-4 rounded-lg bg-hub-surface border border-hub-cta/30 shadow-xl">
+			<p class="text-sm text-hub-text font-medium mb-1">Dispatch to AI?</p>
+			<p class="text-xs text-hub-dim mb-4">{confirmMessage}</p>
+			<div class="flex items-center justify-end gap-2">
+				<button
+					onclick={() => { mode = null; }}
+					class="px-3 py-1.5 rounded text-xs text-hub-dim hover:text-hub-text transition-colors cursor-pointer"
+				>
+					Cancel
+				</button>
+				<button
+					onclick={confirmDispatch}
+					disabled={acting !== null}
+					class="px-3 py-1.5 rounded text-xs font-medium bg-hub-cta text-hub-bg hover:bg-hub-cta/90 transition-colors cursor-pointer disabled:opacity-50"
+				>
+					{acting === 'accept' ? '…' : 'Dispatch'}
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}
 
 {#if mode === 'reject'}
 	<div class="mt-3 p-3 rounded-lg bg-hub-surface border border-hub-danger/30">

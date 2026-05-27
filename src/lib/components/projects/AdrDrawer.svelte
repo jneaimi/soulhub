@@ -13,7 +13,8 @@
 	import { onMount, untrack } from 'svelte';
 	import RenderedMarkdown from '../RenderedMarkdown.svelte';
 	import DecisionActions from './DecisionActions.svelte';
-	import { resolveAgentForWork } from '$lib/projects/dispatch-routing.js';
+	import { resolveAgentForWork, clusterFromTags, classifySurface } from '$lib/projects/dispatch-routing.js';
+	import { parseHandback, handbackGatesGreen, type ParsedHandback } from '$lib/agents/handback.js';
 
 	interface NoteLink {
 		raw: string;
@@ -29,6 +30,11 @@
 		rendered: string;
 		contentIsRtl?: boolean;
 		links?: NoteLink[];
+		/** Engine-resolved relationship-field wikilinks (`blocked_by`, etc.):
+		 *  raw target → vault path (or null if unresolvable). Authoritative —
+		 *  uses the global slug/alias index, so cross-project bare slugs resolve
+		 *  correctly where the drawer's directory-relative fallback would 404. */
+		depResolved?: Record<string, string | null>;
 		backlinks?: string[];
 	}
 
@@ -38,9 +44,17 @@
 		path: string | null;
 		onClose: () => void;
 		onTransition?: (info: { path: string; action: DrawerAction; newStatus: string }) => void;
+		/** projects-graph ADR-025 D5 — when true AND canDispatch, call dispatchToAI()
+		 *  once after the note loads.  Set by the page after an Accept → AI confirm
+		 *  from DecisionActions so the drawer reuses its existing stream + review card. */
+		autoDispatch?: boolean;
+		/** projects-graph ADR-025 D5 — propagated from the page to DecisionActions
+		 *  inside this drawer so the confirm flow closes + re-opens the drawer with
+		 *  autoDispatch=true even when the confirm originates from inside the drawer. */
+		onDispatch?: (path: string) => void;
 	}
 
-	let { path, onClose, onTransition }: Props = $props();
+	let { path, onClose, onTransition, autoDispatch = false, onDispatch }: Props = $props();
 
 	/** Internal navigation state — mirrors `path` from the parent on open,
 	 *  but lets in-drawer link clicks (cross-project panel) swap to another
@@ -54,6 +68,9 @@
 
 	// Phase 3a affordances state
 	let shipping = $state(false);
+	// projects-graph ADR-027 P1 — Ship & merge state
+	let shippingAndMerging = $state(false);
+	let shipMergeError = $state('');
 	let savingTarget = $state(false);
 	let targetDateInput = $state('');
 	let editingTarget = $state(false);
@@ -63,12 +80,40 @@
 	let editingAssignee = $state(false);
 	// projects-graph ADR-018 S2 — Dispatch to AI loop (drawer).
 	let agentIds = $state<Set<string>>(new Set());
+	// ADR-014 D1 — parallel repo map so routing refuses repo-less coding agents.
+	let agentRepos = $state<Map<string, string | undefined>>(new Map());
 	let dispatchMode = $state<'test' | 'production'>('test');
 	let dispatching = $state(false);
 	let dispatchOutput = $state('');
 	let dispatchError = $state('');
 	let dispatchDoneNote = $state<string | null>(null);
 	let mutationError = $state('');
+
+	// projects-graph ADR-024 D2 — "Send back to AI" iterate loop state.
+	// The affordance lives inside the D1 review card; it collapses until
+	// the operator clicks "↩ Send back to AI…".
+	let sendBackExpanded = $state(false);
+	let sendBackFeedback = $state('');
+	let sendingBack = $state(false);
+	let sendBackError = $state('');
+
+	// projects-graph ADR-024 D1 / ADR-028 — parsed soul-hub-implementer hand-back.
+	// Populated after a coding dispatch completes; drives the code-review card
+	// and the D3 ship gate. Cleared on each new load or re-dispatch.
+	// Type is the shared ParsedHandback from $lib/agents/handback.js (ADR-028).
+	let implementerReturn = $state<ParsedHandback | null>(null);
+	let implementerSessionId = $state<string | null>(null);
+	let implementerParseError = $state<string | null>(null);
+
+	// projects-graph ADR-024 D4 — blocker status cache.
+	// Keyed by resolved vault path; value is the blocker's status string or
+	// null if unreachable. Undefined (key missing) means "not yet fetched".
+	let blockerStatuses = $state<Record<string, string | null>>({});
+
+	// projects-graph ADR-025 D5 — auto-dispatch guard: tracks whether we have
+	// already fired dispatchToAI() for the current open+autoDispatch=true cycle.
+	// Reset to false in load() so each new open can trigger exactly once.
+	let autoDispatched = $state(false);
 
 	const status = $derived(note ? String(note.meta.status ?? '').toLowerCase() : '');
 	const isProposed = $derived(status === 'proposed');
@@ -157,10 +202,41 @@
 	const project = $derived(typeof note?.meta.project === 'string' ? note.meta.project : '');
 	const assignee = $derived(typeof note?.meta.assignee === 'string' ? note.meta.assignee : '');
 	const workType = $derived(typeof note?.meta.work_type === 'string' ? note.meta.work_type : '');
-	// projects-graph ADR-018 S2 — which agent (if any) can run this artifact.
-	const dispatchTarget = $derived(resolveAgentForWork(workType, assignee, agentIds));
-	const canDispatch = $derived(!!dispatchTarget && isTransitionable && status !== 'shipped');
+	// projects-graph ADR-025 D2 — cluster signal for capability-aware routing.
+	// Moved before dispatchTarget so cluster is available when the derived is evaluated.
 	const tags = $derived(extractStringArray(note?.meta.tags));
+	const cluster = $derived(clusterFromTags(tags));
+	// projects-graph ADR-018 S2 — which agent (if any) can run this artifact.
+	// projects-graph ADR-025 D2 — passes cluster so soul-hub coding work routes to
+	// soul-hub-implementer instead of developer when the agent is in the roster.
+	// ADR-014 D1 — passes agentRepos so repo-less coding candidates are refused.
+	const dispatchTarget = $derived(resolveAgentForWork(workType, assignee, agentIds, cluster, agentRepos));
+	const canDispatch = $derived(!!dispatchTarget && isTransitionable && status !== 'shipped');
+	// projects-graph ADR-024 D1 — implementation dispatches (coding work, or the
+	// soul-hub-implementer) MUST run in production mode: the `test` caps
+	// (60s / 5 turns / $0.10) cannot implement an ADR. Pin them to production
+	// regardless of the toggle; clerical work keeps the test/production choice.
+	const isImplementationDispatch = $derived(
+		dispatchTarget === 'soul-hub-implementer' || workType === 'coding',
+	);
+	// ADR-012 P3 — the artifact's implementation surface. A non-soul-hub surface
+	// (e.g. `~/.claude/agents`) means the default worktree dispatch is NOT where
+	// this work lands; surface a warning so the operator routes deliberately.
+	const surface = $derived(classifySurface(note?.meta ?? {}));
+	const surfaceOutOfWorktree = $derived(
+		isImplementationDispatch && surface.kind !== 'soul-hub',
+	);
+	// projects-graph ADR-024 D1 / ADR-028 — all implementer gates green (drives D3).
+	// Delegates to the shared handbackGatesGreen from $lib/agents/handback.js so
+	// the definition of "green" is identical across drawer, worklist, and ship-merge.
+	const implementerGatesGreen = $derived(
+		implementerReturn !== null && handbackGatesGreen(implementerReturn),
+	);
+	// projects-graph ADR-024 D3 — coding dispatch with a parsed red hand-back
+	// gates the Ship button (operator can only Send-back or Reject until green).
+	const shipGatedByCodeReview = $derived(
+		isImplementationDispatch && implementerReturn !== null && !implementerGatesGreen,
+	);
 	const falsifierDate = $derived(
 		extractDate(note?.meta.falsifier_date) ?? extractDate(note?.meta.falsifierDate),
 	);
@@ -180,6 +256,33 @@
 		if (Array.isArray(raw)) return raw.filter((x) => typeof x === 'string') as string[];
 		if (typeof raw === 'string') return [raw];
 		return [];
+	}
+
+	// projects-graph ADR-024 D4 — true when this edge targets a different project.
+	function isEdgeExternal(edge: DepEdge): boolean {
+		return extractProject(edge.resolved) !== ownProject;
+	}
+
+	// projects-graph ADR-024 D4 — fire background status fetches for all
+	// upstream blockers (including cross-project). Called after `note` loads.
+	function loadBlockerStatuses() {
+		const edges = upstreamEdges; // read derived after note is set
+		for (const edge of edges) {
+			const resolved = edge.resolved;
+			fetch(`/api/vault/notes/${resolved}`)
+				.then(async (r) => {
+					if (!r.ok) {
+						blockerStatuses[resolved] = null;
+						return;
+					}
+					const data = (await r.json()) as { meta?: { status?: unknown } };
+					const s = typeof data?.meta?.status === 'string' ? data.meta.status : null;
+					blockerStatuses[resolved] = s;
+				})
+				.catch(() => {
+					blockerStatuses[resolved] = null;
+				});
+		}
 	}
 
 	/** Phase 3b — parse `"[[slug]]"` or `"[[path/to/note]]"` wikilink values out
@@ -229,7 +332,14 @@
 		const items: DepEdge[] = [];
 		for (const [field, label] of fields) {
 			for (const raw of parseWikilinks(note.meta[field])) {
-				items.push({ label, raw, resolved: resolveRelLink(raw, note.path) });
+				// Prefer the engine's authoritative resolution (global slug/alias
+				// index — handles cross-project bare slugs). Fall back to the naive
+				// directory-relative resolve only when the API didn't supply one
+				// (older payloads) or it couldn't resolve (null → leave a best-effort
+				// guess so the edge still renders a name rather than vanishing).
+				const fromApi = note.depResolved?.[raw];
+				const resolved = fromApi ?? resolveRelLink(raw, note.path);
+				items.push({ label, raw, resolved });
 			}
 		}
 		return items;
@@ -262,6 +372,18 @@
 		loading = true;
 		error = '';
 		note = null;
+		// Reset D1/D2/D3 code-review state and D4 blocker cache on each new load.
+		implementerReturn = null;
+		implementerSessionId = null;
+		implementerParseError = null;
+		blockerStatuses = {};
+		// ADR-027 — reset ship-merge error on each note navigation.
+		shipMergeError = '';
+		// projects-graph ADR-025 D5 — reset auto-dispatch guard for each new note.
+		autoDispatched = false;
+		sendBackExpanded = false;
+		sendBackFeedback = '';
+		sendBackError = '';
 		try {
 			const res = await fetch(`/api/vault/notes/${p}`);
 			if (!res.ok) {
@@ -269,10 +391,49 @@
 				throw new Error(data.error ?? `HTTP ${res.status}`);
 			}
 			note = await res.json();
+			// D4: fire background fetches for blocker statuses (non-blocking).
+			loadBlockerStatuses();
+			// ADR-026 D3 (drawer hydration) — if a PAST dispatch left an un-merged
+			// branch + hand-back, re-show the review card + Ship/Send-back. Skip
+			// when autoDispatch is set: a fresh dispatch will populate the card and
+			// would otherwise reset what we hydrate (avoids a flash).
+			if (!autoDispatch) hydrateReviewCard(p);
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Failed to load note';
 		} finally {
 			loading = false;
+		}
+	}
+
+	/** ADR-026 D3 (drawer hydration) — best-effort: pull the latest completed,
+	 *  un-merged dispatch for this subject and pre-fill the ADR-024 review card
+	 *  (`implementerReturn` + session id) so Ship / Send-back render WITHOUT a
+	 *  live dispatch stream. The endpoint already gates on branch liveness +
+	 *  success status, so a non-implementation note simply gets `available:false`. */
+	async function hydrateReviewCard(p: string) {
+		// Don't bother for already-closed lifecycle states — nothing to ship.
+		const st = String(note?.meta.status ?? '').toLowerCase();
+		if (['shipped', 'rejected', 'parked', 'superseded'].includes(st)) return;
+		try {
+			const res = await fetch(`/api/agents/review-handoff?subject=${encodeURIComponent(p)}`);
+			if (!res.ok) return;
+			const data = (await res.json()) as {
+				available: boolean;
+				sessionId?: string | null;
+				handbackRaw?: string | null;
+			};
+			if (!data.available) return;
+			// Race guard: the await may have outlived this open. Only hydrate the
+			// still-open, not-dispatching, not-already-populated card for THIS path.
+			if (currentPath !== p || dispatching || implementerReturn !== null) return;
+			const parsed = data.handbackRaw ? parseHandback(data.handbackRaw) : null;
+			if (parsed) {
+				implementerReturn = parsed;
+				implementerSessionId = data.sessionId ?? null;
+				implementerParseError = null;
+			}
+		} catch {
+			// best-effort — on failure the card just won't pre-fill (live dispatch still works)
 		}
 	}
 
@@ -305,6 +466,16 @@
 		});
 	});
 
+	// projects-graph ADR-025 D5 — fire dispatchToAI() exactly once when the
+	// parent opens the drawer with autoDispatch=true after an Accept → AI confirm.
+	// Guard: note loaded + canDispatch + not already dispatched + not mid-flight.
+	$effect(() => {
+		if (autoDispatch && canDispatch && !autoDispatched && !dispatching && note) {
+			autoDispatched = true;
+			dispatchToAI();
+		}
+	});
+
 	function handleTransition(info: { path: string; action: DrawerAction; newStatus: string }) {
 		onTransition?.(info);
 		// Close after a successful transition — the row in the parent list
@@ -332,6 +503,35 @@
 			mutationError = e instanceof Error ? e.message : 'Network error';
 		} finally {
 			shipping = false;
+		}
+	}
+
+	/**
+	 * projects-graph ADR-027 P1 — "Ship & merge": merges the implementer's
+	 * orchestration branch to main then flips the ADR status to `shipped`.
+	 * All guards run server-side; this function only drives UI state.
+	 */
+	async function shipAndMerge() {
+		if (!note || shippingAndMerging) return;
+		shippingAndMerging = true;
+		shipMergeError = '';
+		mutationError = '';
+		try {
+			const res = await fetch('/api/agents/ship-merge', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ path: note.path }),
+			});
+			const data = await res.json();
+			if (!res.ok || !data.success) {
+				shipMergeError = data.error ?? `HTTP ${res.status}`;
+				return;
+			}
+			handleTransition({ path: note.path, action: 'ship', newStatus: data.newStatus });
+		} catch (e) {
+			shipMergeError = e instanceof Error ? e.message : 'Network error';
+		} finally {
+			shippingAndMerging = false;
 		}
 	}
 
@@ -412,6 +612,8 @@
 
 	// projects-graph ADR-018 S2 — load the roster once so resolveAgentForWork
 	// can validate an assignee-as-agent and the work_type→agent map.
+	// ADR-014 D1 — also captures repo per agent so routing can refuse repo-less
+	// coding candidates (avoids unisolated run; matches D1 in dispatch-routing.ts).
 	async function loadAgentIds() {
 		if (agentIds.size > 0) return;
 		try {
@@ -419,9 +621,19 @@
 			if (!res.ok) return;
 			const data = await res.json();
 			const list = Array.isArray(data) ? data : (data.agents ?? data.results ?? []);
-			agentIds = new Set(
-				list.map((a: { id?: string }) => (a.id ?? '').toLowerCase()).filter(Boolean),
-			);
+			const newIds = new Set<string>();
+			const newRepos = new Map<string, string | undefined>();
+			for (const a of list as Array<{ id?: string; repo?: string }>) {
+				const id = (a.id ?? '').toLowerCase();
+				if (!id) continue;
+				newIds.add(id);
+				newRepos.set(
+					id,
+					typeof a.repo === 'string' && a.repo.trim() ? a.repo.trim() : undefined,
+				);
+			}
+			agentIds = newIds;
+			agentRepos = newRepos;
 		} catch {
 			/* roster unavailable — Dispatch button simply won't show */
 		}
@@ -438,10 +650,19 @@
 		dispatchOutput = '';
 		dispatchError = '';
 		dispatchDoneNote = null;
+		// D1/D2 — reset code-review card + iterate state on each new dispatch.
+		implementerReturn = null;
+		implementerSessionId = null;
+		implementerParseError = null;
+		sendBackExpanded = false;
+		sendBackFeedback = '';
+		sendBackError = '';
 		const agent = dispatchTarget;
 		const artifactPath = note.path;
 		const artifactSlug = artifactPath.split('/').pop()?.replace(/\.md$/i, '') ?? artifactPath;
 		const proj = project;
+		// ADR-024 D1 — implementation work overrides the toggle to production.
+		const effectiveMode = isImplementationDispatch ? 'production' : dispatchMode;
 		try {
 			// Stamp ownership first so the lane + chip reflect the dispatch.
 			if (assignee !== agent) {
@@ -457,10 +678,12 @@
 				`${note.content ?? ''}\n\n` +
 				`Produce the deliverable and return it as your final output.`;
 
-			const res = await fetch(`/api/agents/${agent}/test?mode=${dispatchMode}`, {
+			const res = await fetch(`/api/agents/${agent}/test?mode=${effectiveMode}`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ task: task.slice(0, 4000), subject: artifactPath }),
+				// ADR-014 D2 — pass work_type so the server guard can refuse repo-less
+				// coding dispatches even when reached via direct API or CLI (belt-and-suspenders).
+				body: JSON.stringify({ task: task.slice(0, 4000), subject: artifactPath, work_type: workType }),
 			});
 			if (!res.ok || !res.body) {
 				const data = await res.json().catch(() => ({}));
@@ -490,8 +713,16 @@
 					} else if (ev.type === 'error') {
 						dispatchError = String(ev.message ?? 'dispatch error');
 					} else if (ev.type === 'done') {
-						const result = ev.result as { output?: string } | undefined;
+						// ADR-024 D1 — capture the full DispatchResult so we can extract
+						// claude_session_id for a future --resume loop (D2).
+						const result = ev.result as {
+							output?: string;
+							claude_session_id?: string;
+						} | undefined;
 						finalOutput = result?.output ?? dispatchOutput;
+						if (result?.claude_session_id) {
+							implementerSessionId = result.claude_session_id;
+						}
 					}
 				}
 			}
@@ -501,6 +732,21 @@
 			if (!body) {
 				dispatchError = 'Agent returned no output.';
 				return;
+			}
+
+			// projects-graph ADR-024 D1 — for coding dispatches, parse the
+			// soul-hub-implementer hand-back JSON out of the agent's output.
+			// Drives the code-review card and the D3 ship gate.
+			if (isImplementationDispatch) {
+				const parsed = parseHandback(body);
+				if (parsed) {
+					implementerReturn = parsed;
+					implementerParseError = null;
+				} else {
+					implementerReturn = null;
+					implementerParseError =
+						'Could not parse implementer hand-back JSON — review the raw output note.';
+				}
 			}
 
 			// Write the deliverable back as a linked output note (review-then-ship).
@@ -513,7 +759,7 @@
 				`- **Source artifact**: [[${artifactSlug}]]\n` +
 				`- **Agent**: ${agent}\n` +
 				`- **Run ID**: ${runId || '(n/a)'}\n` +
-				`- **Mode**: ${dispatchMode}\n` +
+				`- **Mode**: ${effectiveMode}\n` +
 				`- **Date**: ${stamp}\n\n` +
 				`> AI-generated. Review before shipping the source artifact.\n\n` +
 				`## Output\n\n` +
@@ -548,6 +794,154 @@
 		} catch (e) {
 			dispatchError = e instanceof Error ? e.message : 'Dispatch failed';
 		} finally {
+			dispatching = false;
+		}
+	}
+
+	/**
+	 * ADR-024 D2 — Re-dispatch on the SAME branch + session.
+	 *
+	 * Posts `{ task: feedback, subject, resume: sessionId, branch }` to the test
+	 * endpoint in production mode.  `dispatching` stays `true` throughout so the
+	 * live-output `<pre>` block keeps rendering (artifact in flight per spec).
+	 * On completion the hand-back is re-parsed and `implementerReturn` is updated
+	 * in place — the review card refreshes without a new note navigation.
+	 */
+	async function sendBackToAI() {
+		if (!note || sendingBack || !implementerSessionId || !implementerReturn || !dispatchTarget) return;
+		const feedback = sendBackFeedback.trim();
+		if (!feedback) {
+			sendBackError = 'Enter feedback for the AI before sending.';
+			return;
+		}
+
+		// Capture before clearing (implementerReturn is reset below).
+		const sessionId = implementerSessionId;
+		const branch = implementerReturn.branch;
+		const agent = dispatchTarget;
+		const artifactPath = note.path;
+		const artifactSlug = artifactPath.split('/').pop()?.replace(/\.md$/i, '') ?? artifactPath;
+		const proj = project;
+
+		sendingBack = true;
+		dispatching = true;
+		sendBackError = '';
+		dispatchOutput = '';
+		dispatchError = '';
+		dispatchDoneNote = null;
+		sendBackExpanded = false;
+		sendBackFeedback = '';
+		// Reset review card — will be repopulated when the resume completes.
+		implementerReturn = null;
+		implementerSessionId = null;
+		implementerParseError = null;
+
+		try {
+			const res = await fetch(`/api/agents/${agent}/test?mode=production`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					task: feedback.slice(0, 4000),
+					subject: artifactPath,
+					resume: sessionId,
+					branch,
+				}),
+			});
+			if (!res.ok || !res.body) {
+				const data = await res.json().catch(() => ({}));
+				throw new Error(data.message ?? data.error ?? `HTTP ${res.status}`);
+			}
+
+			// Consume NDJSON stream — identical to dispatchToAI's stream loop.
+			const reader = res.body.getReader();
+			const decoder = new TextDecoder();
+			let buf = '';
+			let finalOutput = '';
+			for (;;) {
+				const { value, done } = await reader.read();
+				if (done) break;
+				buf += decoder.decode(value, { stream: true });
+				const lines = buf.split('\n');
+				buf = lines.pop() ?? '';
+				for (const line of lines) {
+					if (!line.trim()) continue;
+					let ev: Record<string, unknown>;
+					try { ev = JSON.parse(line); } catch { continue; }
+					if (ev.type === 'output' && typeof ev.data === 'string') {
+						dispatchOutput += ev.data;
+					} else if (ev.type === 'error') {
+						dispatchError = String(ev.message ?? 'dispatch error');
+					} else if (ev.type === 'done') {
+						const result = ev.result as { output?: string; claude_session_id?: string } | undefined;
+						finalOutput = result?.output ?? dispatchOutput;
+						if (result?.claude_session_id) {
+							// Preserve session id for a future iteration.
+							implementerSessionId = result.claude_session_id;
+						}
+					}
+				}
+			}
+			if (dispatchError) return;
+
+			const body = finalOutput.trim() || dispatchOutput.trim();
+			if (!body) {
+				dispatchError = 'Agent returned no output.';
+				return;
+			}
+
+			// Re-parse the updated hand-back → review card refreshes in place.
+			const parsed = parseHandback(body);
+			if (parsed) {
+				implementerReturn = parsed;
+				implementerParseError = null;
+			} else {
+				implementerReturn = null;
+				implementerParseError =
+					'Could not parse implementer hand-back JSON — review the raw output note.';
+			}
+
+			// Write the iterate output note (audit trail).
+			const stamp = new Date().toISOString().slice(0, 10);
+			const filename = `${artifactSlug}-output-${stamp}-iterate.md`;
+			const noteContent =
+				`# Output (iterate) — ${note.title}\n\n` +
+				`## Pipeline Context\n\n` +
+				`- **Source artifact**: [[${artifactSlug}]]\n` +
+				`- **Agent**: ${agent}\n` +
+				`- **Branch**: \`${branch}\`\n` +
+				`- **Mode**: production (resume)\n` +
+				`- **Date**: ${stamp}\n\n` +
+				`> AI-generated (resume iteration). Review before shipping the source artifact.\n\n` +
+				`## Output\n\n` +
+				body;
+			const writeRes = await fetch('/api/vault/notes', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					zone: `projects/${proj}`,
+					filename,
+					meta: {
+						type: 'output',
+						created: stamp,
+						tags: [proj, 'ai-output', 'iterate'],
+						project: proj,
+						assignee: agent,
+						pipeline: 'ai-dispatch-resume',
+						relates_to: [`[[${artifactSlug}]]`],
+					},
+					content: noteContent,
+				}),
+			});
+			const writeData = await writeRes.json();
+			if (!writeRes.ok || writeData.success === false) {
+				dispatchError = `Output write failed: ${writeData.error ?? writeRes.status}`;
+				return;
+			}
+			dispatchDoneNote = `projects/${proj}/${filename}`;
+		} catch (e) {
+			dispatchError = e instanceof Error ? e.message : 'Send back failed';
+		} finally {
+			sendingBack = false;
 			dispatching = false;
 		}
 	}
@@ -683,7 +1077,16 @@
 					<div class="mb-5 p-3 rounded-lg border border-hub-warning/30 bg-hub-warning/5">
 						<div class="flex items-center justify-between gap-3 mb-1">
 							<p class="text-xs text-hub-warning">{isDecision ? 'Awaiting decision' : 'Awaiting triage'}</p>
-							<DecisionActions path={note.path} size="sm" onTransition={handleTransition} />
+							<DecisionActions
+							path={note.path}
+							size="sm"
+							onTransition={handleTransition}
+							work_type={workType}
+							assignee={assignee}
+							tags={tags}
+							agentIds={agentIds}
+							onDispatch={onDispatch}
+						/>
 						</div>
 
 						<!-- Target date editor — drives the planned-Gantt view (Phase 3a) -->
@@ -725,49 +1128,132 @@
 					</div>
 				{/if}
 
-				<!-- Ship button for accepted artifacts (P3: any transitionable type) -->
+				<!-- Ship controls for accepted artifacts (P3: any transitionable type).
+				     projects-graph ADR-024 D3 — gated on implementer gates when
+				     this is a coding artifact with a parsed hand-back.
+				     projects-graph ADR-027 P1 — button matrix:
+				       coding + green  → Ship & merge (primary) + Mark shipped (secondary)
+				       coding + red    → disabled (existing shipGatedByCodeReview guard)
+				       non-coding / no hand-back → Mark shipped (unchanged) -->
 				{#if isAccepted && isTransitionable}
-					<div class="mb-5 p-3 rounded-lg border border-hub-info/30 bg-hub-info/5 flex items-center justify-between gap-3">
-						<div>
-							<p class="text-xs text-hub-info">Decision accepted{acceptedOn ? ` on ${acceptedOn}` : ''}</p>
-							<p class="text-[11px] text-hub-dim mt-0.5">Mark as shipped when all planned phases are live.</p>
+					{#if shipGatedByCodeReview}
+						<!-- Red gates: ship disabled until gates pass -->
+						<div class="mb-5 p-3 rounded-lg border border-hub-danger/30 bg-hub-danger/5 flex items-center justify-between gap-3">
+							<div>
+								<p class="text-xs text-hub-danger font-medium">⛔ Ship disabled — code review gates are red</p>
+								<p class="text-[11px] text-hub-dim mt-0.5">Fix the failing gates and re-dispatch before shipping.</p>
+							</div>
+							<button
+								onclick={shipDecision}
+								disabled={true}
+								title="Code review gates must be green before shipping"
+								class="px-3 py-1.5 rounded text-xs font-medium bg-hub-cta text-hub-bg transition-colors cursor-not-allowed opacity-50 flex-shrink-0"
+							>
+								Mark shipped
+							</button>
 						</div>
-						<button
-							onclick={shipDecision}
-							disabled={shipping}
-							class="px-3 py-1.5 rounded text-xs font-medium bg-hub-cta text-hub-bg hover:bg-hub-cta/90 transition-colors cursor-pointer disabled:opacity-50 flex-shrink-0"
-						>
-							{shipping ? '…' : 'Mark shipped'}
-						</button>
-					</div>
+					{:else if isImplementationDispatch && implementerGatesGreen}
+						<!-- ADR-027: coding artifact with green gates → Ship & merge primary -->
+						<div class="mb-5 p-3 rounded-lg border border-hub-info/30 bg-hub-info/5">
+							<div class="mb-2">
+								<p class="text-xs text-hub-info">Decision accepted{acceptedOn ? ` on ${acceptedOn}` : ''}</p>
+								<p class="text-[11px] text-hub-dim mt-0.5">
+									✓ Code review gates green. Merges the branch to main + marks shipped. Does not deploy — build &amp; reload separately.
+								</p>
+							</div>
+							<div class="flex items-center gap-2 flex-wrap">
+								<button
+									onclick={shipAndMerge}
+									disabled={shippingAndMerging || shipping}
+									class="px-3 py-1.5 rounded text-xs font-medium bg-hub-cta text-hub-bg hover:bg-hub-cta/90 transition-colors cursor-pointer disabled:opacity-50"
+								>
+									{shippingAndMerging ? '⏳ merging…' : '⇡ Ship & merge'}
+								</button>
+								<button
+									onclick={shipDecision}
+									disabled={shipping || shippingAndMerging}
+									title="Marks status as shipped without merging the branch — for multi-phase ADRs or already-merged branches"
+									class="px-3 py-1.5 rounded text-xs font-medium bg-hub-card text-hub-dim hover:text-hub-text border border-hub-border/60 transition-colors cursor-pointer disabled:opacity-50"
+								>
+									{shipping ? '…' : 'Mark shipped (status only)'}
+								</button>
+							</div>
+							{#if shipMergeError}
+								<p class="mt-2 text-[11px] text-hub-danger">{shipMergeError}</p>
+							{/if}
+						</div>
+					{:else}
+						<!-- Non-coding or no hand-back: unchanged Mark shipped -->
+						<div class="mb-5 p-3 rounded-lg border border-hub-info/30 bg-hub-info/5 flex items-center justify-between gap-3">
+							<div>
+								<p class="text-xs text-hub-info">Decision accepted{acceptedOn ? ` on ${acceptedOn}` : ''}</p>
+								<p class="text-[11px] text-hub-dim mt-0.5">
+									Mark as shipped when all planned phases are live.
+								</p>
+							</div>
+							<button
+								onclick={shipDecision}
+								disabled={shipping}
+								class="px-3 py-1.5 rounded text-xs font-medium bg-hub-cta text-hub-bg hover:bg-hub-cta/90 transition-colors cursor-pointer disabled:opacity-50 flex-shrink-0"
+							>
+								{shipping ? '…' : 'Mark shipped'}
+							</button>
+						</div>
+					{/if}
 				{/if}
 
-				<!-- projects-graph ADR-018 S2 — Dispatch to AI. Shown when the
-				     artifact's work_type / assignee resolves to a roster agent.
-				     Writes output back as a linked note; human reviews + ships. -->
-				{#if canDispatch}
+				<!-- projects-graph ADR-018 S2 / ADR-025 D5 — Dispatch to AI.
+				     Re-dispatch / run surface for an ALREADY-ACCEPTED artifact. A
+				     *proposed* artifact is accepted-and-dispatched via the named
+				     "Accept → 🤖 agent" button in the DecisionActions strip above,
+				     so this standalone control is gated on `isAccepted` to avoid
+				     showing two dispatch paths for one proposed ADR (D5 finding). -->
+				{#if canDispatch && isAccepted}
 					<div class="mb-5 p-3 rounded-lg border border-hub-cta/30 bg-hub-cta/5">
+						{#if surfaceOutOfWorktree}
+							<!-- ADR-012 P2/P3 — this ADR's surface is outside the soul-hub
+							     worktree. The implementer's pre-flight check will STOP and
+							     report (not edit live) unless explicitly authorized. -->
+							<div class="mb-2 p-2 rounded border border-hub-warning/40 bg-hub-warning/5">
+								<p class="text-[11px] text-hub-warning font-medium">⚠ Out-of-worktree surface: <span class="font-mono">{surface.declared}</span></p>
+								<p class="text-[10px] text-hub-dim mt-0.5">
+									{surface.kind === 'config-repo'
+										? `This work lands in ${surface.repo}, not the soul-hub worktree. The implementer will stop + report unless the task authorizes an [OUT-OF-WORKTREE] surface — it will NOT edit global state silently.`
+										: 'No known repo owns this surface. The implementer will stop + report rather than edit live; resolve the surface before dispatching.'}
+								</p>
+							</div>
+						{/if}
 						<div class="flex items-center justify-between gap-3 flex-wrap">
 							<div>
 								<p class="text-xs text-hub-text font-medium">Dispatch to AI</p>
 								<p class="text-[11px] text-hub-dim mt-0.5">→ <span class="font-mono">{dispatchTarget}</span>{workType ? ` · ${workType}` : ''}</p>
 							</div>
 							<div class="flex items-center gap-1.5">
-								<select
-									bind:value={dispatchMode}
-									disabled={dispatching}
-									class="px-1.5 py-1 rounded bg-hub-card border border-hub-border text-hub-text text-[11px] cursor-pointer disabled:opacity-50"
-									title="test = capped $0.10 / 5 turns · run = real budget"
-								>
-									<option value="test">test</option>
-									<option value="production">run</option>
-								</select>
+								{#if isImplementationDispatch}
+									<!-- D5/D1: implementation dispatches are force-pinned to production.
+									     Hide the toggle to prevent a misleading test click that would
+									     actually run a ~$5–8 worktree build. -->
+									<span class="text-[11px] text-hub-dim font-mono" title="ADR-024 D1 — coding dispatches always run in production mode with an isolated worktree">
+										production · isolated worktree · ~$5–8
+									</span>
+								{:else}
+									<select
+										bind:value={dispatchMode}
+										disabled={dispatching}
+										class="px-1.5 py-1 rounded bg-hub-card border border-hub-border text-hub-text text-[11px] cursor-pointer disabled:opacity-50"
+										title="test = capped $0.10 / 5 turns · run = real budget"
+									>
+										<option value="test">test</option>
+										<option value="production">run</option>
+									</select>
+								{/if}
 								<button
 									onclick={dispatchToAI}
 									disabled={dispatching}
+									title={implementerReturn ? 'A completed run is awaiting your review below — this starts a fresh dispatch on a new branch' : undefined}
 									class="px-3 py-1.5 rounded text-xs font-medium bg-hub-cta text-hub-bg hover:bg-hub-cta/90 transition-colors cursor-pointer disabled:opacity-50"
 								>
-									{dispatching ? '🟡 working…' : 'Dispatch'}
+									{dispatching ? '🟡 working…' : implementerReturn ? 'Re-dispatch' : 'Dispatch'}
 								</button>
 							</div>
 						</div>
@@ -781,8 +1267,119 @@
 							<div class="mt-2 flex items-center gap-2 text-[11px]">
 								<span class="text-hub-cta">✓ output saved</span>
 								<button class="text-hub-info hover:text-hub-text underline cursor-pointer" onclick={() => dispatchDoneNote && load(dispatchDoneNote)}>review it →</button>
-								<span class="text-hub-dim">then ship the artifact above.</span>
+								{#if !isImplementationDispatch}
+									<span class="text-hub-dim">then ship the artifact above.</span>
+								{/if}
 							</div>
+						{/if}
+
+						<!-- projects-graph ADR-024 D1 — Code Review Card.
+						     Rendered after an implementation dispatch completes; shows
+						     branch, files changed, gate badge. Drives the D3 ship gate. -->
+						{#if implementerReturn}
+							<div class="mt-3 rounded-lg border p-3 {implementerGatesGreen ? 'border-hub-cta/40 bg-hub-cta/5' : 'border-hub-danger/40 bg-hub-danger/5'}">
+								<div class="flex items-center justify-between mb-2">
+									<p class="text-xs font-semibold text-hub-text">Code Review</p>
+									<span class="px-2 py-0.5 rounded text-[10px] font-bold {implementerGatesGreen ? 'bg-hub-cta text-hub-bg' : 'bg-hub-danger text-white'}">
+										{implementerGatesGreen ? '✓ gates green' : '✗ gates red'}
+									</span>
+								</div>
+								<p class="text-[11px] text-hub-dim font-mono truncate mb-2" title={implementerReturn.branch}>{implementerReturn.branch}</p>
+								<div class="flex items-center gap-3 text-[11px] text-hub-dim mb-2">
+									<span>{implementerReturn.commits.length} commit{implementerReturn.commits.length !== 1 ? 's' : ''}</span>
+									<span>·</span>
+									<span>{implementerReturn.files_changed.length} file{implementerReturn.files_changed.length !== 1 ? 's' : ''} changed</span>
+									{#if implementerSessionId}
+										<span class="ml-auto font-mono text-[10px] text-hub-dim" title="Claude session ID for --resume">{implementerSessionId.slice(0, 8)}…</span>
+									{/if}
+								</div>
+								{#if implementerReturn.files_changed.length > 0}
+									<ul class="text-[11px] font-mono text-hub-dim space-y-0.5 ml-2 mb-2">
+										{#each implementerReturn.files_changed.slice(0, 8) as f}
+											<li>· {f}</li>
+										{/each}
+										{#if implementerReturn.files_changed.length > 8}
+											<li class="italic">… +{implementerReturn.files_changed.length - 8} more</li>
+										{/if}
+									</ul>
+								{/if}
+								{#if Object.keys(implementerReturn.gate_results).length > 0}
+									<div class="flex flex-wrap gap-1 mb-2">
+										{#each Object.entries(implementerReturn.gate_results) as [gate, result]}
+											<span class="px-1.5 py-0.5 rounded text-[10px] font-medium {result === 'pass' ? 'bg-hub-cta/15 text-hub-cta' : 'bg-hub-danger/15 text-hub-danger'}">
+												{gate}: {result}
+											</span>
+										{/each}
+									</div>
+								{/if}
+								{#if implementerReturn.summary}
+									<p class="text-[11px] text-hub-dim leading-relaxed mt-1">
+										{implementerReturn.summary.length > 280
+											? implementerReturn.summary.slice(0, 280) + '…'
+											: implementerReturn.summary}
+									</p>
+								{/if}
+								{#if implementerReturn.follow_ups.length > 0}
+									<details class="mt-2">
+										<summary class="text-[11px] text-hub-warning cursor-pointer select-none">
+											⚠ {implementerReturn.follow_ups.length} follow-up{implementerReturn.follow_ups.length !== 1 ? 's' : ''}
+										</summary>
+										<ul class="mt-1 ml-2 space-y-0.5">
+											{#each implementerReturn.follow_ups as item}
+												<li class="text-[11px] text-hub-dim">· {item}</li>
+											{/each}
+										</ul>
+									</details>
+								{/if}
+
+								<!-- projects-graph ADR-024 D2 — "Send back to AI" iterate loop.
+								     Collapsed until clicked. Disabled when no session id (PTY
+								     didn't emit one, or session was already cleared). -->
+								<div class="mt-3 pt-2 border-t border-hub-border/30">
+									{#if !dispatching && !sendBackExpanded}
+										<button
+											onclick={() => { sendBackExpanded = true; sendBackError = ''; }}
+											disabled={!implementerSessionId}
+											title={implementerSessionId ? 'Re-dispatch on the same branch, resuming the same Claude session' : 'No session ID — cannot resume (run completed without PTY session data)'}
+											class="text-[11px] text-hub-info hover:text-hub-text transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+										>
+											↩ Send back to AI…
+										</button>
+									{:else if sendBackExpanded && !dispatching}
+										<div class="space-y-1.5">
+											<p class="text-[10px] text-hub-dim">Feedback for the implementer (will resume session <span class="font-mono">{implementerSessionId?.slice(0, 8)}…</span> on branch <span class="font-mono truncate">{implementerReturn?.branch ?? ''}</span>):</p>
+											<textarea
+												bind:value={sendBackFeedback}
+												placeholder="E.g. 'The TypeScript check still fails on line 42 — fix the type error and re-run npm run check before returning.'"
+												class="w-full px-2 py-1.5 rounded bg-hub-bg border border-hub-border text-hub-text text-[11px] placeholder:text-hub-dim resize-none focus:outline-none focus:border-hub-cta/50 transition-colors"
+												rows="3"
+												disabled={sendingBack}
+											></textarea>
+											{#if sendBackError}
+												<p class="text-[10px] text-hub-danger">{sendBackError}</p>
+											{/if}
+											<div class="flex items-center gap-1.5">
+												<button
+													onclick={sendBackToAI}
+													disabled={sendingBack || !sendBackFeedback.trim()}
+													class="px-2.5 py-1 rounded text-[11px] font-medium bg-hub-cta text-hub-bg hover:bg-hub-cta/90 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+												>
+													{sendingBack ? '🟡 sending…' : '↩ Send back'}
+												</button>
+												<button
+													onclick={() => { sendBackExpanded = false; sendBackFeedback = ''; sendBackError = ''; }}
+													disabled={sendingBack}
+													class="px-2.5 py-1 rounded text-[11px] text-hub-dim hover:text-hub-text transition-colors cursor-pointer disabled:opacity-50"
+												>
+													Cancel
+												</button>
+											</div>
+										</div>
+									{/if}
+								</div>
+							</div>
+						{:else if implementerParseError && !dispatching}
+							<p class="mt-2 text-[11px] text-hub-warning">{implementerParseError}</p>
 						{/if}
 					</div>
 				{/if}
@@ -813,9 +1410,15 @@
 									<span class="text-xs font-medium text-hub-text">This depends on</span>
 									<span class="text-[10px] text-hub-dim">({upstreamEdges.length})</span>
 								</div>
+								<!-- projects-graph ADR-024 D4 — upstream edges with status badges.
+								     Cross-project blockers (external: true in critical-path.ts)
+								     are shown with a ⚠ marker if not yet shipped, ensuring the
+								     operator sees the real gate rather than a silently dropped dep. -->
 								<ul class="space-y-0.5 ml-4">
 									{#each upstreamEdges as edge}
-										<li class="flex items-baseline gap-2 text-xs">
+										{@const bStatus = blockerStatuses[edge.resolved]}
+										{@const bExternal = isEdgeExternal(edge)}
+										<li class="flex items-center gap-2 text-xs">
 											<span class="text-[10px] uppercase tracking-wider text-hub-dim w-20 flex-shrink-0">
 												{edge.label}
 											</span>
@@ -826,6 +1429,24 @@
 											>
 												{shortName(edge.resolved)}
 											</button>
+											<!-- Status badge: loading → status pill → unknown -->
+											{#if !(edge.resolved in blockerStatuses)}
+												<span class="flex-shrink-0 text-[9px] text-hub-dim italic">…</span>
+											{:else if bStatus !== null}
+												<span class="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] font-medium
+													{bStatus === 'shipped' ? 'bg-hub-cta/15 text-hub-cta' :
+													 bStatus === 'accepted' ? 'bg-hub-info/15 text-hub-info' :
+													 bStatus === 'proposed' ? 'bg-hub-warning/15 text-hub-warning' :
+													 'bg-hub-dim/15 text-hub-dim'}">
+													{bStatus}
+												</span>
+											{:else}
+												<span class="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] bg-hub-dim/15 text-hub-dim">?</span>
+											{/if}
+											<!-- Cross-project warning when not shipped -->
+											{#if bExternal && bStatus !== 'shipped'}
+												<span class="flex-shrink-0 text-[10px] text-hub-warning" title="Cross-project blocker — not yet shipped">⚠</span>
+											{/if}
 										</li>
 									{/each}
 								</ul>

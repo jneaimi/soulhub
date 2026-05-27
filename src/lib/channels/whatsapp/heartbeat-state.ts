@@ -507,6 +507,33 @@ function migrate(db: Database.Database): void {
 		`);
 		db.pragma('user_version = 20');
 	}
+
+	if (version < 21) {
+		// projects-graph ADR-026 D3 — persist the raw hand-back ```json``` block
+		// untruncated so the Handoff Workbench review card can always parse
+		// gate_results, summary, and follow_ups — even when the full run output
+		// exceeds the 800-char result_excerpt limit. The block is typically
+		// ≤ 1 KB so no separate BLOB column is needed. Nullable: rows predating
+		// this migration have no stored hand-back; the worklist falls back to
+		// result_excerpt for back-compat. Idempotent: ALTER TABLE is a no-op on
+		// re-run if the column already exists (SQLite ignores duplicate ADD COLUMN
+		// wrapped in `IF NOT EXISTS`-equivalent try/catch at the call site — but
+		// the version guard above is the real idempotency mechanism).
+		db.exec(`ALTER TABLE agent_runs ADD COLUMN handback TEXT;`);
+		db.pragma('user_version = 21');
+	}
+
+	if (version < 22) {
+		// projects-graph ADR-031 P1 — persist the dispatcher's resolved
+		// `effectiveRepo` per run so ship-merge and review-handoff can operate
+		// git in the run's repo rather than hardcoded soul-hub.
+		// null = legacy/soul-hub (null-default is backward compatible: every row
+		// predating this migration reads as soul-hub via the ?? fallback in the
+		// endpoint layer). The stored value is the expanded absolute path written
+		// by the dispatcher at dispatch time (expandHome applied).
+		db.exec(`ALTER TABLE agent_runs ADD COLUMN repo TEXT;`);
+		db.pragma('user_version = 22');
+	}
 }
 
 /** Heartbeat run statuses logged to `proactive_log`. */

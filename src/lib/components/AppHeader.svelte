@@ -3,6 +3,7 @@
 	import type { FeaturesConfig } from '$lib/config.schema';
 	import type { UpdateState } from '$lib/update-check';
 	import UpdateBanner from './UpdateBanner.svelte';
+	import DeployBanner from './DeployBanner.svelte';
 
 	let { features, update }: { features?: FeaturesConfig; update?: UpdateState | null } = $props();
 
@@ -34,6 +35,7 @@
 	}
 </script>
 
+<DeployBanner {features} />
 <UpdateBanner {update} />
 
 <header class="flex-shrink-0 border-b border-hub-border bg-hub-bg/95 backdrop-blur sticky top-0 z-30">

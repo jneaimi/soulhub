@@ -19,6 +19,9 @@ interface QueueRow {
 	falsifierDaysAway: number | null;
 	tags: string[];
 	blockedBy: string[];
+	/** projects-graph ADR-025 D5 — routing inputs for DecisionActions D5 UX. */
+	work_type: string | null;
+	assignee: string | null;
 }
 
 function daysBetween(iso: string): number | null {
@@ -81,6 +84,9 @@ export const GET: RequestHandler = async () => {
 			falsifierDaysAway: falsifier ? daysBetween(falsifier) : null,
 			tags: asStringArray(note.meta.tags),
 			blockedBy: asStringArray(note.meta.blocked_by ?? note.meta.blockedBy),
+			// projects-graph ADR-025 D5 — routing inputs for the D5 button model.
+			work_type: typeof note.meta.work_type === 'string' ? note.meta.work_type : null,
+			assignee: typeof note.meta.assignee === 'string' ? note.meta.assignee : null,
 		});
 	}
 

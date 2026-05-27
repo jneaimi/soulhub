@@ -15,6 +15,11 @@ import { access, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
+import matter from 'gray-matter';
+import { getVaultEngine } from '../vault/index.js';
+import { rewriteBody, rewriteMeta, stripMd } from '../vault/relocate.js';
+import type { VaultMeta } from '../vault/types.js';
+import { CANONICAL_STATUSES } from './parse-body-status.js';
 
 const SUPPRESSIONS_PATH = join(homedir(), '.soul-hub', 'data', 'hygiene-suppressions.json');
 const SUPPRESS_DAYS_DEFAULT = 30;
@@ -65,9 +70,16 @@ async function pathExists(p: string): Promise<boolean> {
 /** Move `projects/<slug>` → `archive/<slug>`. Validates the slug,
  *  asserts the source has `status: archived` (defensive — caller
  *  should have verified), guards against archive-side collisions,
- *  and commits the move with a hygiene-attributed message. The
- *  vault watcher auto-rewrites stale wikilinks pointing at the old
- *  path. */
+ *  and commits the move with a hygiene-attributed message.
+ *
+ *  ADR-042 retro-fix: after the directory move this function rewrites
+ *  every inbound wikilink (body + frontmatter relationship fields)
+ *  vault-wide that previously pointed at any note in `projects/<slug>/`,
+ *  updating them to `archive/<slug>/…`. Uses the same two-phase
+ *  capture-before-move / apply-after-move approach as `relocateNotes`
+ *  (ADR-004 P1.0 primitive). The rewrites are committed as a second
+ *  hygiene commit so the move and the link-repair are independently
+ *  revertible via `git revert`. */
 export async function archiveProject(slug: string, vaultDir: string): Promise<ActionResult> {
 	if (!PROJECT_SLUG_RX.test(slug)) {
 		return { ok: false, error: 'invalid-slug', detail: `slug must match ${PROJECT_SLUG_RX}` };
@@ -95,13 +107,108 @@ export async function archiveProject(slug: string, vaultDir: string): Promise<Ac
 		};
 	}
 
+	// ── Pre-capture: build inbound-link rewrites BEFORE the git mv ──────────
+	// The vault engine's resolver still maps `projects/<slug>/…` to their
+	// current indexed paths at this point. We enumerate every vault note,
+	// compute new body / meta for any that link into the moving tree, and
+	// serialise the result so it can be written straight after the move
+	// without needing to re-resolve anything against the (now stale) index.
+
+	interface RewriteEntry {
+		/** Vault-relative path at which to write the rewritten content.
+		 *  Notes inside the moved tree use their post-move archive/ path;
+		 *  notes outside it keep their current path. */
+		vaultPath: string;
+		/** Pre-serialised file content (matter.stringify already applied). */
+		content: string;
+	}
+
+	const srcVaultPrefix = `projects/${slug}/`;
+	const dstVaultPrefix = `archive/${slug}/`;
+	const rewriteEntries: RewriteEntry[] = [];
+
+	const engine = getVaultEngine();
+	if (engine) {
+		const allNotes = engine.getAllNotes();
+		const movedNotes = allNotes.filter(n => n.path.startsWith(srcVaultPrefix));
+
+		if (movedNotes.length > 0) {
+			const moveMap = new Map<string, string>(
+				movedNotes.map(n => [n.path, dstVaultPrefix + n.path.slice(srcVaultPrefix.length)]),
+			);
+
+			const movingSrc = new Set(movedNotes.map(n => n.path));
+			const dstSlugs = new Set(
+				[...moveMap.values()].map(p => stripMd(p).split('/').pop()!),
+			);
+			const bareSlugIsUnique = (s: string): boolean => {
+				if (!dstSlugs.has(s)) return false;
+				return !allNotes.some(
+					n => !movingSrc.has(n.path) && stripMd(n.path.split('/').pop()!) === s,
+				);
+			};
+
+			for (const note of allNotes) {
+				const resolveTarget = (raw: string) => engine.resolveLink(raw, note.path);
+				const bodyResult = rewriteBody(
+					note.content,
+					resolveTarget,
+					moveMap,
+					bareSlugIsUnique,
+				);
+				const relFields = engine.resolveZone(dirname(note.path)).allowedRelationshipFields;
+				const metaResult = rewriteMeta(
+					note.meta as VaultMeta,
+					relFields,
+					resolveTarget,
+					moveMap,
+					bareSlugIsUnique,
+				);
+
+				if (bodyResult.count === 0 && metaResult.count === 0) continue;
+
+				const newBody =
+					bodyResult.count > 0 ? bodyResult.content : note.content;
+				const newMeta =
+					metaResult.count > 0
+						? (metaResult.meta as Record<string, unknown>)
+						: (note.meta as Record<string, unknown>);
+
+				// Notes in the moved tree will exist at their archive/ path after
+				// the git mv; notes outside it stay at their current path.
+				const vaultPath = moveMap.get(note.path) ?? note.path;
+
+				rewriteEntries.push({
+					vaultPath,
+					content: matter.stringify(newBody, newMeta),
+				});
+			}
+		}
+	}
+	// ────────────────────────────────────────────────────────────────────────
+
 	try {
+		// Step 1 — move the directory (original behaviour, unchanged)
 		await runGit(vaultDir, ['mv', `projects/${slug}`, `archive/${slug}`]);
 		await runGit(vaultDir, [
 			'commit',
 			'-m',
 			`vault(hygiene): archive ${slug} (ADR-042 inline action)`,
 		]);
+
+		// Step 2 — apply pre-captured wikilink rewrites (ADR-042 retro-fix)
+		if (rewriteEntries.length > 0) {
+			for (const entry of rewriteEntries) {
+				await writeFile(join(vaultDir, entry.vaultPath), entry.content, 'utf-8');
+			}
+			const vaultPaths = rewriteEntries.map(e => e.vaultPath);
+			await runGit(vaultDir, ['add', '--', ...vaultPaths]);
+			await runGit(vaultDir, [
+				'commit',
+				'-m',
+				`vault(hygiene): rewrite inbound wikilinks after archiving ${slug} (ADR-042 retro-fix)`,
+			]);
+		}
 	} catch (err) {
 		return {
 			ok: false,
@@ -417,4 +524,115 @@ export async function suppressAnomaly(
 	await writeFile(SUPPRESSIONS_PATH, JSON.stringify(suppressions, null, 2) + '\n', 'utf-8');
 
 	return { ok: true, detail: `suppressed ${slug}:${bucket} until ${until}` };
+}
+
+/** Matches the two files in a project pair that carry dual-file status:
+ *  `projects/<slug>/index.md` and `projects/<slug>/project.md`. Capture
+ *  group 1 is the slug. Used by `dispatchStatusFlip` to detect project
+ *  paths and route to the pair-aware primitives. */
+const PROJECT_FILE_RX = /^projects\/([a-z][a-z0-9-]*)\/(?:index|project)\.md$/;
+
+/** Set the `status` frontmatter field on any single vault note at `path`.
+ *
+ *  This is the generic, path-based counterpart to the project-scoped
+ *  `setProjectStatus` and `reconcileDualStatus` above — it carries none
+ *  of their slug-regex validation or dual-file logic.
+ *
+ *  Routes through `engine.updateNote()` (the ADR-046 write chokepoint) so
+ *  all governance gates, audit-log stamping, and git-commit attribution run
+ *  exactly as they do for every other vault write. Never writes the file
+ *  directly.
+ *
+ *  `path` must be a vault-relative path (e.g. `"projects/foo/adr-001.md"`).
+ *  `status` is validated against the canonical 6-status set
+ *  (`proposed | accepted | shipped | rejected | parked | superseded`).
+ *  The canonical open/reopen value for ADR notes is `"proposed"` (ADR-006
+ *  edge case #7: the initial active-ladder state before the decision is made). */
+export async function setNoteStatus(path: string, status: string): Promise<ActionResult> {
+	if (!path || path.trim().length === 0) {
+		return { ok: false, error: 'invalid-path', detail: 'path must be non-empty' };
+	}
+	if (!(CANONICAL_STATUSES as readonly string[]).includes(status)) {
+		return {
+			ok: false,
+			error: 'invalid-status',
+			detail: `status must be one of: ${CANONICAL_STATUSES.join(', ')}`,
+		};
+	}
+
+	const engine = getVaultEngine();
+	if (!engine) {
+		return { ok: false, error: 'engine-unavailable', detail: 'vault engine not initialised' };
+	}
+
+	const result = await engine.updateNote(
+		path,
+		{ meta: { status } },
+		{ actor: 'setNoteStatus', actorContext: `path=${path} status=${status}` },
+	);
+
+	if (!result.success) {
+		return { ok: false, error: 'update-failed', detail: result.error };
+	}
+
+	return { ok: true, detail: `status → ${status}` };
+}
+
+/** Dual-file-aware status flip dispatcher (ADR-006 P1.1 Deliverable B).
+ *
+ *  Routes based on `path`:
+ *
+ *  **Project pair** (`projects/<slug>/(index|project).md`): sets index.md to
+ *  `status` via `setProjectStatus`, then syncs project.md from index.md via
+ *  `reconcileDualStatus(slug, 'index', vaultDir)` — only when project.md
+ *  actually exists (caller may supply a path for a single-file project). This
+ *  reuses both existing pair-aware primitives without hand-rolling a new dual-
+ *  file writer, and the two-step sequence guarantees both files carry the same
+ *  value with no intermediate desync window.
+ *
+ *  **Everything else**: delegates to `setNoteStatus` which runs through the
+ *  ADR-046 write chokepoint (governance gates + audit log + git commit).
+ *
+ *  This function owns the deterministic flip; the *judgment* (reopen vs. tick
+ *  the task) stays with the operator. P1.2 will wire it into the remediate
+ *  API — the signature is kept HTTP-agnostic intentionally.
+ *
+ *  `vaultDir` is required for the project-pair path (needed by the direct-I/O
+ *  primitives). Non-project paths ignore it (engine carries its own vaultDir). */
+export async function dispatchStatusFlip(
+	path: string,
+	status: string,
+	vaultDir: string,
+): Promise<ActionResult> {
+	if (!path || path.trim().length === 0) {
+		return { ok: false, error: 'invalid-path', detail: 'path must be non-empty' };
+	}
+	if (!status || status.trim().length === 0) {
+		return { ok: false, error: 'invalid-status', detail: 'status must be non-empty' };
+	}
+
+	const projectMatch = PROJECT_FILE_RX.exec(path);
+
+	if (projectMatch) {
+		const slug = projectMatch[1];
+		// Step 1 — set index.md to the target status (setProjectStatus always
+		// targets the index file; validates `/^[a-z][a-z-]*$/`).
+		const setResult = await setProjectStatus(slug, status, vaultDir);
+		if (!setResult.ok) return setResult;
+
+		// Step 2 — sync project.md from index.md, but only when project.md
+		// exists. A single-file project (index.md only) is fine as-is.
+		const projectMdPath = join(vaultDir, 'projects', slug, 'project.md');
+		if (await pathExists(projectMdPath)) {
+			const reconcileResult = await reconcileDualStatus(slug, 'index', vaultDir);
+			if (!reconcileResult.ok) return reconcileResult;
+			return { ok: true, detail: `[project pair] ${setResult.detail}; ${reconcileResult.detail}` };
+		}
+
+		return { ok: true, detail: `[project single] ${setResult.detail}` };
+	}
+
+	// Non-project note — validate status against CANONICAL_STATUSES and
+	// run through the engine (ADR-046 chokepoint).
+	return setNoteStatus(path, status);
 }

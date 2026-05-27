@@ -34,3 +34,9 @@ output/
 # snapshots + ARIA accessibility trees) — regenerable, not source.
 .playwright-cli/
 aiag.yaml
+
+.worktrees/
+
+# ADR-016 — build-time SHA stamp (gitignored to prevent perpetual working-tree drift)
+# Regenerated on prebuild / predev / npm run check via scripts/stamp-build-info.mjs
+src/lib/build-info.ts

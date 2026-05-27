@@ -65,6 +65,10 @@ export interface DispatchOptions {
 	 *  rather than starting fresh. Set by the resume path; the backend passes
 	 *  `--resume <id>` and omits `--session-id`. */
 	resume_session_id?: string;
+	/** ADR-024 D2 — when resuming, work in the EXISTING branch's worktree
+	 *  rather than provisioning a new one. Must be set alongside
+	 *  `resume_session_id`; absent → fresh worktree provisioned as usual. */
+	resume_branch?: string;
 }
 
 export type DispatchEvent =
@@ -88,6 +92,11 @@ export type DispatchEvent =
 			reason: 'max_usd' | 'max_turns';
 			ts: number;
 	  }
+	/** ADR-026 P3 — live cost/turns progress tick, emitted every time the
+	 *  transcript snapshot changes during a PTY run. `dispatch/index.ts`
+	 *  persists these into the `running` DB row so the board chip can show
+	 *  real numbers mid-run instead of `$0.00 · 0t`. */
+	| { type: 'progress'; runId: string; costUsd: number; numTurns: number; ts: number }
 	| { type: 'done'; result: DispatchResult; ts: number };
 
 export interface DispatchResult {
@@ -103,7 +112,11 @@ export interface DispatchResult {
 		| 'goal_achieved'
 		/** ADR-006 Phase 2 — hit the hard ceiling but was pausable: the session
 		 *  is preserved, awaiting an operator budget grant to resume. */
-		| 'awaiting-budget-approval';
+		| 'awaiting-budget-approval'
+		/** ADR-026 P2 — agent emitted an `ask_operator` sentinel mid-run: the
+		 *  session is preserved, awaiting an operator answer which rides back
+		 *  in as the `task` on `--resume`. */
+		| 'awaiting-operator-input';
 	output: string;
 	cost_usd: number;
 	num_turns: number;
@@ -117,6 +130,11 @@ export interface DispatchResult {
 		/** Ceilings that were in force (so the bump raises from the right base). */
 		ceiling_usd: number;
 		ceiling_turns: number;
+	};
+	/** ADR-026 P2 — present iff `status === 'awaiting-operator-input'`.
+	 *  The question the agent needs answered before it can continue. */
+	operator_pause?: {
+		question: string;
 	};
 	/** ADR-002 Layer 1 — Claude Code session UUID for this run, when the backend
 	 *  set a deterministic `--session-id` (PTY) or reported one (cli-flag). Lets

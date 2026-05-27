@@ -27,7 +27,7 @@ export interface DecideV2Options {
 	 *  heartbeat reader is hardcoded to `'whatsapp'`) refuse gracefully
 	 *  off-channel. Optional so legacy callers default to `undefined` →
 	 *  channel-aware tools degrade rather than crash. */
-	channel?: 'whatsapp' | 'telegram';
+	channel?: 'whatsapp' | 'telegram' | 'web';
 	/** ADR-025 — reminders config snapshot. Gates the `scheduleReminder`
 	 *  tool: when undefined or `enabled: false`, the tool refuses with a
 	 *  graceful error and the model relays it in plain language. */
@@ -197,6 +197,10 @@ export type V2Output =
 			 *  `worker`, and conversation `ctx` that live one layer up. */
 			agentId: string;
 			task: string;
+			/** Optional vault path of the artifact being dispatched (ADR-007).
+			 *  Passed to the agent test endpoint as `subject` so the run can
+			 *  be correlated to a vault note and linked in the review card. */
+			subject?: string;
 	  }
 	| {
 			kind: 'error';

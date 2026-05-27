@@ -14,9 +14,15 @@
 		reconnectSessionId?: string;
 		/** If true, do NOT kill the PTY session when this component unmounts (e.g. when collapsed) */
 		keepAlive?: boolean;
+		/**
+		 * ADR-005 — Called once the server assigns a session ID to this spawn.
+		 * Allows a parent (e.g. ChatDrawer) to store the ID for reconnect on
+		 * re-mount without accessing the component's internal state.
+		 */
+		onSessionStart?: (sessionId: string) => void;
 	}
 
-	let { prompt = '', cwd = '', autoSpawn = false, projectName = '', continueSession = false, shell = false, reconnectSessionId = '', keepAlive = false }: Props = $props();
+	let { prompt = '', cwd = '', autoSpawn = false, projectName = '', continueSession = false, shell = false, reconnectSessionId = '', keepAlive = false, onSessionStart }: Props = $props();
 
 	let fileInput: HTMLInputElement;
 	let uploading = $state(false);
@@ -502,6 +508,8 @@
 						switch (msg.type) {
 							case 'session':
 								sessionId = msg.sessionId;
+								// ADR-005: notify parent so it can store the ID for reconnect.
+								onSessionStart?.(msg.sessionId);
 								break;
 							case 'output':
 								batchWrite(msg.data);
