@@ -3,7 +3,7 @@
 
 This project is indexed by GitNexus as **soul-hub** (23767 symbols, 32062 relationships, 258 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
-> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
+> If any GitNexus tool warns the index is stale, run `npm run reindex` in terminal first (= `gitnexus analyze --skip-agents-md`; the `--skip-agents-md` keeps the volatile symbol count out of this file so the tree stays clean).
 
 ## Always Do
 
@@ -89,8 +89,10 @@ Before completing any code modification task, verify:
 After committing code changes the GitNexus index becomes stale. The PostToolUse hook in this project **detects staleness after `git commit` / `git merge` and notifies the agent to run analyze** — the hook does NOT auto-run it (gitnexus 1.6.4+ design: avoids 120s blocks + risk of KuzuDB corruption on timeout). When the hook fires its staleness notice, run:
 
 ```bash
-npx gitnexus analyze
+npm run reindex          # = gitnexus analyze --skip-agents-md
 ```
+
+**Always use `--skip-agents-md`** (baked into `npm run reindex`). Plain `gitnexus analyze` rewrites the volatile symbol count in the `AGENTS.md`/`CLAUDE.md` header sentence, and that count jitters by ±1 every run — leaving both tracked files perpetually "modified" with no real change (the recurring "dirty tree" this repo kept hitting). `--skip-agents-md` leaves those files untouched, so the working tree stays clean. (`--no-stats` is documented to drop the count but does NOT work in 1.6.4 — verified.)
 
 As of gitnexus 1.6.4, `analyze` **preserves existing embeddings by default**. Two flags govern embedding state:
 

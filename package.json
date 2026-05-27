@@ -14,6 +14,7 @@
 		"doctor": "node scripts/doctor.mjs",
 		"verify": "node scripts/verify-fresh-install.mjs",
 		"update": "node scripts/update.mjs",
+		"reindex": "npx gitnexus analyze --skip-agents-md",
 		"release": "uv run scripts/release-publish.py",
 		"predev": "node scripts/stamp-build-info.mjs",
 		"dev": "vite dev",
