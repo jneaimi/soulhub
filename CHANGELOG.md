@@ -4,6 +4,57 @@ All notable changes to Soul Hub are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.19.0] — 2026-05-27
+
+### Added
+- **Scope-aware chat drawer with two equal engines (soul-hub-chat ADR-002–007).**
+  A global, bottom-docked chat surface mounts beside the header on every page.
+  A `ChatScope` provider (`resolveScope`) injects per-area context — project
+  index + open decisions on a project page, and vault-note / inbox-thread /
+  CRM-contact contributors elsewhere — so both engines start already oriented.
+  Two equal peers, not an escalation: the **Orchestrator web channel** (SSE at
+  `POST /api/chat/web`, wrapping `decideV2` via the shared presence layer) and an
+  interactive **Claude PTY** launched in the scope's `cwd` with the scope primer,
+  session-persistent across drawer collapse. A heavy-build handoff lets the chat
+  escalate into the dispatch → review → ship workbench loop.
+- **Operator one-click rebuild & reload (soul-hub ADR-016).** After a Ship &
+  merge (which deliberately only merges), a `DeployBanner` above the header
+  detects that the running build is behind `HEAD` — via a build-time `BUILD_SHA`
+  stamp compared to live `git rev-parse HEAD` — and offers a guarded
+  `POST /api/system/redeploy` (the local sibling of the public updater: flag→404,
+  same-origin→403, confirm→400, stale-SHA→409, then a detached build+reload).
+  Gated by a new `localRedeploy` feature flag, **operator-only** (the public
+  export seeds it off). Replaces the manual `npm run build && pm2 reload` ritual.
+
+### Fixed
+- **Redeploy builds to a temp dir + atomic swap (soul-hub ADR-017).** The
+  redeployer no longer `rm -rf build` before building; it builds into `build.next`
+  and atomically swaps on success, leaving the known-good `build/` untouched (and
+  bootable) when a build fails.
+- **Redeploy completion reconciled on boot (soul-hub ADR-018).** `pm2 reload`
+  kills the detached redeploy worker before it can record `done`, which used to
+  strand the DeployBanner spinning forever on a successful deploy. The new server
+  now reconciles a stuck `reloading`/`building` status from its own `BUILD_SHA`
+  on boot — finalising `done` when it matches the target, `failed` otherwise — so
+  the banner can never hang across a restart. (Self-validated on its own deploy.)
+- **Ship & merge gate-value matching is content-based (projects-graph ADR-033).**
+  `handbackGatesGreen` delegated to a position-sensitive `/^pass/i` check that
+  false-redded count-prefixed gate values like `"14/14 pass (…)"`, blocking
+  ship-merge on genuinely-green work. The new `isGateGreen` reads the pass/fail
+  signal anywhere in the value (pass-token AND no fail-token AND not negated),
+  staying fail-closed on ambiguity.
+- **Workbench dispatch → review → ship hardening (soul-hub-agents ADR-016–018).**
+  The review/ship loop now derives truth from the committed artifact, not the
+  agent's self-report: auto-derive a hand-back from the committed branch when the
+  agent omits the trailer; surface a run as reviewable when it carries an
+  artifact regardless of a stall-detector status label; and tolerate benign
+  auto-generated `AGENTS.md`/`CLAUDE.md` drift in the ship-merge clean-tree guard.
+- **GitNexus reindex no longer dirties the working tree.** Plain
+  `gitnexus analyze` rewrites a volatile symbol count in the `AGENTS.md`/`CLAUDE.md`
+  header sentence (jitters ±1 every run), leaving both tracked files perpetually
+  modified. A new `npm run reindex` (= `gitnexus analyze --skip-agents-md`) skips
+  those files; all index-fresh instructions now point at it.
+
 ## [2.18.0] — 2026-05-26
 
 ### Changed
