@@ -201,6 +201,68 @@ export async function decideV2(
 		};
 	}
 
+	// ADR-012 S5 — deterministic architect routing. Matches explicit ADR-authorship
+	// / architecture-design intent ("draft an ADR for X", "design the architecture
+	// for Y") from a project-scoped page and proposes the architect agent directly
+	// (behind the confirm gate). Only fires when:
+	//   (a) architect is in dispatchableAgentIds
+	//   (b) scopeKind === 'project' with a slug (so context injection in S2 works)
+	//   (c) the message pattern matches the architect route
+	// Falls through to the LLM for global scope (project unknown), ambiguous
+	// phrasing, or when architect isn't registered.
+	const architectWork =
+		opts.conversationKey &&
+		dispatchableAgentIds.includes('architect') &&
+		opts.scopeKind === 'project' &&
+		opts.scopeParams?.slug
+			? detectArchitectRoute(userMessage)
+			: null;
+	if (architectWork && opts.conversationKey && opts.scopeParams?.slug) {
+		const slug = opts.scopeParams.slug;
+		const label = `Draft ADR: ${architectWork.topic}`.slice(0, 80);
+		const task = (
+			`Draft an ADR for project "${slug}": ${architectWork.topic}. ` +
+			`Original request: "${userMessage}".`
+		).slice(0, 800);
+		const proposal = setPending({
+			conversationKey: opts.conversationKey,
+			agentId: 'architect',
+			task,
+			label,
+			origin: 'natural',
+			modelBranch: branch.name,
+		});
+		const proposalResult: ToolResult = {
+			kind: 'proposal',
+			text: formatProposal(proposal),
+			agentId: 'architect',
+			task,
+			label,
+		};
+		const detToolCall = {
+			name: 'dispatchAgent',
+			argSummary: JSON.stringify({
+				agentId: 'architect',
+				task,
+				proposalLabel: label,
+				confirmed: false,
+			}),
+		};
+		return {
+			decision: mapToolCallsToDecision([detToolCall], ''),
+			fellThrough: false,
+			note: `[v2 ${branch.name}] deterministic architect route → architect proposal (topic="${architectWork.topic}", project="${slug}")`,
+			telemetry: {
+				model: modelId,
+				modelBranch: branch.name,
+				stepsUsed: 0,
+				toolCalls: [detToolCall],
+				durationMs: Date.now() - startedAt,
+			},
+			v2Output: buildV2Output([proposalResult], '', [], 0),
+		};
+	}
+
 	// Phase 4d — chat-invokable skills come from the overlay registry.
 	const chatSkills = listChatSkills();
 	const invokableSkills = chatSkills.map((s) => ({
@@ -226,6 +288,11 @@ export async function decideV2(
 		timezone: opts.timezone,
 		modelBranch: branch.name,
 		slowDispatch: opts.slowDispatch,
+		// ADR-011 — scope context for describeCurrentPage.
+		scopeKind: opts.scopeKind,
+		scopeParams: opts.scopeParams,
+		// ADR-014 — user message for keyword-intent toolset expansion (Tier 2 §S4).
+		userMessage,
 	});
 
 	// ADR-033 Layer 1 — load the persona bundle from the vault. The kill
@@ -247,6 +314,7 @@ export async function decideV2(
 		invokableSkills,
 		userTimezone: opts.timezone,
 		personaBundle,
+		channel: opts.channel,
 	});
 
 	const openrouter = createOpenRouter({ apiKey });
@@ -571,6 +639,18 @@ function buildV2Output(
 	const slowResult = results.find((r) => r.kind === 'slow-dispatched');
 	if (slowResult && slowResult.kind === 'slow-dispatched') {
 		return { kind: 'slow-dispatched', toolName: slowResult.toolName, ack: slowResult.ack };
+	}
+
+	// ADR-011 — navigate directive (web-only). Instructs the browser drawer to
+	// call goto(url). Treated as high-priority (same tier as dispatch) because
+	// the navigation already happened client-side as a side effect of the tool.
+	const navResult = results.find((r) => r.kind === 'navigate');
+	if (navResult && navResult.kind === 'navigate') {
+		return { kind: 'navigate', url: navResult.url, message: navResult.confirmMessage };
+	}
+	const navErr = results.find((r) => r.kind === 'navigate-error');
+	if (navErr && navErr.kind === 'navigate-error') {
+		return { kind: 'error', text: `Couldn't navigate to \`${navErr.path}\`: ${navErr.error}` };
 	}
 
 	// Confirmed dispatch is the highest-stakes action — fire it first.
@@ -912,7 +992,7 @@ export function detectDeepWorkRoute(message: string): { entity: string } | null 
 	if (!verbMatch) return null;
 
 	// 1) An explicitly quoted name is the strongest signal.
-	const quoted = m.match(/["'“]([^"'”]{2,60})["'”]/);
+	const quoted = m.match(/[“'”]([^”'”]{2,60})[“'”]/);
 	let entity = quoted ? quoted[1].trim() : '';
 
 	// 2) Otherwise a capitalised proper-noun phrase right after the verb.
@@ -924,6 +1004,48 @@ export function detectDeepWorkRoute(message: string): { entity: string } | null 
 
 	if (entity.length < 2) return null;
 	return { entity };
+}
+
+/** ADR-012 S5 — Detect explicit architecture / ADR-authorship intent so the
+ *  orchestrator can route deterministically to an architect PROPOSAL (behind
+ *  the confirm gate) instead of letting the LLM decide turn-to-turn.
+ *
+ *  Conservative by design: fires ONLY when a clear authorship verb is paired
+ *  with “adr” OR the phrase matches a design/architecture pattern with a
+ *  topic complement. Falls through to the LLM for vague requests, global scope
+ *  (no project context), or phrasing that doesn't include an explicit subject.
+ *
+ *  Returns `{ topic }` on a match, where `topic` is the design subject
+ *  extracted from the user's message (e.g. “caching rendered PDFs”). */
+const ARCHITECT_VERB_RE =
+	/\b(?:draft|write|create|propose|need)\s+(?:an?\s+)?adr\b|\bdesign(?:ing)?\s+(?:the\s+)?architecture\b|\bpropose\s+(?:a\s+)?decision\b|\barchitect(?:ure)?\s+(?:this|for)\b/i;
+
+export function detectArchitectRoute(message: string): { topic: string } | null {
+	const m = message.trim();
+	if (!ARCHITECT_VERB_RE.test(m)) return null;
+
+	// Extract the design topic from text after the triggering phrase.
+	// Looks for “for X”, “about X”, or “on X” following the verb phrase,
+	// or a quoted string anywhere in the message.
+	const quoted = m.match(/[“'”]([^”'”]{3,120})[“'”]/);
+	if (quoted) return { topic: quoted[1].trim() };
+
+	// After any of the keyword patterns, grab the remainder as the topic.
+	const afterFor = m.match(/\b(?:for|about|on)\s+(.{5,120})(?:\.|$)/i);
+	if (afterFor) {
+		const topic = afterFor[1].trim().replace(/[.!?]+$/, '');
+		if (topic.length >= 5) return { topic };
+	}
+
+	// Fallback: take text after the last keyword match.
+	const verbMatch = ARCHITECT_VERB_RE.exec(m);
+	if (verbMatch) {
+		const rest = m.slice(verbMatch.index + verbMatch[0].length).trim();
+		const topic = rest.replace(/^[:\-–—,\s]+/, '').replace(/[.!?]+$/, '').trim();
+		if (topic.length >= 5) return { topic };
+	}
+
+	return null;
 }
 
 function extractText(jsonish: string): string {

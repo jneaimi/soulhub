@@ -23,10 +23,12 @@
 import type { RequestHandler } from './$types';
 import { json } from '@sveltejs/kit';
 import { execFile } from 'node:child_process';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { getReviewableRunForSubject } from '$lib/agents/runs.js';
 import { nonBenignDirtyPaths } from '$lib/agents/benign-drift.js';
 import { safeId, expandHome } from '$lib/agents/dispatch/worktree-provision.js';
+import { removeWorktree, deleteBranch } from '$lib/orchestration/worktree.js';
 import { getVaultEngine } from '$lib/vault/index.js';
 import { parseHandback, handbackGatesGreen } from '$lib/agents/handback.js';
 
@@ -276,6 +278,29 @@ export const POST: RequestHandler = async ({ request }) => {
 				error: `Branch merged successfully but status flip failed: ${(result as { error?: string }).error ?? 'unknown error'}. The branch is on main — update the ADR status manually or run Mark shipped (status only).`,
 			},
 			{ status: 500 },
+		);
+	}
+
+	// ── 7. Best-effort worktree reclamation (ADR-038 Layer A) ────────────────
+	// Runs on both the just-merged path AND the alreadyMerged idempotent path
+	// (a re-ship of an already-merged branch should still reclaim a lingering
+	// worktree). Wrapped in try/catch — a cleanup hiccup MUST NOT roll back a
+	// successful merge or status flip. The scheduled janitor (Layer B) is the
+	// backstop for anything this misses.
+	//
+	// Worktree path formula mirrors worktree-provision.ts + worktree.ts:
+	//   join(repoDir, '.worktrees', `run-${run.startedAt}-${safeId(path)}`)
+	// which is `${runId}-${taskId}` = `run-<startedAt>-<safeId>` with
+	// runId = `run-${run.startedAt}` and taskId = safeId(path).
+	const worktreePath = join(repoDir, '.worktrees', `run-${run.startedAt}-${safeId(path)}`);
+	try {
+		await removeWorktree(worktreePath, /* force */ true);
+		await deleteBranch(repoDir, branch);
+		console.log(`[ship-merge] reclaimed worktree ${worktreePath} + branch ${branch}`);
+	} catch (err) {
+		// Non-fatal: log and let the janitor handle it on its next sweep.
+		console.warn(
+			`[ship-merge] worktree reclamation failed (non-fatal, janitor will sweep): ${(err as Error).message}`,
 		);
 	}
 

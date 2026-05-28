@@ -10,6 +10,11 @@
 		continueSession?: boolean;
 		/** Spawn a plain shell instead of Claude Code */
 		shell?: boolean;
+		/** Resume a specific past Claude conversation (claude --resume <uuid>) */
+		resumeSessionId?: string;
+		/** UI surface that owns this terminal — sent on spawn so the session is
+		 *  tagged (e.g. 'chat-drawer') and resumable from the picker. */
+		origin?: string;
 		/** Connect to an already-running PTY session instead of spawning a new one */
 		reconnectSessionId?: string;
 		/** If true, do NOT kill the PTY session when this component unmounts (e.g. when collapsed) */
@@ -22,7 +27,7 @@
 		onSessionStart?: (sessionId: string) => void;
 	}
 
-	let { prompt = '', cwd = '', autoSpawn = false, projectName = '', continueSession = false, shell = false, reconnectSessionId = '', keepAlive = false, onSessionStart }: Props = $props();
+	let { prompt = '', cwd = '', autoSpawn = false, projectName = '', continueSession = false, shell = false, resumeSessionId = '', origin = '', reconnectSessionId = '', keepAlive = false, onSessionStart }: Props = $props();
 
 	let fileInput: HTMLInputElement;
 	let uploading = $state(false);
@@ -34,6 +39,56 @@
 	let touchStartY = 0;
 	let touchScrollActive = false;
 	let scrolledUp = $state(false);
+
+	// Mobile copy: the canvas/WebGL terminal has no DOM text, so the OS long-press
+	// selection can't reach the output. A long-press opens this overlay holding the
+	// recent buffer as plain, natively-selectable text — long-press-select + copy
+	// with the OS, or "Copy all" in one tap.
+	let copyOverlayText = $state<string | null>(null);
+	let longPressTimer: ReturnType<typeof setTimeout> | null = null;
+
+	function grabTerminalText(): string {
+		if (!terminal) return '';
+		const buf = terminal.buffer.active;
+		const end = buf.baseY + terminal.rows;
+		const start = Math.max(0, end - 500); // last ~500 lines incl. scrollback
+		const lines: string[] = [];
+		for (let i = start; i < end; i++) {
+			const line = buf.getLine(i);
+			lines.push(line ? line.translateToString(true) : '');
+		}
+		return lines.join('\n').replace(/\s+$/, '');
+	}
+
+	function openCopyOverlay() {
+		copyOverlayText = grabTerminalText();
+	}
+
+	async function copyAllOverlay() {
+		if (copyOverlayText) {
+			try {
+				await navigator.clipboard.writeText(copyOverlayText);
+				showToast('Copied', `${copyOverlayText.length} chars`, 'ok');
+			} catch { /* clipboard blocked */ }
+		}
+		copyOverlayText = null;
+	}
+
+	// Mobile paste: read the OS clipboard and feed it into the running session as
+	// input. The canvas terminal has no native paste affordance on touch, so the
+	// PASTE key bridges it. readText() needs a user gesture (the tap supplies it).
+	async function pasteFromClipboard() {
+		if (!sessionId || !running) return;
+		try {
+			const text = await navigator.clipboard.readText();
+			if (text) {
+				sendInput(text);
+				showToast('Pasted', `${text.length} chars`, 'ok');
+			}
+		} catch {
+			showToast('Paste blocked', 'Clipboard read denied', 'err');
+		}
+	}
 
 	let terminalEl: HTMLDivElement | undefined = $state();
 	let terminal: any = null;
@@ -110,7 +165,12 @@
 	let resizeObserver: ResizeObserver | null = null;
 
 	function handleBeforeUnload() {
-		if (sessionId && running) {
+		// Only auto-kill on unload for throwaway terminals. keepAlive sessions
+		// (the chat drawer) MUST survive a refresh/close so the operator can
+		// reattach to the still-running session — killing here was exactly why
+		// "every refresh starts a new session": the beacon killed it before the
+		// reloaded page could reconnect.
+		if (sessionId && running && !keepAlive) {
 			// Fire-and-forget kill on tab close — use sendBeacon for reliability
 			const blob = new Blob([JSON.stringify({ action: 'kill', sessionId })], { type: 'application/json' });
 			navigator.sendBeacon('/api/pty', blob);
@@ -167,20 +227,27 @@
 	// --- RAF-batched writer: coalesces rapid SSE chunks into ~60 writes/sec ---
 	let writeQueue = '';
 	let writeRafId: number | null = null;
+	// While the user is actively selecting (mouse held down), pause flushing PTY
+	// output: the TUI's repaints clear xterm's on-screen selection, so without
+	// this you can never drag a range — only grab what a double-click selects
+	// instantly. Output buffers in writeQueue and flushes on mouse-up, so the
+	// highlight holds still while you select.
+	let selecting = false;
+	let cleanupSelection: (() => void) | null = null;
 
 	function batchWrite(data: string) {
 		// Intercept kitty protocol negotiation before queuing for render
 		data = handleKittyProtocol(data);
 		if (!data) return;
 		writeQueue += data;
-		if (writeRafId === null) {
+		if (writeRafId === null && !selecting) {
 			writeRafId = requestAnimationFrame(flushWrites);
 		}
 	}
 
 	function flushWrites() {
 		writeRafId = null;
-		if (!writeQueue || !terminal) return;
+		if (selecting || !writeQueue || !terminal) return;
 		const data = writeQueue;
 		writeQueue = '';
 		terminal.write(data);
@@ -291,6 +358,24 @@
 				}
 				return false; // block both keydown and keyup from xterm
 			}
+
+			// Copy: Cmd+C (macOS) or Ctrl+Shift+C — only consume the chord; a bare
+			// Ctrl+C is left alone so it still sends SIGINT to the process. xterm's
+			// selection is a canvas overlay, not DOM text, so the browser's native
+			// copy can't see it — we read it via getSelection() and write it out.
+			const copyPasteChord = event.metaKey || (event.ctrlKey && event.shiftKey);
+			if (event.type === 'keydown' && copyPasteChord && (event.key === 'c' || event.key === 'C')) {
+				const sel = terminal.getSelection();
+				if (sel) navigator.clipboard?.writeText(sel).catch(() => { /* clipboard blocked */ });
+				return false; // handled — don't forward to the PTY
+			}
+
+			// Paste: Cmd+V (macOS) or Ctrl+Shift+V. (Bare Ctrl+V stays verbatim-insert.)
+			if (event.type === 'keydown' && copyPasteChord && (event.key === 'v' || event.key === 'V')) {
+				navigator.clipboard?.readText().then((text) => { if (text) sendInput(text); }).catch(() => { /* clipboard blocked */ });
+				return false;
+			}
+
 			return true;
 		});
 
@@ -332,6 +417,44 @@
 		resizeObserver = ro;
 		if (terminalEl) ro.observe(terminalEl);
 
+		// Pause output while selecting: mouse-down in the terminal freezes the
+		// screen so a drag can build a full selection without repaints wiping it;
+		// mouse-up (anywhere) resumes and flushes the buffered output. Listener on
+		// document so a release outside the terminal still resumes.
+		const onTermMouseDown = () => { selecting = true; };
+		const onDocMouseUp = () => {
+			if (!selecting) return;
+			selecting = false;
+			if (writeQueue && writeRafId === null) writeRafId = requestAnimationFrame(flushWrites);
+		};
+		terminalEl?.addEventListener('mousedown', onTermMouseDown);
+		document.addEventListener('mouseup', onDocMouseUp);
+		cleanupSelection = () => {
+			terminalEl?.removeEventListener('mousedown', onTermMouseDown);
+			document.removeEventListener('mouseup', onDocMouseUp);
+		};
+
+		// Select-to-copy. Claude's TUI repaints frequently (spinner, status line)
+		// and each repaint clears xterm's on-screen selection — so the highlight
+		// vanishes before you can copy it. We copy whenever a non-empty selection
+		// SETTLES (debounced): the text is captured into `toCopy` and copied even
+		// if a repaint wipes the live selection a moment later. Cmd+C / Ctrl+Shift+C
+		// still work as an explicit copy.
+		let copyTimer: ReturnType<typeof setTimeout> | null = null;
+		let lastCopied = '';
+		terminal.onSelectionChange(() => {
+			const sel = terminal?.getSelection();
+			if (!sel || !sel.trim() || sel === lastCopied) return;
+			if (copyTimer) clearTimeout(copyTimer);
+			const toCopy = sel;
+			copyTimer = setTimeout(() => {
+				lastCopied = toCopy;
+				navigator.clipboard?.writeText(toCopy)
+					.then(() => showToast('Copied', `${toCopy.length} char${toCopy.length === 1 ? '' : 's'}`, 'ok'))
+					.catch(() => { /* clipboard blocked */ });
+			}, 250);
+		});
+
 		isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
 		// Track scroll position to show "scroll to bottom" button
@@ -349,12 +472,17 @@
 					if (e.touches.length === 1) {
 						touchStartY = e.touches[0].clientY;
 						touchScrollActive = true;
+						// Long-press (hold still ~500ms) opens the copy overlay.
+						if (longPressTimer) clearTimeout(longPressTimer);
+						longPressTimer = setTimeout(() => { longPressTimer = null; openCopyOverlay(); }, 500);
 					}
 				}, { passive: true });
 
 				viewport.addEventListener('touchmove', (e: TouchEvent) => {
 					if (!touchScrollActive || e.touches.length !== 1) return;
 					const deltaY = touchStartY - e.touches[0].clientY;
+					// Any real movement = a scroll, not a long-press — cancel the timer.
+					if (Math.abs(deltaY) > 8 && longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
 					const lines = Math.round(deltaY / 20); // ~20px per line
 					if (lines !== 0) {
 						terminal.scrollLines(lines);
@@ -366,6 +494,7 @@
 
 				viewport.addEventListener('touchend', () => {
 					touchScrollActive = false;
+					if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
 				}, { passive: true });
 			}
 		}
@@ -379,8 +508,8 @@
 			sessionId = reconnectSessionId;
 			running = true;
 			terminal.writeln(`\x1b[38;5;245m  Connecting to session ${reconnectSessionId}...\x1b[0m`);
-			attemptReconnect(5);
-		} else if (autoSpawn && prompt) {
+			attemptReconnect(5, { freshMount: true });
+		} else if (autoSpawn && (prompt || resumeSessionId || shell)) {
 			spawn();
 		}
 	}
@@ -389,6 +518,8 @@
 		if (writeRafId !== null) cancelAnimationFrame(writeRafId);
 		if (inputRafId !== null) cancelAnimationFrame(inputRafId);
 		if (uploadToastTimer) clearTimeout(uploadToastTimer);
+		if (longPressTimer) clearTimeout(longPressTimer);
+		cleanupSelection?.();
 		if (abortController) abortController.abort();
 		// Only kill the session if keepAlive is false (default behavior for interactive terminals).
 		// PM and worker terminals use keepAlive=true so collapsing doesn't kill the session.
@@ -453,7 +584,11 @@
 		running = true;
 		sessionId = '';
 
-		const label = isShell ? 'Opening shell' : shouldContinue ? 'Resuming session' : 'Starting agent';
+		// Resuming an existing conversation (--resume) or continuing the latest
+		// (--continue) must NOT re-inject the scope primer — that pastes it as a
+		// new message. The primer is for brand-new sessions only.
+		const isResume = !isShell && !shouldContinue && !!resumeSessionId;
+		const label = isShell ? 'Opening shell' : (shouldContinue || isResume) ? 'Resuming session' : 'Starting agent';
 		terminal?.writeln(`\x1b[38;5;245m  ${label} in ${cwd || 'HOME'}...\x1b[0m`);
 		terminal?.focus();
 
@@ -464,11 +599,13 @@
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				action: 'spawn',
-				prompt: isShell ? undefined : p,
+				prompt: (isShell || shouldContinue || isResume) ? undefined : p,
 				cwd: cwd || undefined,
 				cols: terminal?.cols || 120,
 				rows: terminal?.rows || 40,
 				continueSession: isShell ? undefined : shouldContinue || undefined,
+				resumeSessionId: isShell || shouldContinue ? undefined : (resumeSessionId || undefined),
+				origin: origin || undefined,
 				shell: isShell || undefined,
 			}),
 			signal: abortController.signal,
@@ -550,7 +687,13 @@
 		});
 	}
 
-	async function attemptReconnect(retries = 3) {
+	async function attemptReconnect(retries = 3, opts?: { freshMount?: boolean }) {
+		// freshMount = a brand-new xterm is connecting to an already-running session
+		// (e.g. the chat drawer was collapsed and re-opened). In that case the
+		// terminal is empty and the persistent process's screen state must be
+		// re-established. When false (a mid-session stream drop into the SAME xterm)
+		// the content is already on screen and must NOT be wiped.
+		const freshMount = opts?.freshMount === true;
 		for (let i = 0; i < retries; i++) {
 			await new Promise(r => setTimeout(r, 1000 * (i + 1)));
 			try {
@@ -580,16 +723,52 @@
 
 				terminal?.writeln('\x1b[38;5;82m  Reconnected\x1b[0m');
 
-				// Replay session log so terminal shows history after reconnect
-				try {
-					const logRes = await fetch(`/api/sessions/${sessionId}`);
-					if (logRes.ok) {
-						const logData = await logRes.json();
-						if (logData.log) {
-							terminal?.write(logData.log);
-						}
+				if (freshMount && terminal) {
+					// Re-establish the screen on a fresh xterm WITHOUT replaying the
+					// raw historical log. Replay was the cause of "text all over the
+					// place": /api/sessions/{id} returns only the last 32KB tail, so a
+					// 500KB-900KB Claude TUI log starts mid-escape-sequence (the
+					// alt-screen enable + all prior cursor context already scrolled
+					// off), and its absolute cursor moves were captured at the
+					// session's earlier geometry — both render as garbage in a freshly
+					// sized terminal.
+					const { cols, rows } = terminal;
+
+					// Match the live PTY + its server-side headless mirror to this
+					// fresh terminal's geometry so the snapshot is reflowed to the size
+					// we're about to render at.
+					await sendResize(cols, rows);
+
+					// Preferred: paint the headless mirror's serialized current screen
+					// (complete + geometry-matched — no diff-repaint gaps).
+					let snapshot = '';
+					try {
+						const snapRes = await fetch('/api/pty', {
+							method: 'POST',
+							headers: { 'Content-Type': 'application/json' },
+							body: JSON.stringify({ action: 'snapshot', sessionId }),
+						});
+						if (snapRes.ok) snapshot = (await snapRes.json())?.snapshot ?? '';
+					} catch { /* fall through to repaint fallback */ }
+
+					terminal.reset();
+					if (snapshot) {
+						// The server's snapshot already includes the alternate-screen
+						// enter when (and only when) the process is on the alt buffer —
+						// so we paint it verbatim, no client-side mode guessing.
+						terminal.write(snapshot);
+					} else {
+						// Fallback (no mirror, e.g. a session spawned before this shipped):
+						// clear an alt-screen and force a SIGWINCH so the process repaints
+						// its current frame.
+						terminal.write('\x1b[?1049h\x1b[2J\x1b[H');
+						await sendResize(cols, Math.max(1, rows - 1));
+						await new Promise((r) => setTimeout(r, 60));
+						await sendResize(cols, rows);
 					}
-				} catch { /* best effort — proceed without history */ }
+				}
+				// Mid-session stream drop (freshMount=false): the same xterm already
+				// holds the rendered screen — just resume the live stream below.
 
 				const reader = res.body.getReader();
 				const decoder = new TextDecoder();
@@ -654,6 +833,12 @@
 
 	export function clear() {
 		terminal?.clear();
+	}
+
+	/** Open the file picker — lets a parent (chat drawer) surface upload in its
+	 *  own toolbar without duplicating the upload logic. */
+	export function triggerUpload() {
+		fileInput?.click();
 	}
 
 	async function uploadFiles(files: FileList | File[]) {
@@ -831,6 +1016,26 @@
 				</svg>
 			</button>
 		{/if}
+
+		<!-- Mobile copy overlay: native-selectable text of the recent buffer.
+		     Long-press the terminal (or the COPY key) opens this; select with the
+		     OS and copy, or tap "Copy all". -->
+		{#if copyOverlayText !== null}
+			<div class="absolute inset-0 z-40 flex flex-col bg-hub-bg/95 backdrop-blur-sm">
+				<div class="flex items-center justify-between px-3 py-2 border-b border-hub-border/50 text-xs flex-shrink-0">
+					<span class="text-hub-muted">Select text to copy</span>
+					<div class="flex items-center gap-2">
+						<button onclick={copyAllOverlay} class="px-3 py-1 rounded bg-hub-cta text-hub-bg font-medium cursor-pointer">Copy all</button>
+						<button onclick={() => (copyOverlayText = null)} class="px-3 py-1 rounded bg-hub-card border border-hub-border text-hub-muted hover:text-hub-text transition-colors cursor-pointer">Close</button>
+					</div>
+				</div>
+				<textarea
+					readonly
+					class="flex-1 min-h-0 w-full resize-none bg-hub-bg text-hub-text font-mono text-xs leading-relaxed p-3 outline-none select-text"
+					style="-webkit-user-select: text; user-select: text;"
+				>{copyOverlayText}</textarea>
+			</div>
+		{/if}
 	</div>
 
 	<!-- Mobile extra keys toolbar -->
@@ -849,7 +1054,8 @@
 				<button ontouchstart={xalt} class="xkey {altActive ? 'xkey-active' : ''}">ALT</button>
 				<button ontouchstart={xkey('/')} class="xkey">/</button>
 				<button ontouchstart={xkey('-')} class="xkey">-</button>
-				<button ontouchstart={xkey('_')} class="xkey">_</button>
+				<button ontouchstart={(e) => { e.preventDefault(); openCopyOverlay(); }} class="xkey text-[9px] text-hub-cta" title="Copy text">COPY</button>
+				<button ontouchstart={(e) => { e.preventDefault(); pasteFromClipboard(); }} class="xkey text-[9px] text-hub-cta" title="Paste from clipboard">PASTE</button>
 				<div class="ml-auto flex gap-0.5">
 					<div class="w-9"></div>
 					<button ontouchstart={xkey('\x1b[A')} class="xkey xkey-arrow">&uarr;</button>

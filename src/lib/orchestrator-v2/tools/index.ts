@@ -20,6 +20,9 @@
 
 import { tool } from 'ai';
 import { z } from 'zod';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 
 import { withToolCache } from './cache.js';
 import { dispatchWebSearch, formatWebSearchForChat } from '../../web-search/index.js';
@@ -34,6 +37,16 @@ import { dispatchVaultSave } from '../../vault-save/index.js';
 import { fetchPage } from '../../fetch-page/index.js';
 import { recordToolCall, assertManifestParity } from './registry.js';
 import { withLatencyTracking } from './latency-tracker.js';
+import {
+	selectToolsets,
+	applyGatingFilter,
+	getSessionExpansions,
+	requestToolsetExpansion,
+	assertToolsetCoverage,
+	TOOLSET_DESCRIPTIONS,
+	getToolsetMap,
+	type ToolsetName,
+} from './gating.js';
 import { setPending, formatProposal } from '../../orchestrator/pending-proposals.js';
 import {
 	listMessages,
@@ -41,6 +54,7 @@ import {
 	correctClassification,
 	getMessage,
 	getAccount,
+	listAccounts,
 	fetchImapBody,
 	getExtractedData,
 	setExtractedData,
@@ -77,6 +91,7 @@ import {
 	type InteractionDirection,
 } from '../../crm/index.js';
 import { getVaultEngine } from '../../vault/index.js';
+import { getAgent } from '../../agents/store.js';
 import { applyShipSlice, ShipSliceRequestSchema } from '../../projects/ship-slice.js';
 import { applyProposeAdr } from '../../projects/propose-adr.js';
 import { applyProposeSlice } from '../../projects/propose-slice.js';
@@ -104,6 +119,15 @@ import type {
 	RemindersConfigSlice,
 	HeartbeatConfigSlice,
 } from '../types.js';
+import {
+	findCatalogEntry,
+	buildNavigateUrl,
+	formatCatalogList,
+	formatPageDescription,
+} from '../../chat/pages/catalog.js';
+// ADR-013 S2 — systemHealth tool: in-process doctor check (no shell).
+import { getCatalogIndexFreshness } from '../../naseej/catalog-index.js';
+import { getSystemHealth } from '../../system/index.js';
 
 export interface ToolDeps {
 	conversationKey?: string;
@@ -143,6 +167,17 @@ export interface ToolDeps {
 	 *  branch in analytics. Undefined when v2 isn't running an A/B (e.g.
 	 *  `ORCHESTRATOR_V2_MODEL` legacy override). */
 	modelBranch?: string;
+	/** ADR-011 — scope kind for the current page (e.g. 'project', 'global').
+	 *  Forwarded from the web channel; undefined on WhatsApp/Telegram.
+	 *  Used by `describeCurrentPage` to look up the page catalog entry. */
+	scopeKind?: string;
+	/** ADR-011 — scope-specific params (e.g. `{ slug: 'naseej' }`).
+	 *  Forwarded alongside `scopeKind`. */
+	scopeParams?: Record<string, string>;
+	/** ADR-014 — the user's message text for this turn. Forwarded from
+	 *  `decideV2` to drive keyword-intent toolset expansion (Tier 2 §S4).
+	 *  Optional so all existing callers keep working without changes. */
+	userMessage?: string;
 	/** ADR-030 — slow-skill dispatch hook. When set, slow tools (per the
 	 *  manifest's `latencyClass`) short-circuit their execute() to a
 	 *  background worker that edits the presence bubble when complete.
@@ -174,13 +209,24 @@ export interface SlowDispatchDeps {
 /** Tagged-union return type for all tool `execute()` bodies. decide-v2's
  *  result walker discriminates on `kind` to assemble the `V2Output`.
  *
- *  `reply` vs `verbatim`: both carry pre-formatted text, but `reply` is a
- *  fallback used only when the LLM's `finalText` is junk-short — the LLM
- *  is free to creatively reformat the result during composition. Use
- *  `verbatim` when the tool's structured output IS the answer and any
- *  LLM rewrite removes information (e.g. list-style outputs where row
- *  ids must survive intact). `verbatim` wins over `usefulFinal` in
- *  buildV2Output, bypassing LLM narration entirely. */
+ *  `reply` vs `verbatim` contract (ADR-016 S3 — choose carefully):
+ *
+ *  `reply`   — The LLM's `usefulFinal` wins when the model synthesises (e.g.
+ *               picks a recommendation, compares options, gives a rationale).
+ *               The tool text is the graceful fallback only when `usefulFinal`
+ *               is junk-short or absent. Use `reply` for tools whose output is
+ *               *input to reasoning* — the user may ask "which one?", "compare
+ *               X and Y", "what should we do next?" after seeing the data.
+ *               Examples: projectList, projectGet, vaultSearch results.
+ *
+ *  `verbatim` — The tool text IS the final reply; buildV2Output returns it
+ *               immediately, discarding any LLM narration. Use ONLY when the
+ *               tool's structured output must survive exactly (row ids, action
+ *               codes, formatted catalogs) AND the user never asks the model
+ *               to reason over it. Over-using verbatim silently discards the
+ *               model's synthesis even for reasoning questions.
+ *               Examples: inbox-list-queued (msg-N ids), listPages, systemHealth,
+ *               listToolsets, describeCurrentPage, vaultRecent (path ids). */
 export type ToolResult =
 	| { kind: 'reply'; text: string }
 	| { kind: 'verbatim'; text: string }
@@ -354,6 +400,21 @@ export type ToolResult =
 			adr: string;
 			error: string;
 			statusHint?: number;
+	  }
+	/** ADR-011 S2 — navigateTo tool success: web-only navigate directive.
+	 *  Instructs the browser drawer to call goto(url) via a `navigate` SSE
+	 *  event. `buildV2Output` maps this to `V2Output.kind === 'navigate'`. */
+	| {
+			kind: 'navigate';
+			url: string;
+			/** Human-readable confirmation shown in the bubble before navigation. */
+			confirmMessage: string;
+	  }
+	/** ADR-011 S2 — navigateTo failed (path not in catalog, external URL). */
+	| {
+			kind: 'navigate-error';
+			path: string;
+			error: string;
 	  };
 
 /** Build the tool dictionary for an Agent. Returns a stable object so the
@@ -361,13 +422,38 @@ export type ToolResult =
  *
  *  ADR-015 — checks manifest parity once per process. Warns (doesn't
  *  throw) when the live tool keys diverge from the static manifest, so
- *  the dev sees the drift in PM2 logs without breaking dispatch. */
+ *  the dev sees the drift in PM2 logs without breaking dispatch.
+ *
+ *  ADR-014 — assembly-time toolset gating (Tier 2 + Tier 3):
+ *  assertManifestParity + assertToolsetCoverage run on the FULL tool set,
+ *  then applyGatingFilter returns the subset for this turn. Only the
+ *  gated subset is wrapped in latency tracking and handed to the model. */
 export function buildOrchestratorTools(deps: ToolDeps) {
 	const tools = buildOrchestratorToolsImpl(deps);
+
+	// Parity + coverage assertions must run on the full set (before gating).
 	assertManifestParity(Object.keys(tools));
+	assertToolsetCoverage(); // ADR-014 S1
+
+	// ADR-014 Tier 2 — select toolsets for this context (pure, stable).
+	const baseEnabled = selectToolsets({
+		channel: deps.channel,
+		scopeKind: deps.scopeKind,
+		userMessage: deps.userMessage,
+	});
+
+	// ADR-014 Tier 3 — merge session expansions from prior turns.
+	const sessionExpansions = deps.conversationKey
+		? getSessionExpansions(deps.conversationKey)
+		: (new Set<ToolsetName>() as ReadonlySet<ToolsetName>);
+	const enabled = new Set<ToolsetName>([...baseEnabled, ...sessionExpansions]);
+
+	// Filter to the enabled toolsets + apply channel hard-filter for WEB_ONLY_TOOLS.
+	const gated = applyGatingFilter(tools, enabled, deps.channel);
+
 	// ADR-030 v2 — wrap each tool's execute() so the rolling per-tool
 	// latency buffer powers the `auto` suggestion on /orchestration/tools.
-	return withLatencyTracking(tools);
+	return withLatencyTracking(gated);
 }
 
 function buildOrchestratorToolsImpl(deps: ToolDeps) {
@@ -423,15 +509,95 @@ function buildOrchestratorToolsImpl(deps: ToolDeps) {
 		}),
 
 		vaultSearch: tool({
+			// ADR-013 S3 — trimmed from single 1 KB string; routing discriminators preserved.
 			description:
-				'Recon the accumulated knowledge base (Soul Hub vault, ~/vault/ — prior research, decisions, CRM, learnings). CALL THIS FIRST (ADR-053 vault-recon) for any knowledge / entity / continuity question — a company, person, project, or topic, and "do we have research on X", "what did we save / decide about Y", "have we looked at Z", "find my notes on W" — so you build on prior work before hitting the web. A vault hit is CONTEXT to extend ("we already have a note on X from <date>"), NOT the authoritative answer for current-state facts; a tangential match is not relevant. Do NOT use for current events, news, headlines, weather, live scores, or any question about the outside world — those go to webSearch (a topic-adjacent note does not satisfy a current-events question). Do NOT use for inbox/email queries of ANY kind — "what\'s in my inbox", "what\'s queued", "any new emails", "new mail", "what came in today", "any bank alerts", "msg <N>", "what about msg N", "tell me about N", or any bare 4-6 digit id after a digest/anomaly push. ALL email queries route to `inbox-list-queued` (lists) or `inbox-drill-down` (single id), NEVER here. The vault has an unrelated `inbox/` folder for quick note captures — ignore that name collision; the word "inbox" without an explicit "note"/"vault" qualifier always means EMAIL. Vault returning a topic-adjacent note does not satisfy a news / current-events / inbox question.',
+				'CALL FIRST (ADR-053) for knowledge / entity / continuity questions — "do we have notes on X", "what did we decide about Y", "find research on Z". ' +
+				'Searches ~/vault/ (prior research, decisions, CRM, learnings). A hit is CONTEXT to build on, not authoritative for current facts. ' +
+				'Optional filters (zone, project, type, tag, limit) mirror `soul vault search` — structural precision; without filters, semantic retrieval is used. ' +
+				'Do NOT use for: current events / news / weather / live scores (→ webSearch). ' +
+				'Do NOT use for inbox/email — "what\'s in my inbox", "any new emails", "msg N", bare 4-6 digit id after a digest → `inbox-list-queued` (lists) or `inbox-drill-down` (single). ' +
+				'The vault has an unrelated inbox/ folder for note captures — ignore the name; "inbox" without "note/vault" qualifier = EMAIL.',
 			inputSchema: z.object({
 				query: z.string().min(2).max(400),
+				zone: z
+					.string()
+					.max(80)
+					.optional()
+					.describe('Vault zone filter, e.g. "projects", "knowledge/patterns", "inbox".'),
+				project: z
+					.string()
+					.max(80)
+					.optional()
+					.describe('Project slug filter, e.g. "soul-hub-chat", "naseej".'),
+				type: z
+					.string()
+					.max(40)
+					.optional()
+					.describe('Note type filter, e.g. "decision", "learning", "pattern".'),
+				tag: z
+					.string()
+					.max(60)
+					.optional()
+					.describe('Single tag filter (AND with other filters). E.g. "svelte".'),
+				limit: z
+					.number()
+					.int()
+					.min(1)
+					.max(50)
+					.optional()
+					.describe('Max results to return (default 10 when filters present, semantic mode returns full answer).'),
 			}),
 			execute: withToolCache(
 				'vaultSearch',
-				async ({ query }): Promise<ToolResult> => {
-					logToolCall('vaultSearch', { query });
+				async ({ query, zone, project, type, tag, limit }): Promise<ToolResult> => {
+					logToolCall('vaultSearch', { query, zone, project, type, tag, limit });
+					const hasFilters = !!(zone || project || type || tag || limit);
+					if (hasFilters) {
+						// ADR-010 S1 — structural filter path: call engine.getNotes() directly,
+						// mirroring soul CLI's MiniSearch filter surface.
+						const engine = getVaultEngine();
+						if (!engine) {
+							return { kind: 'vault-search-error', error: 'Vault engine not initialized', query };
+						}
+						try {
+							const results = engine.getNotes({
+								q: query,
+								zone,
+								project,
+								type,
+								tags: tag ? [tag] : undefined,
+								limit: limit ?? 10,
+							});
+							if (results.length === 0) {
+								const filterDesc = [
+									zone ? `zone=${zone}` : '',
+									project ? `project=${project}` : '',
+									type ? `type=${type}` : '',
+									tag ? `tag=${tag}` : '',
+								].filter(Boolean).join(', ');
+								return {
+									kind: 'vault-search',
+									text: `No vault notes match${filterDesc ? ` (${filterDesc})` : ''}.`,
+									query,
+								};
+							}
+							const lines = results.map((r, i) => {
+								const status = r.status ? ` [${r.status}]` : '';
+								const proj = r.project ? ` • ${r.project}` : '';
+								const snip = r.snippet ? `\n   ${r.snippet.slice(0, 120)}` : '';
+								return `${i + 1}. ${r.title}${status}${proj} — ${r.path}${snip}`;
+							});
+							return {
+								kind: 'vault-search',
+								text: `Found ${results.length} note${results.length === 1 ? '' : 's'}:\n\n${lines.join('\n\n')}`,
+								query,
+							};
+						} catch (err) {
+							const error = (err as Error).message ?? String(err);
+							return { kind: 'vault-search-error', error, query };
+						}
+					}
+					// No filters — use the semantic vault-chat path for richer LLM-backed retrieval.
 					try {
 						const r = await dispatchVaultChat(query, deps.conversationKey);
 						return { kind: 'vault-search', text: r.text || '(no reply)', query };
@@ -442,6 +608,82 @@ function buildOrchestratorToolsImpl(deps: ToolDeps) {
 				},
 				{ scope: () => deps.conversationKey ?? '' },
 			),
+		}),
+
+		vaultGet: tool({
+			description:
+				'Fetch a specific vault note by its vault-relative path. Returns frontmatter, full body content, and outgoing wikilinks. Use when you know the exact path (e.g., from a prior vaultSearch result). Mirrors `soul vault get PATH`. All channels. ' +
+				'Do NOT guess paths — use the exact `path` field from a vaultSearch result. Returns a 404-style error when the path does not exist.',
+			inputSchema: z.object({
+				path: z
+					.string()
+					.min(1)
+					.max(500)
+					.describe('Vault-relative path to the note, e.g. "projects/soul-hub-chat/adr-010-foo.md" or "knowledge/patterns/2026-05-12-bar.md".'),
+			}),
+			execute: withToolCache('vaultGet', async ({ path }): Promise<ToolResult> => {
+				logToolCall('vaultGet', { path });
+				if (path.includes('..') || path.startsWith('/') || !path.endsWith('.md')) {
+					return {
+						kind: 'reply',
+						text: `ERROR: Invalid vault path "${path}". Must be relative (no ".." or leading "/") and end in ".md".`,
+					};
+				}
+				const engine = getVaultEngine();
+				if (!engine) return { kind: 'reply', text: 'ERROR: Vault engine not initialized.' };
+				const note = engine.getNote(path);
+				if (!note) {
+					return {
+						kind: 'reply',
+						text: `ERROR: No vault note at "${path}". Use vaultSearch to find notes by topic first.`,
+					};
+				}
+				const metaLines: string[] = [];
+				if (note.meta.type) metaLines.push(`type: ${note.meta.type}`);
+				if (note.meta.status) metaLines.push(`status: ${note.meta.status}`);
+				if (note.meta.created) metaLines.push(`created: ${note.meta.created}`);
+				if (note.meta.project) metaLines.push(`project: ${note.meta.project}`);
+				const tags = Array.isArray(note.meta.tags) ? note.meta.tags : [];
+				if (tags.length > 0) metaLines.push(`tags: ${(tags as string[]).join(', ')}`);
+				const outLinks = note.links.filter((l) => l.resolved).map((l) => l.raw);
+				if (outLinks.length > 0) metaLines.push(`links out: ${outLinks.join(', ')}`);
+				const header = `# ${note.title}\npath: ${note.path}\n${metaLines.join('\n')}`;
+				const body = (note.content ?? '').slice(0, 4000);
+				const truncated = (note.content?.length ?? 0) > 4000 ? `\n…(truncated — ${note.content?.length} chars total)` : '';
+				return { kind: 'reply', text: `${header}\n\n---\n\n${body}${truncated}` };
+			}),
+		}),
+
+		vaultRecent: tool({
+			description:
+				'Return the N most recently modified vault notes. Mirrors `soul vault recent`. All channels. ' +
+				'Use for "what did we work on recently", "show me the latest notes", "what was just saved". Read-only, no confirmation gate.',
+			inputSchema: z.object({
+				limit: z
+					.number()
+					.int()
+					.min(1)
+					.max(50)
+					.optional()
+					.describe('Max notes to return (default 10).'),
+			}),
+			execute: withToolCache('vaultRecent', async ({ limit }): Promise<ToolResult> => {
+				logToolCall('vaultRecent', { limit });
+				const engine = getVaultEngine();
+				if (!engine) return { kind: 'reply', text: 'ERROR: Vault engine not initialized.' };
+				const notes = engine.getRecent(limit ?? 10);
+				if (notes.length === 0) return { kind: 'reply', text: 'No vault notes found.' };
+				const lines = notes.map((n, i) => {
+					const when = formatRelativeDate(n.mtime);
+					const type = n.meta.type ? ` [${n.meta.type as string}]` : '';
+					const status = n.meta.status ? ` (${n.meta.status as string})` : '';
+					return `${i + 1}. ${n.title}${type}${status} — ${n.path}  · ${when}`;
+				});
+				return {
+					kind: 'verbatim',
+					text: `${notes.length} recently modified note${notes.length === 1 ? '' : 's'}:\n\n${lines.join('\n')}`,
+				};
+			}),
 		}),
 
 		generateImage: tool({
@@ -567,10 +809,27 @@ function buildOrchestratorToolsImpl(deps: ToolDeps) {
 					// happens in the inbound handler's v2Output short-circuit
 					// because it needs `envelope.chatJid`, `worker`, and `ctx`
 					// that aren't available inside the orchestrator scope.
+					//
+					// ADR-012 S2 — architect dispatch from a project-scoped page:
+					// inject project context (slug, existing ADR count, next ordinal)
+					// into the task so the agent targets the correct project without
+					// the operator having to repeat themselves.
+					let effectiveTask = args.task;
+					if (
+						args.agentId === 'architect' &&
+						deps.scopeKind === 'project' &&
+						deps.scopeParams?.slug
+					) {
+						const engine = getVaultEngine();
+						const ctx = buildArchitectProjectContext(engine, deps.scopeParams.slug);
+						if (ctx) {
+							effectiveTask = `${ctx}\n\n## Design brief\n${args.task}`;
+						}
+					}
 					return {
 						kind: 'dispatch',
 						agentId: args.agentId,
-						task: args.task,
+						task: effectiveTask,
 					};
 				}
 				// confirmed=false → write to pending_proposals + return formatted text.
@@ -784,13 +1043,14 @@ function buildOrchestratorToolsImpl(deps: ToolDeps) {
 		}),
 
 		vaultSave: tool({
+			// ADR-013 S3 — trimmed; CALL ONCE guard preserved.
 			description:
-				"Save composed content to the user's Soul Hub vault (standalone markdown store at ~/vault/) as a markdown note. " +
-				"Use ONLY when the user explicitly asks to save / capture / remember / add to notes / write down / store. " +
-				"NEVER call this for discussion-only requests. " +
-				"For multi-step flows (e.g. user asks to save a YouTube video), call the upstream tool first (youtubeFetch with mode=summary), then synthesize a clean note body, THEN call vaultSave with the synthesized title + body. " +
-				"CALL ONCE per save intent — do NOT call vaultSave twice in the same turn even with a different title or richer content. Pick the best title and the fullest body on the first call. A second call wastes tokens and produces a duplicate row. " +
-				"Always writes to the inbox zone — the user curates from there. After it returns, include the openUrl in your reply so the user can open the note.",
+				"Save composed content to ~/vault/ as a markdown note. " +
+				"ONLY when user explicitly asks to save / capture / remember / write down / store. NEVER for discussion-only. " +
+				"Multi-step: call upstream tool first (e.g. youtubeFetch), synthesize, then vaultSave. " +
+				"CALL ONCE per save intent — a second call in the same turn produces a duplicate. " +
+				"Default zone: inbox (user curates from there). Pass zone for: knowledge/patterns, knowledge/learnings, knowledge/snippets, knowledge/debugging. " +
+				"Include openUrl in reply.",
 			inputSchema: z.object({
 				title: z
 					.string()
@@ -824,14 +1084,21 @@ function buildOrchestratorToolsImpl(deps: ToolDeps) {
 					.describe(
 						'When the saved content was derived from a URL (YouTube, article), pass it here so the note can back-link.',
 					),
+				zone: z
+					.enum(['inbox', 'knowledge/patterns', 'knowledge/learnings', 'knowledge/snippets', 'knowledge/debugging'])
+					.optional()
+					.describe(
+						'ADR-010 S4 — target zone. Defaults to "inbox". Use "knowledge/patterns" for validated patterns, "knowledge/learnings" for insights, "knowledge/snippets" for reusable code, "knowledge/debugging" for post-mortems.',
+					),
 			}),
-			execute: async ({ title, content, type, tags, sourceUrl }): Promise<ToolResult> => {
+			execute: async ({ title, content, type, tags, sourceUrl, zone }): Promise<ToolResult> => {
 				logToolCall('vaultSave', {
 					title: title.slice(0, 60),
 					type,
 					tagCount: tags.length,
 					hasSource: !!sourceUrl,
 					contentChars: content.length,
+					zone: zone ?? 'inbox',
 				});
 				const outcome = await dispatchVaultSave({
 					title,
@@ -839,6 +1106,7 @@ function buildOrchestratorToolsImpl(deps: ToolDeps) {
 					type,
 					tags,
 					sourceUrl,
+					zone,
 				});
 				if (!outcome.ok) {
 					return { kind: 'vault-save-error', error: outcome.error, title: outcome.title };
@@ -849,6 +1117,387 @@ function buildOrchestratorToolsImpl(deps: ToolDeps) {
 					openUrl: outcome.openUrl,
 					title: outcome.title,
 				};
+			},
+		}),
+
+		vaultNoteUpdate: tool({
+			description:
+				'Update an existing vault note\'s content and/or frontmatter metadata. Mirrors `soul note update PATH`. All channels. ' +
+				'CONFIRMATION GATE: OMIT `confirmed` (or set false) to PROPOSE the update — the user replies "yes" to run it. Set `confirmed=true` ONLY when the user explicitly confirmed. ' +
+				'Takes `path` (vault-relative) + optional `content` (full new body) + optional `metaJson` (JSON object of fields to merge into frontmatter). At least one of `content` or `metaJson` is required. ' +
+				'PROVENANCE: `path` MUST be a real vault path from a prior vaultSearch/vaultGet result. NEVER fabricate paths.',
+			inputSchema: z.object({
+				path: z
+					.string()
+					.min(1)
+					.max(500)
+					.describe('Vault-relative path of the note to update, e.g. "projects/foo/adr-001-bar.md".'),
+				content: z
+					.string()
+					.min(1)
+					.max(50_000)
+					.optional()
+					.describe('New markdown body. When provided, replaces the full existing body.'),
+				metaJson: z
+					.string()
+					.max(2000)
+					.optional()
+					.describe('JSON object of frontmatter fields to merge/overwrite, e.g. \'{"status":"accepted","tags":["adr","shipped"]}\'.'),
+				confirmed: z
+					.boolean()
+					.optional()
+					.describe('Omit (default false) to propose. true = run now.'),
+			}).refine((v) => v.content || v.metaJson, {
+				message: 'Provide at least one of `content` or `metaJson`.',
+			}),
+			execute: async ({ path, content, metaJson, confirmed }): Promise<ToolResult> => {
+				const isConfirmed = confirmed ?? false;
+				logToolCall('vaultNoteUpdate', { path, hasContent: !!content, hasMeta: !!metaJson, confirmed: isConfirmed });
+
+				if (!isConfirmed && deps.conversationKey) {
+					const label = `Update vault note "${path.split('/').pop()}"`;
+					const proposal = setPending({
+						conversationKey: deps.conversationKey,
+						agentId: 'vaultNoteUpdate',
+						task: JSON.stringify({ path, hasContent: !!content, hasMeta: !!metaJson }),
+						label,
+						origin: 'natural',
+						modelBranch: deps.modelBranch,
+					});
+					return { kind: 'proposal', text: formatProposal(proposal), agentId: 'vaultNoteUpdate', task: path, label };
+				}
+
+				if (path.includes('..') || path.startsWith('/') || !path.endsWith('.md')) {
+					return { kind: 'reply', text: `ERROR: Invalid vault path "${path}". Must be relative and end in ".md".` };
+				}
+				const engine = getVaultEngine();
+				if (!engine) return { kind: 'reply', text: 'ERROR: Vault engine not initialized.' };
+				const existing = engine.getNote(path);
+				if (!existing) {
+					return { kind: 'reply', text: `ERROR: No vault note at "${path}". Use vaultSearch to find notes.` };
+				}
+				let metaPatch: Record<string, unknown> | undefined;
+				if (metaJson) {
+					try {
+						metaPatch = JSON.parse(metaJson) as Record<string, unknown>;
+					} catch {
+						return { kind: 'reply', text: `ERROR: metaJson is not valid JSON — ${metaJson.slice(0, 80)}` };
+					}
+				}
+				const req: Record<string, unknown> = {};
+				if (content !== undefined) req.content = content;
+				if (metaPatch !== undefined) req.meta = metaPatch;
+				const result = await engine.updateNote(
+					path,
+					req as Parameters<typeof engine.updateNote>[1],
+					{ actor: 'vaultNoteUpdate', actorContext: 'orchestrator tool' },
+				);
+				if (!result.success) {
+					return { kind: 'reply', text: `ERROR: Could not update "${path}": ${result.error ?? 'unknown'}` };
+				}
+				return { kind: 'reply', text: `Updated ${path}.${metaPatch ? ` Frontmatter patched: ${Object.keys(metaPatch).join(', ')}.` : ''}` };
+			},
+		}),
+
+		vaultNoteMove: tool({
+			description:
+				'Move or rename a vault note — link-safe: rewrites every inbound wikilink across the vault. Mirrors `soul note move SRC ZONE` / `soul note rename SRC NEW-FILENAME`. ' +
+				'WEB CHANNEL ONLY — too destructive for WhatsApp/Telegram where you cannot see the result inline. ' +
+				'CONFIRMATION GATE: OMIT `confirmed` (or set false) to PROPOSE the move — the user replies "yes" to run it. Set `confirmed=true` ONLY when the user explicitly confirmed. ' +
+				'Must provide `targetZone` and/or `newFilename`. PROVENANCE: `src` MUST be a real vault path from a prior vaultSearch/vaultGet.',
+			inputSchema: z.object({
+				src: z
+					.string()
+					.min(1)
+					.max(500)
+					.describe('Vault-relative path of the note to move/rename.'),
+				targetZone: z
+					.string()
+					.max(80)
+					.optional()
+					.describe('Target zone, e.g. "knowledge/patterns". Must change targetZone or newFilename or both.'),
+				newFilename: z
+					.string()
+					.max(120)
+					.optional()
+					.describe('New filename (must end in .md, no slashes), e.g. "2026-05-28-my-note.md".'),
+				confirmed: z
+					.boolean()
+					.optional()
+					.describe('Omit (default false) to propose. true = run now.'),
+			}).refine((v) => v.targetZone || v.newFilename, {
+				message: 'Provide targetZone and/or newFilename.',
+			}),
+			execute: async ({ src, targetZone, newFilename, confirmed }): Promise<ToolResult> => {
+				if (deps.channel !== 'web') {
+					return { kind: 'reply', text: 'This operation is available in the browser chat only.' };
+				}
+				const isConfirmed = confirmed ?? false;
+				logToolCall('vaultNoteMove', { src, targetZone, newFilename, confirmed: isConfirmed });
+
+				if (!isConfirmed && deps.conversationKey) {
+					const srcName = src.split('/').pop() ?? src;
+					const dstZone = targetZone ? `${targetZone}/` : '';
+					const dstFile = newFilename ?? srcName;
+					const label = `Move "${srcName}" → ${dstZone}${dstFile}`;
+					const proposal = setPending({
+						conversationKey: deps.conversationKey,
+						agentId: 'vaultNoteMove',
+						task: JSON.stringify({ src, targetZone, newFilename }),
+						label,
+						origin: 'natural',
+						modelBranch: deps.modelBranch,
+					});
+					return { kind: 'proposal', text: formatProposal(proposal), agentId: 'vaultNoteMove', task: src, label };
+				}
+
+				const engine = getVaultEngine();
+				if (!engine) return { kind: 'reply', text: 'ERROR: Vault engine not initialized.' };
+				const result = await engine.relocateNotes(
+					[{ src, targetZone, newFilename }],
+					{ actor: 'vaultNoteMove', actorContext: 'orchestrator tool' },
+				);
+				if (!result.success) {
+					return { kind: 'reply', text: `ERROR: Move failed for "${src}": ${result.error ?? 'unknown error'}` };
+				}
+				const moved = result.moves[0];
+				const dst = moved?.dst ?? `${targetZone ?? ''}/${newFilename ?? src.split('/').pop()}`;
+				const rewritten = result.rewrites.reduce((sum, r) => sum + r.bodyCount + r.metaCount, 0);
+				return {
+					kind: 'reply',
+					text: `Moved ${src} → ${dst}. ${rewritten} inbound link${rewritten === 1 ? '' : 's'} updated.`,
+				};
+			},
+		}),
+
+		projectList: tool({
+			// ADR-013 S1 — routing guard: "Do NOT use" for health/system questions.
+			description:
+				'List all active projects in the vault. Mirrors `soul project list`. All channels. ' +
+				'Returns project slugs with last-activity date and open ADR count. Use for "what projects do we have", "list all projects", "what\'s active". ' +
+				'Do NOT use for system health / server status / "is everything ok" / "are services up" questions — use `systemHealth` for those.',
+			inputSchema: z.object({
+				limit: z
+					.number()
+					.int()
+					.min(1)
+					.max(100)
+					.optional()
+					.describe('Max projects to return (default 50).'),
+			}),
+			execute: withToolCache('projectList', async ({ limit }): Promise<ToolResult> => {
+				logToolCall('projectList', { limit });
+				const engine = getVaultEngine();
+				if (!engine) return { kind: 'reply', text: 'ERROR: Vault engine not initialized.' };
+				// Find all project root index.md files (projects/<slug>/index.md pattern)
+				const allNotes = engine.getAllNotes();
+				const projectIndexes = allNotes.filter((n) => /^projects\/[^/]+\/index\.md$/.test(n.path));
+				if (projectIndexes.length === 0) {
+					return { kind: 'reply', text: 'No projects found in vault.' };
+				}
+				// Sort by mtime descending (most recently active first)
+				const sorted = projectIndexes
+					.sort((a, b) => b.mtime - a.mtime)
+					.slice(0, limit ?? 50);
+				const lines = sorted.map((n, i) => {
+					const slug = n.path.split('/')[1] ?? '';
+					const when = n.mtime ? `  · ${formatRelativeDate(n.mtime)}` : '';
+					// Count open (proposed) ADRs for this project
+					const openAdrs = allNotes.filter(
+						(x) =>
+							x.path.startsWith(`projects/${slug}/`) &&
+							x.meta.type === 'decision' &&
+							x.meta.status === 'proposed',
+					).length;
+					const openStr = openAdrs > 0 ? ` (${openAdrs} open ADR${openAdrs === 1 ? '' : 's'})` : '';
+					return `${i + 1}. ${slug}${openStr}${when}`;
+				});
+				// ADR-016 S1 — `reply` so the LLM can synthesise over this list for
+				// reasoning questions ("which project next?", "compare X and Y").
+				// `verbatim` was wrong here: it bypassed the model's `usefulFinal`
+				// even when the user wanted a recommendation, not just a raw list.
+				// `reply` lets synthesis win when present; the tool text is the
+				// graceful fallback when the model is short-circuited.
+				return {
+					kind: 'reply',
+					text: `${sorted.length} project${sorted.length === 1 ? '' : 's'}:\n\n${lines.join('\n')}`,
+				};
+			}),
+		}),
+
+		projectGet: tool({
+			// ADR-013 S1 — routing guard: "Do NOT use" for page-description questions.
+			description:
+				'Get a project\'s summary: description, ADR list with statuses, and status counts. Mirrors `soul project get SLUG`. All channels. ' +
+				'Use for "show me the soul-hub-chat project", "what\'s in project X", "list ADRs for project Y", "how is the [project] project". ' +
+				'Do NOT use for "what page am I on?", "what can I do here?", "describe this screen" — use `describeCurrentPage` for those (page-description questions). ' +
+				'PROVENANCE: `slug` MUST be a real project slug from a prior projectList result or the user\'s explicit text. NEVER fabricate slugs.',
+			inputSchema: z.object({
+				slug: z
+					.string()
+					.min(1)
+					.max(80)
+					.describe('Project slug — the kebab-case folder name under projects/, e.g. "soul-hub-chat".'),
+			}),
+			execute: withToolCache('projectGet', async ({ slug }): Promise<ToolResult> => {
+				logToolCall('projectGet', { slug });
+				const engine = getVaultEngine();
+				if (!engine) return { kind: 'reply', text: 'ERROR: Vault engine not initialized.' };
+				const indexPath = `projects/${slug}/index.md`;
+				const projectIndex = engine.getNote(indexPath);
+				if (!projectIndex) {
+					return { kind: 'reply', text: `ERROR: Project "${slug}" not found. Use projectList to see available projects.` };
+				}
+				// Gather all notes for this project
+				const notes = engine.getNotes({ project: slug, limit: 200 }).filter(
+					(n) => !n.path.startsWith('archive/'),
+				);
+				const fullNotes = notes.map((n) => engine.getNote(n.path)).filter(Boolean) as ReturnType<typeof engine.getNote>[];
+				// Build status counts for decisions
+				const statusCounts: Record<string, number> = {};
+				const decisions: { path: string; title: string; status: string; created?: string }[] = [];
+				for (const n of fullNotes) {
+					if (!n) continue;
+					if (n.meta.type === 'decision') {
+						const s = String(n.meta.status ?? 'unknown');
+						statusCounts[s] = (statusCounts[s] ?? 0) + 1;
+						decisions.push({
+							path: n.path,
+							title: n.title || n.path.split('/').pop()?.replace(/\.md$/, '') || n.path,
+							status: s,
+							created: typeof n.meta.created === 'string' ? n.meta.created : undefined,
+						});
+					}
+				}
+				// Sort: proposed first, then accepted, then shipped, rest alphabetically
+				const statusRank = (s: string) =>
+					s === 'proposed' ? 0 : s === 'accepted' ? 1 : s === 'shipped' ? 2 : 3;
+				decisions.sort((a, b) => {
+					const r = statusRank(a.status) - statusRank(b.status);
+					return r !== 0 ? r : (b.created ?? '').localeCompare(a.created ?? '');
+				});
+				const desc = typeof projectIndex.meta.description === 'string'
+					? projectIndex.meta.description
+					: '';
+				const header = `## Project: ${slug}\n${desc ? desc + '\n' : ''}Notes: ${notes.length}`;
+				const countsStr = Object.entries(statusCounts)
+					.sort((a, b) => statusRank(a[0]) - statusRank(b[0]))
+					.map(([s, n]) => `${s}:${n}`)
+					.join(', ');
+				const countsLine = countsStr ? `ADR counts — ${countsStr}` : 'No ADRs.';
+				const decisionLines = decisions.map((d) => {
+					const fname = d.path.split('/').pop() ?? d.path;
+					return `  [${d.status.padEnd(9)}] ${d.title} — ${fname}`;
+				});
+				const body = [header, countsLine, '', decisionLines.length > 0 ? decisionLines.join('\n') : '(no decisions)'].join('\n');
+				// ADR-016 S1 — `reply` so the LLM can synthesise project details for
+				// reasoning questions ("what's the status of X?", "which ADR should
+				// we work on?"). Same rationale as projectList: verbatim was discarding
+				// model synthesis even when the user asked for a recommendation.
+				return { kind: 'reply', text: body };
+			}),
+		}),
+
+		adrAccept: tool({
+			description:
+				'Transition an ADR from `proposed` → `accepted`. WEB CHANNEL ONLY — ADR status changes are available in the browser chat only. ' +
+				'CONFIRMATION GATE: OMIT `confirmed` (or set false) to PROPOSE the action — the user replies "yes" to confirm. Set `confirmed=true` ONLY when the user explicitly confirmed. ' +
+				'PROVENANCE: `path` MUST be a real vault-relative ADR path from a prior vaultSearch/projectGet/vaultGet result. NEVER fabricate paths.',
+			inputSchema: z.object({
+				path: z
+					.string()
+					.min(1)
+					.max(500)
+					.describe('Vault-relative path of the ADR, e.g. "projects/soul-hub-chat/adr-010-foo.md".'),
+				assignee: z
+					.string()
+					.max(60)
+					.optional()
+					.describe('Optional: assign to an AI agent on acceptance (e.g. "soul-hub-implementer").'),
+				confirmed: z
+					.boolean()
+					.optional()
+					.describe('Omit (default false) to propose. true = run now.'),
+			}),
+			execute: async ({ path, assignee, confirmed }): Promise<ToolResult> => {
+				return executeAdrTransition({ path, action: 'accept', assignee, confirmed, deps });
+			},
+		}),
+
+		adrShip: tool({
+			description:
+				'Transition an ADR from `accepted` → `shipped`. WEB CHANNEL ONLY — ADR status changes are available in the browser chat only. ' +
+				'CONFIRMATION GATE: OMIT `confirmed` (or set false) to PROPOSE the action — the user replies "yes" to confirm. Set `confirmed=true` ONLY when the user explicitly confirmed. ' +
+				'PROVENANCE: `path` MUST be a real vault-relative ADR path.',
+			inputSchema: z.object({
+				path: z
+					.string()
+					.min(1)
+					.max(500)
+					.describe('Vault-relative path of the ADR.'),
+				confirmed: z
+					.boolean()
+					.optional()
+					.describe('Omit (default false) to propose. true = run now.'),
+			}),
+			execute: async ({ path, confirmed }): Promise<ToolResult> => {
+				return executeAdrTransition({ path, action: 'ship', confirmed, deps });
+			},
+		}),
+
+		adrPark: tool({
+			description:
+				'Transition an ADR from `proposed` → `parked`. WEB CHANNEL ONLY — ADR status changes are available in the browser chat only. ' +
+				'CONFIRMATION GATE: OMIT `confirmed` (or set false) to PROPOSE the action — the user replies "yes" to confirm. Set `confirmed=true` ONLY when the user explicitly confirmed.',
+			inputSchema: z.object({
+				path: z
+					.string()
+					.min(1)
+					.max(500)
+					.describe('Vault-relative path of the ADR.'),
+				reason: z
+					.string()
+					.max(300)
+					.optional()
+					.describe('Optional reason for parking.'),
+				reviewAfter: z
+					.string()
+					.regex(/^\d{4}-\d{2}-\d{2}$/)
+					.optional()
+					.describe('Optional ISO date (YYYY-MM-DD) to review after.'),
+				confirmed: z
+					.boolean()
+					.optional()
+					.describe('Omit (default false) to propose. true = run now.'),
+			}),
+			execute: async ({ path, reason, reviewAfter, confirmed }): Promise<ToolResult> => {
+				return executeAdrTransition({ path, action: 'park', reason, reviewAfter, confirmed, deps });
+			},
+		}),
+
+		adrReject: tool({
+			description:
+				'Transition an ADR from `proposed` → `rejected`. WEB CHANNEL ONLY — ADR status changes are available in the browser chat only. ' +
+				'CONFIRMATION GATE: OMIT `confirmed` (or set false) to PROPOSE the action — the user replies "yes" to confirm. Set `confirmed=true` ONLY when the user explicitly confirmed. ' +
+				'`reason` is REQUIRED for rejection.',
+			inputSchema: z.object({
+				path: z
+					.string()
+					.min(1)
+					.max(500)
+					.describe('Vault-relative path of the ADR.'),
+				reason: z
+					.string()
+					.min(5)
+					.max(500)
+					.describe('Required reason for rejection.'),
+				confirmed: z
+					.boolean()
+					.optional()
+					.describe('Omit (default false) to propose. true = run now.'),
+			}),
+			execute: async ({ path, reason, confirmed }): Promise<ToolResult> => {
+				return executeAdrTransition({ path, action: 'reject', reason, confirmed, deps });
 			},
 		}),
 
@@ -1021,11 +1670,14 @@ function buildOrchestratorToolsImpl(deps: ToolDeps) {
 
 		proposeAdr: tool({
 			description:
-				'Draft a NEW ADR (architecture decision record) note in a project, with status `proposed`. Picks the next-available `adr-NNN-<slug>` ordinal and writes via the ADR-046 chokepoint with `actor: proposeAdr` (audit log shows this distinct from `projectShipSlice` closures). ' +
+				// ADR-010 S10 — description aligned with `soul adr propose` engine path.
+				// Calls applyProposeAdr() (same in-process engine path as `soul adr propose`);
+				// produces exactly one H1 (# ADR-NNN — Title) with no bespoke wrapper heading.
+				'Draft a NEW ADR (architecture decision record) note in a project, with status `proposed`. Uses the same `applyProposeAdr` engine path as `soul adr propose`. Picks the next-available `adr-NNN-<slug>` ordinal, composes the standard ADR structure (one H1 + Status / Context / Decision / Falsifiers / Implementation plan / Related sections), and writes via the ADR-046 chokepoint with `actor: proposeAdr`. ' +
 				'STRICT ROUTING: only fires when the user explicitly asks to "draft / propose / write a new ADR" for a specific project. NEVER fires for vague "we should write something about X" — needs a concrete project slug + working title. NEVER mutates an existing ADR (that\'s the operator\'s job via the AdrDrawer). ' +
 				'PROVENANCE — DO NOT INVENT ARGS: pull `problem_statement` and `falsifier_conditions` from the user\'s own words in the conversation, never fabricate. If the user hasn\'t articulated a problem statement or at least one falsifier, ASK before calling. ' +
 				'FALSIFIER STRING FORMAT — do NOT include the `F<N>` prefix in your `falsifier_conditions` strings. The tool automatically renders `**F1** ...`, `**F2** ...`, etc. — write only the falsifier text itself. Example bad: `"F1 — At least one X event occurs"`. Example good: `"At least one X event occurs"`. The tool will defensively strip any leading `F<N>` prefix you accidentally include, but cleaner input avoids the strip path entirely. ' +
-				'The new ADR lands as `status: proposed`; the operator confirms via the existing AdrDrawer Accept button (no new acceptance UI). The tool returns 404 if `projects/<slug>/index.md` is missing, 409 on two consecutive ordinal collisions (rare race with manual hand-creation).',
+				'The new ADR lands as `status: proposed`; the operator confirms via the existing AdrDrawer Accept button (no new acceptance UI) or `adrAccept` tool (S9). The tool returns 404 if `projects/<slug>/index.md` is missing, 409 on two consecutive ordinal collisions (rare race with manual hand-creation).',
 			inputSchema: z.object({
 				slug: z
 					.string()
@@ -1443,13 +2095,11 @@ function buildOrchestratorToolsImpl(deps: ToolDeps) {
 		}),
 
 		'inbox-list-queued': tool({
+			// ADR-013 S3 — trimmed; STRICT ROUTING preamble and msg-N guard preserved.
 			description:
-				"STRICT ROUTING: any user mention of 'my inbox', 'queued', 'new emails', 'new mail', 'what came in', 'mail today', 'any bank alerts', 'show me my receipts', or similar list-style email queries routes HERE — these are EMAIL queries against the IMAP-synced messages table. NOT vaultSearch — that's for Soul Hub vault markdown notes; the vault has an unrelated `inbox/` folder for quick note captures and the name collision MUST be ignored. The word 'inbox' without an explicit 'note'/'vault' qualifier always means EMAIL. " +
-				"List the user's queued inbox messages (post-Layer-2 filter, agent-relevant only). " +
-				"Use when the user asks 'what's in my inbox', 'any new emails', 'show me bank alerts', 'what came in today'. " +
-				"Filter by category for targeted queries: personal (human mail), transactional (bank/orders/receipts), notification (service alerts), unclassified (filter wasn't confident). " +
-				"Returns newest first. " +
-				"OUTPUT FORMAT: when rendering rows to the user, you MUST preserve the `(msg N)` annotation next to each row — those ids are how the user drills down with phrases like 'tell me about msg N' or 'what about N'. Dropping the ids breaks the follow-up loop. If you summarize or group rows by category, still include `(msg N)` on every row.",
+				"STRICT ROUTING: 'my inbox', 'queued', 'new emails', 'new mail', 'what came in', 'any bank alerts', 'show me receipts' → HERE (EMAIL, NOT vaultSearch). " +
+				"Lists queued IMAP-synced messages (post-Layer-2 filter). Filter by category: personal / transactional / notification / unclassified. Returns newest first. " +
+				"MUST preserve `(msg N)` ids in every row — user drills down with 'tell me about msg N'.",
 			inputSchema: z.object({
 				category: z
 					.enum(['personal', 'transactional', 'notification', 'unclassified'])
@@ -1820,11 +2470,12 @@ function buildOrchestratorToolsImpl(deps: ToolDeps) {
 		}),
 
 		'inbox-drill-down': tool({
+			// ADR-013 S3 — trimmed; STRICT ROUTING preamble and provenance rule preserved.
 			description:
-				"STRICT ROUTING: any user mention of 'msg <N>', 'message <N>', 'about <N>', or a bare 4-6 digit number that appears in the recent conversation context (digest / anomaly push / list-queued result) routes HERE. NOT vaultSearch — that's for vault notes, NOT inbox rows. NOT reply — drill-down composes the answer for you. " +
-				"Returns everything cheap-to-fetch about a single inbox message: envelope (from/subject/when), cached extracted_data, agent-action history, and a 200-char body preview. Typical triggers: 'what about msg 33602', 'tell me about 33425', 'more on 33877', or just the bare number '33877' as a reply to a digest. " +
-				"Does NOT fetch the full body — call `inbox-read-body` next if the user wants more after seeing the preview. " +
-				"PROVENANCE: `messageId` MUST be a real id from a prior `inbox-list-queued`, `inbox-anomaly-push`, `inbox-digest`, or a number the user explicitly typed in their reply. NEVER fabricate.",
+				"STRICT ROUTING: 'msg N', 'message N', 'about N', or bare 4-6 digit number from a digest/list-queued reply → HERE. NOT vaultSearch (vault notes ≠ inbox rows). " +
+				"Returns envelope + cached extract + agent-action history + 200-char body preview for one message. Triggers: 'what about msg 33602', bare '33877' reply to a digest. " +
+				"For full body: call `inbox-read-body` next. " +
+				"PROVENANCE: messageId MUST be real (prior inbox-list-queued / digest / user-typed). NEVER fabricate.",
 			inputSchema: z.object({
 				messageId: z.number().int().positive(),
 			}),
@@ -2409,6 +3060,391 @@ function buildOrchestratorToolsImpl(deps: ToolDeps) {
 				};
 			},
 		}),
+
+		// ── ADR-011 — Browser navigation tools ────────────────────────────────────
+
+		/**
+		 * S2 — Navigate to an internal Soul Hub page (web-channel only).
+		 *
+		 * Validates the path against the static page catalog, builds the full URL
+		 * (including optional deep-link params for S7), and returns a `navigate`
+		 * ToolResult. `buildV2Output` maps this to V2Output.navigate, which causes
+		 * `dispatchWebTurn` to emit a `navigate` SSE event the drawer handles by
+		 * calling SvelteKit's `goto(url)`.
+		 */
+		navigateTo: tool({
+			description:
+				'Navigate the browser to a Soul Hub page. ONLY works in the browser chat (web channel) — ' +
+				'on WhatsApp/Telegram this returns a graceful error. ' +
+				'Use when the user says "take me to X", "go to the scheduler", "open the vault", ' +
+				'"navigate to projects", "show me the CRM". ' +
+				'Pass `path` as a concrete route (e.g. `/scheduler`, `/projects/naseej`, `/vault`). ' +
+				'For deep-links: pass `params` with `{ note: "vault/relative/path.md" }` to pre-select ' +
+				'a vault note, or `{ adr: "adr-007" }` to open a project ADR drawer. ' +
+				'Path MUST be an internal Soul Hub route — external URLs are rejected (use `fetchPage` for those). ' +
+				'Call `listPages` first if unsure which route to use.',
+			inputSchema: z.object({
+				path: z
+					.string()
+					.min(1)
+					.max(500)
+					.describe(
+						'Internal Soul Hub path, e.g. `/scheduler`, `/projects/naseej`, `/vault`. ' +
+						'Must start with `/`. External URLs (http://, https://) are rejected.',
+					),
+				params: z
+					.record(z.string(), z.string())
+					.optional()
+					.describe(
+						'Optional deep-link query params. ' +
+						'For vault: `{ note: "projects/foo/bar.md" }` → opens that note. ' +
+						'For projects: `{ adr: "adr-007" }` → opens the ADR drawer.',
+					),
+			}),
+			execute: async ({ path, params }): Promise<ToolResult> => {
+				logToolCall('navigateTo', { path, params });
+
+				// Channel gate — navigation is web-only.
+				if (deps.channel && deps.channel !== 'web') {
+					return {
+						kind: 'navigate-error',
+						path,
+						error: 'Navigation is only available in the browser chat. On WhatsApp/Telegram, use `listPages` to see available sections and navigate manually.',
+					};
+				}
+
+				// Reject external URLs.
+				if (/^https?:\/\//i.test(path) || /^[a-z][a-z0-9+\-.]*:\/\//i.test(path)) {
+					return {
+						kind: 'navigate-error',
+						path,
+						error: 'External URLs cannot be navigated to — use `fetchPage` to read external content.',
+					};
+				}
+
+				// Ensure path starts with /
+				const normPath = path.startsWith('/') ? path : `/${path}`;
+
+				// Validate against the page catalog.
+				const entry = findCatalogEntry(normPath);
+				if (!entry) {
+					return {
+						kind: 'navigate-error',
+						path: normPath,
+						error: `Path \`${normPath}\` is not in the Soul Hub page catalog. Call \`listPages\` to see valid routes.`,
+					};
+				}
+
+				const url = buildNavigateUrl(normPath, params);
+				const confirmMessage = `Navigating to **${entry.title}** (\`${url}\`)…`;
+
+				return { kind: 'navigate', url, confirmMessage };
+			},
+		}),
+
+		/**
+		 * S5 — List all Soul Hub pages (all channels, degrades gracefully on
+		 * WhatsApp/Telegram).
+		 *
+		 * Returns the full page catalog as a human-readable list. On web this is
+		 * most useful because the operator can click to navigate; on WhatsApp /
+		 * Telegram it gives a concise text list of available sections.
+		 */
+		listPages: tool({
+			description:
+				'List all Soul Hub pages with their routes and descriptions. ' +
+				'Use for "what pages are there?", "where can I go?", "show me the app map", ' +
+				'"what sections does Soul Hub have?". ' +
+				'Available on all channels (web + WhatsApp + Telegram).',
+			inputSchema: z.object({}),
+			execute: async (): Promise<ToolResult> => {
+				logToolCall('listPages', {});
+				return { kind: 'verbatim', text: formatCatalogList() };
+			},
+		}),
+
+		/**
+		 * S4 — Describe the current page and its chat capabilities (web-channel
+		 * only).
+		 *
+		 * Reads `deps.scopeKind` + `deps.scopeParams` (forwarded from the web
+		 * turn's scope descriptor) and looks up the matching catalog entry to
+		 * produce a structured description. No new data fetch needed — the richer
+		 * entity context is already injected via the ADR-002 contextPayload system
+		 * history entry.
+		 */
+		describeCurrentPage: tool({
+			// ADR-013 S1 — STRICT-ROUTING preamble: scope to page/UI description only.
+			// Explicit redirect to projectGet for project-status questions.
+			description:
+				'STRICT ROUTING — use ONLY for questions about the BROWSER UI ITSELF: "where am I?", "what is this screen?", ' +
+				'"what can I do here?", "what features does this page have?", "describe this view". ' +
+				'Takes no arguments. ONLY works in the browser chat (web channel). ' +
+				'Do NOT use for project-status questions ("how is project X?", "what\'s open in Y?", ' +
+				'"what\'s the status of Z?") — those are about vault project data, NOT the page UI → use `projectGet`. ' +
+				'Returns the page title, description, and chat capabilities for the current scope.',
+			inputSchema: z.object({}),
+			execute: async (): Promise<ToolResult> => {
+				logToolCall('describeCurrentPage', {});
+
+				// Channel gate — page context is web-only.
+				if (deps.channel && deps.channel !== 'web') {
+					return {
+						kind: 'verbatim',
+						text: 'Page description is only available in the browser chat. On WhatsApp/Telegram, use `listPages` to see all available sections.',
+					};
+				}
+
+				// Reconstruct a representative path from scopeKind + scopeParams
+				// so we can look up the catalog entry. The path only needs to match
+				// the template — actual slug/notePath are included in params.
+				let representativePath = '/';
+				if (deps.scopeKind === 'project' && deps.scopeParams?.slug) {
+					representativePath = `/projects/${deps.scopeParams.slug}`;
+				} else if (deps.scopeKind === 'vault-note') {
+					representativePath = '/vault';
+				} else if (deps.scopeKind === 'inbox-thread') {
+					representativePath = '/inbox';
+				} else if (deps.scopeKind === 'crm-contact') {
+					representativePath = '/crm';
+				}
+
+				const entry = findCatalogEntry(representativePath);
+				if (!entry) {
+					return {
+						kind: 'verbatim',
+						text: `You are on a page not in the catalog (\`${representativePath}\`). Use \`listPages\` to see all known Soul Hub pages.`,
+					};
+				}
+
+				return {
+					kind: 'verbatim',
+					text: formatPageDescription(entry, deps.scopeParams),
+				};
+			},
+		}),
+
+		/**
+		 * ADR-013 S2 — System health check (in-process, no shell).
+		 *
+		 * Wraps the same engine paths as `soul doctor`:
+		 *   - API reachability: implicit (we're in-process; tool runs only when server is up)
+		 *   - Hook status: existsSync on the four chokepoint files
+		 *   - Vault health: getSystemHealth().getLastReport() (detect/auto-fix cycle)
+		 *   - Inbox sync age: listAccounts() from the inbox DB
+		 *   - Catalog-index freshness: getCatalogIndexFreshness()
+		 *
+		 * All-channel, read-only, no confirmation gate.
+		 */
+		systemHealth: tool({
+			description:
+				'STRICT ROUTING — use for system health / server status / "is everything ok" / "are services up" / ' +
+				'"show me the system health" questions. ' +
+				'Returns Soul Hub server reachability, vault health summary, inbox sync freshness, ' +
+				'catalog-index status, and hook installation status. All-channel, read-only. ' +
+				'Do NOT use for project listing — use `projectList` for that. ' +
+				'Do NOT use for vault note search — use `vaultSearch` for that.',
+			inputSchema: z.object({}),
+			execute: async (): Promise<ToolResult> => {
+				logToolCall('systemHealth', {});
+
+				const lines: string[] = [];
+
+				// ── Server ──────────────────────────────────────────────────
+				// If this tool executes at all, the server is reachable.
+				lines.push('**Server**');
+				lines.push('✓ API reachable (in-process)');
+
+				// ── Hooks ────────────────────────────────────────────────────
+				const home = homedir();
+				const hooks = {
+					writeGuard: existsSync(join(home, '.claude/hooks/vault-write-guard.sh')),
+					bashGuard: existsSync(join(home, '.claude/hooks/vault-write-guard-bash.sh')),
+					soulCliGuard: existsSync(join(home, '.claude/hooks/soul-cli-guard.sh')),
+					vaultWriteSkill: existsSync(join(home, '.claude/skills/vault-write/SKILL.md')),
+				};
+				const allHooksOk = Object.values(hooks).every(Boolean);
+				lines.push('');
+				lines.push('**Hooks**');
+				lines.push(`${hooks.writeGuard ? '✓' : '✗'} vault-write-guard.sh`);
+				lines.push(`${hooks.bashGuard ? '✓' : '✗'} vault-write-guard-bash.sh`);
+				lines.push(`${hooks.soulCliGuard ? '✓' : '✗'} soul-cli-guard.sh`);
+				lines.push(`${hooks.vaultWriteSkill ? '✓' : '✗'} /vault-write skill`);
+				if (!allHooksOk) {
+					lines.push('⚠ Some hooks missing — run `bash scripts/install-chokepoint.sh` to install.');
+				}
+
+				// ── Vault health ─────────────────────────────────────────────
+				lines.push('');
+				lines.push('**Vault**');
+				const sysHealth = getSystemHealth();
+				if (sysHealth) {
+					const report = sysHealth.getLastReport();
+					if (report) {
+						const humanIssues = report.issues.filter((i) => i.risk !== 'safe');
+						const totalFixed = report.autoFixed.reduce((s, r) => s + r.fixed.length, 0);
+						const ts = new Date(report.timestamp).toLocaleString('en-GB', { timeZone: 'Asia/Dubai' });
+						lines.push(`${humanIssues.length === 0 ? '✓' : '⚠'} ${report.totalNotes} notes · ${humanIssues.length} issue${humanIssues.length === 1 ? '' : 's'} needing attention · ${totalFixed} auto-fixed (last check: ${ts})`);
+						for (const i of humanIssues) {
+							lines.push(`  • ${i.title}`);
+						}
+					} else {
+						lines.push('— Health check not yet run (startup in progress)');
+					}
+				} else {
+					lines.push('— System health not initialized');
+				}
+
+				// ── Inbox sync ───────────────────────────────────────────────
+				lines.push('');
+				lines.push('**Inbox sync**');
+				const STALE_MS = 30 * 60 * 1000;
+				try {
+					const accounts = listAccounts();
+					if (accounts.length === 0) {
+						lines.push('— No inbox accounts configured');
+					} else {
+						for (const a of accounts) {
+							const ageMs = a.lastSync ? Date.now() - a.lastSync : null;
+							const stale = a.status === 'connected' && ageMs !== null && ageMs > STALE_MS;
+							const ageStr = ageMs === null
+								? 'never synced'
+								: ageMs < 60_000
+									? `${Math.floor(ageMs / 1000)}s ago`
+									: ageMs < 3_600_000
+										? `${Math.floor(ageMs / 60_000)}m ago`
+										: `${Math.floor(ageMs / 3_600_000)}h ago`;
+							lines.push(`${stale ? '⚠' : '✓'} ${a.email ?? a.id} — ${a.status} (${ageStr})`);
+						}
+					}
+				} catch {
+					lines.push('— Could not read inbox accounts');
+				}
+
+				// ── Catalog index ────────────────────────────────────────────
+				lines.push('');
+				lines.push('**Catalog index**');
+				try {
+					const freshness = await getCatalogIndexFreshness();
+					if (!freshness.exists) {
+						lines.push('✗ catalog-index.json missing — fetch GET /api/components/index to build it');
+					} else if (freshness.fresh) {
+						const ageStr =
+							freshness.ageSeconds !== null && freshness.ageSeconds >= 0
+								? `+${freshness.ageSeconds}s ahead`
+								: 'no sources';
+						lines.push(`✓ fresh (${ageStr})`);
+					} else {
+						const ageStr = freshness.ageSeconds !== null ? `${Math.abs(freshness.ageSeconds)}s behind` : 'stale';
+						lines.push(`⚠ stale (${ageStr})${freshness.newestSource ? ` — newest source: ${freshness.newestSource}` : ''}`);
+					}
+				} catch {
+					lines.push('— Could not probe catalog-index freshness');
+				}
+
+				// ── Overall ──────────────────────────────────────────────────
+				const overallOk = allHooksOk;
+				lines.push('');
+				lines.push(overallOk ? '✓ **System health: ok**' : '⚠ **System health: issues found**');
+
+				return { kind: 'verbatim', text: lines.join('\n') };
+			},
+		}),
+
+		// ─── ADR-014 S5 — meta-tools: dynamic discovery ───────────────────────
+
+		enableToolset: tool({
+			description:
+				'ADR-014 Tier 3 — request that a toolset be added to the NEXT turn of this ' +
+				'conversation when the initial assembly-time selection was too narrow. ' +
+				'Call this when you need a tool that is not in the current turn\'s set. ' +
+				'The toolset becomes available on the following message — inform the user ' +
+				'and ask them to repeat their request. ' +
+				'Use `listToolsets` first to discover available toolset names and their descriptions.',
+			inputSchema: z.object({
+				toolset: z
+					.enum([
+						'core',
+						'vault',
+						'project-adr',
+						'inbox',
+						'crm',
+						'external-fetch',
+						'navigation',
+						'actions',
+					] as const)
+					.describe('The toolset name to enable for future turns of this conversation.'),
+				reason: z
+					.string()
+					.min(1)
+					.max(200)
+					.describe('Why this toolset is needed — shown in logs for observability.'),
+			}),
+			execute: async ({ toolset, reason }): Promise<ToolResult> => {
+				logToolCall('enableToolset', { toolset, reason: reason.slice(0, 60) });
+
+				if (!deps.conversationKey) {
+					return {
+						kind: 'reply',
+						text: 'Cannot enable a toolset: no conversationKey for this session. This is a configuration issue — please report it.',
+					};
+				}
+
+				requestToolsetExpansion(deps.conversationKey, toolset as ToolsetName);
+
+				const desc = TOOLSET_DESCRIPTIONS[toolset as ToolsetName] ?? toolset;
+				return {
+					kind: 'reply',
+					text: `Toolset **${toolset}** has been enabled for this conversation (${desc}). Please repeat your request — the new tools will be available on your next message.`,
+				};
+			},
+		}),
+
+		listToolsets: tool({
+			description:
+				'ADR-014 Tier 3 — list all available toolsets with their descriptions and ' +
+				'current activation status for this turn. Use this to discover what toolsets ' +
+				'exist before calling `enableToolset`. Returns the full toolset catalog with ' +
+				'enabled/disabled status for the current turn.',
+			inputSchema: z.object({}),
+			execute: async (): Promise<ToolResult> => {
+				logToolCall('listToolsets', {});
+
+				// Compute what's enabled for THIS turn (same logic as buildOrchestratorTools).
+				const baseEnabled = selectToolsets({
+					channel: deps.channel,
+					scopeKind: deps.scopeKind,
+					userMessage: deps.userMessage,
+				});
+				const sessionExpansions = deps.conversationKey
+					? getSessionExpansions(deps.conversationKey)
+					: (new Set<ToolsetName>() as ReadonlySet<ToolsetName>);
+				const enabled = new Set<ToolsetName>([...baseEnabled, ...sessionExpansions]);
+
+				// Show each toolset's enabled/disabled status + tool count.
+				const toolsetMap = getToolsetMap();
+				const toolCountByToolset = new Map<ToolsetName, number>();
+				for (const ts of toolsetMap.values()) {
+					toolCountByToolset.set(ts, (toolCountByToolset.get(ts) ?? 0) + 1);
+				}
+
+				const lines: string[] = ['**Available toolsets** (ADR-014 dynamic discovery):'];
+				const allToolsets: ToolsetName[] = [
+					'core', 'vault', 'project-adr', 'inbox', 'crm', 'external-fetch', 'navigation', 'actions',
+				];
+				for (const ts of allToolsets) {
+					const isEnabled = enabled.has(ts);
+					const count = toolCountByToolset.get(ts) ?? 0;
+					const desc = TOOLSET_DESCRIPTIONS[ts] ?? ts;
+					const icon = isEnabled ? '✓' : '○';
+					lines.push(`${icon} **${ts}** (${count} tool${count !== 1 ? 's' : ''}) — ${desc}`);
+				}
+				lines.push('');
+				lines.push('Use `enableToolset` to add a disabled toolset to future turns of this conversation.');
+
+				return { kind: 'verbatim', text: lines.join('\n') };
+			},
+		}),
 	};
 }
 
@@ -2742,6 +3778,237 @@ async function runTiktokFetchInline(args: {
 		costUsd: r.costUsd,
 		note: r.note,
 	};
+}
+
+// ─── ADR-010 S9 — shared ADR transition helper ────────────────────────────────
+// Mirrors the logic of POST /api/vault/decisions/transition (transition/+server.ts)
+// but runs in-process via engine.updateNote so the tool stays on the same
+// fast path as all other vault-write tools (no round-trip HTTP).
+
+type AdrTransitionAction = 'accept' | 'ship' | 'park' | 'reject';
+
+const ADR_ACTION_TO_STATUS: Record<AdrTransitionAction, string> = {
+	accept: 'accepted',
+	ship: 'shipped',
+	park: 'parked',
+	reject: 'rejected',
+};
+
+const ADR_ACTION_FROM_STATUS: Record<AdrTransitionAction, string> = {
+	accept: 'proposed',
+	ship: 'accepted',
+	park: 'proposed',
+	reject: 'proposed',
+};
+
+const ADR_TRANSITIONABLE_TYPES = new Set([
+	'decision', 'task', 'risk', 'metric', 'post', 'design', 'requirements',
+]);
+
+async function executeAdrTransition(args: {
+	path: string;
+	action: AdrTransitionAction;
+	assignee?: string;
+	reason?: string;
+	reviewAfter?: string;
+	confirmed?: boolean;
+	deps: ToolDeps;
+}): Promise<ToolResult> {
+	const { path, action, assignee, reason, reviewAfter, confirmed, deps } = args;
+
+	// Web-only gate
+	if (deps.channel !== 'web') {
+		return {
+			kind: 'reply',
+			text: 'ADR status transitions are available in the browser chat only. Open the web interface to use adrAccept / adrShip / adrPark / adrReject.',
+		};
+	}
+
+	// Path safety check
+	if (!path || path.includes('..') || path.startsWith('/') || !path.endsWith('.md')) {
+		return {
+			kind: 'reply',
+			text: `ERROR: Invalid path "${path}". Must be a vault-relative path ending in .md with no directory traversal.`,
+		};
+	}
+
+	// Confirmation gate
+	const isConfirmed = confirmed === true;
+	if (!isConfirmed && deps.conversationKey) {
+		const label = `${action} ADR: ${path.split('/').pop() ?? path}`;
+		const proposal = setPending({
+			conversationKey: deps.conversationKey,
+			agentId: `adr-${action}`,
+			task: path,
+			label,
+			origin: 'natural',
+			modelBranch: deps.modelBranch,
+		});
+		return {
+			kind: 'proposal',
+			text: formatProposal(proposal),
+			agentId: `adr-${action}`,
+			task: path,
+			label,
+		};
+	}
+
+	const engine = getVaultEngine();
+	if (!engine) {
+		return { kind: 'reply', text: 'ERROR: Vault engine not initialized.' };
+	}
+
+	const existing = engine.getNote(path);
+	if (!existing) {
+		return { kind: 'reply', text: `ERROR: Note not found: ${path}` };
+	}
+	if (!ADR_TRANSITIONABLE_TYPES.has(String(existing.meta.type ?? ''))) {
+		return {
+			kind: 'reply',
+			text: `ERROR: Type '${existing.meta.type}' has no lifecycle. Allowed types: ${[...ADR_TRANSITIONABLE_TYPES].join(', ')}.`,
+		};
+	}
+
+	const currentStatus = String(existing.meta.status ?? '').toLowerCase();
+	const requiredFrom = ADR_ACTION_FROM_STATUS[action];
+	if (currentStatus !== requiredFrom) {
+		return {
+			kind: 'reply',
+			text: `ERROR: ${action} requires status '${requiredFrom}' but current status is '${currentStatus || 'none'}'. Use the correct transition for this status.`,
+		};
+	}
+
+	// Validate reason for reject
+	if (action === 'reject' && (!reason || !reason.trim())) {
+		return { kind: 'reply', text: 'ERROR: reason is required for reject action.' };
+	}
+
+	// Build metaPatch
+	const today = new Date().toISOString().slice(0, 10);
+	const newStatus = ADR_ACTION_TO_STATUS[action];
+	const metaPatch: Record<string, unknown> = { status: newStatus };
+
+	if (action === 'accept') {
+		metaPatch.accepted_on = today;
+		if (typeof assignee === 'string' && assignee.trim()) {
+			const agentId = assignee.trim().toLowerCase();
+			if (!getAgent(agentId)) {
+				return { kind: 'reply', text: `ERROR: Unknown agent: '${agentId}'. Check /orchestration/agents for valid IDs.` };
+			}
+			metaPatch.assignee = agentId;
+		}
+	} else if (action === 'ship') {
+		metaPatch.shipped_on = today;
+	} else if (action === 'reject') {
+		metaPatch.rejected_on = today;
+		metaPatch.rejection_reason = (reason as string).trim();
+	} else if (action === 'park') {
+		metaPatch.parked_on = today;
+		if (typeof reviewAfter === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(reviewAfter)) {
+			metaPatch.review_after = reviewAfter;
+		}
+		if (typeof reason === 'string' && reason.trim()) {
+			metaPatch.park_reason = reason.trim();
+		}
+	}
+
+	const result = await engine.updateNote(
+		path,
+		{ meta: metaPatch },
+		{ actor: `adr-${action}`, actorContext: 'orchestrator tool' },
+	);
+
+	if (!result.success) {
+		return { kind: 'reply', text: `ERROR: Failed to update ADR status: ${result.error}` };
+	}
+
+	const filename = path.split('/').pop() ?? path;
+	const assigneeNote = action === 'accept' && metaPatch.assignee
+		? ` Assigned to: ${metaPatch.assignee}.`
+		: '';
+	const reasonNote = (action === 'reject' || action === 'park') && metaPatch.rejection_reason || metaPatch.park_reason
+		? ` Reason: ${metaPatch.rejection_reason ?? metaPatch.park_reason}`
+		: '';
+	return {
+		kind: 'reply',
+		text: `ADR ${action}ed: ${filename} is now \`${newStatus}\`.${assigneeNote}${reasonNote}`,
+	};
+}
+
+/**
+ * ADR-012 S2 — Build the project context preamble injected into the architect
+ * agent's task when dispatched from a project-scoped page.
+ *
+ * Returns a markdown block containing:
+ * - Project slug and description
+ * - Existing ADR count and list (path, title, status)
+ * - Next available ADR ordinal (max NNN + 1)
+ *
+ * The architect uses this to target the correct project and avoid ordinal
+ * conflicts without needing to query the vault separately.
+ *
+ * Returns null when the vault engine is unavailable or the project has no
+ * index — the dispatch proceeds without injection (architect will ask for
+ * context in its startup sequence).
+ */
+function buildArchitectProjectContext(
+	engine: ReturnType<typeof getVaultEngine>,
+	slug: string,
+): string | null {
+	if (!engine) return null;
+	const indexPath = `projects/${slug}/index.md`;
+	const projectIndex = engine.getNote(indexPath);
+	if (!projectIndex) return null;
+
+	// Collect all ADRs (decisions) for this project.
+	const allNotes = engine.getAllNotes();
+	const adrs = allNotes
+		.filter(
+			(n) =>
+				n.path.startsWith(`projects/${slug}/`) &&
+				n.meta.type === 'decision' &&
+				// Exclude proposals sub-folder (those aren't canonical ADRs)
+				!n.path.includes('/proposals/'),
+		)
+		.sort((a, b) => a.path.localeCompare(b.path));
+
+	// Parse ordinals (adr-NNN pattern) to find the highest so far.
+	let maxOrdinal = 0;
+	for (const n of adrs) {
+		const fname = n.path.split('/').pop() ?? '';
+		const m = fname.match(/^adr-(\d+)-/);
+		if (m) {
+			const num = parseInt(m[1], 10);
+			if (num > maxOrdinal) maxOrdinal = num;
+		}
+	}
+	const nextOrdinal = String(maxOrdinal + 1).padStart(3, '0');
+	const nextSlug = `adr-${nextOrdinal}`;
+
+	const desc =
+		typeof projectIndex.meta.description === 'string' ? projectIndex.meta.description : '';
+	const lines: string[] = [
+		`## Project context (injected by Soul Hub)`,
+		`- **Project slug**: ${slug}`,
+	];
+	if (desc) lines.push(`- **Description**: ${desc}`);
+	lines.push(`- **Existing ADRs**: ${adrs.length}`);
+	lines.push(`- **Next ordinal**: ${nextSlug}`);
+	if (adrs.length > 0) {
+		lines.push(`- **ADR list**:`);
+		for (const n of adrs) {
+			const fname = n.path.split('/').pop() ?? n.path;
+			const status = typeof n.meta.status === 'string' ? n.meta.status : 'unknown';
+			const title =
+				typeof n.title === 'string' && n.title ? n.title : fname.replace(/\.md$/, '');
+			lines.push(`  - \`${fname}\` [${status}] — ${title}`);
+		}
+	}
+	lines.push(
+		``,
+		`Use \`${nextSlug}-<short-slug>\` as the filename and \`soul adr propose --project ${slug}\` to write the ADR.`,
+	);
+	return lines.join('\n');
 }
 
 /** Build the `invokeSkill` tool description dynamically from the registry.

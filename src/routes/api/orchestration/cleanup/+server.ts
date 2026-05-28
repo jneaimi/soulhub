@@ -55,6 +55,9 @@ export const POST: RequestHandler = async ({ url }) => {
 
 		return json({
 			cleaned: result.cleaned,
+			// ADR-038 — escalated: branches that are inactive but NOT merged into
+			// main (abandoned/errored runs awaiting review). Never auto-deleted.
+			escalated: result.escalated,
 			errors: result.errors,
 			locksRemoved,
 			total: orphans.length,

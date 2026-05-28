@@ -25,6 +25,11 @@ export interface PromptContext {
 	 *  the time anchor and routing rules). When undefined or empty, the
 	 *  prompt falls back to the pre-ADR-033 personality stub. */
 	personaBundle?: PersonaBundle;
+	/** ADR-011 — chat channel for this turn. When `'web'`, a
+	 *  "Browser capabilities" section is appended describing the
+	 *  `navigateTo`, `describeCurrentPage`, and `listPages` tools.
+	 *  Omitted on WhatsApp / Telegram (navigation is browser-only). */
+	channel?: 'whatsapp' | 'telegram' | 'web';
 }
 
 export function buildOrchestratorSystemPrompt(ctx: PromptContext): string {
@@ -60,7 +65,17 @@ export function buildOrchestratorSystemPrompt(ctx: PromptContext): string {
 		? composePersonaHeader(ctx.personaBundle)
 		: '';
 
-	return `${personaHeader}You are Soul Hub, a personal AI orchestrator running on WhatsApp. You answer the user's messages by picking the right tool(s).
+	// ADR-013 S4 — channel-aware header: model knows its surface (browser vs
+	// messaging), so it uses navigation tools on web and frames replies for
+	// the right channel instead of always behaving like a WhatsApp bot.
+	const channelLabel =
+		ctx.channel === 'web'
+			? 'in the Soul Hub browser app'
+			: ctx.channel === 'telegram'
+				? 'on Telegram'
+				: 'on WhatsApp'; // default / undefined → WhatsApp (historical safe fallback)
+
+	return `${personaHeader}You are Soul Hub, a personal AI orchestrator running ${channelLabel}. You answer the user's messages by picking the right tool(s).
 
 ## Current time anchor
 - User's local time: **${localNow}** (timezone: ${tz})
@@ -100,6 +115,7 @@ export function buildOrchestratorSystemPrompt(ctx: PromptContext): string {
 4. Single text-to-image (no overlay text, no video, no Arabic text) → \`generateImage\`.
 5. Heavy specialist work (research dive, drafted content, code review, audit, multi-step media generation, image with text overlay, video, voiceover, carousel) → \`dispatchAgent\`.
 6. Fast scoped utility (research a topic on social, generate a single media asset, render a diagram, save/search the vault, recipe lookup) → \`invokeSkill\`.
+7. **Architecture / ADR authorship** ("draft an ADR for X", "design the architecture for Y", "propose a decision about Z", "I need an ADR for W") → \`dispatchAgent\` with \`agentId="architect"\`. The architect agent does multi-step vault recon, trade-off analysis, and writes a fully-structured ADR via the soul CLI. Always propose (confirmed=false) first; set confirmed=true only on explicit user confirmation. Ask for the project slug if not clear from context.
 
 ## Propose-vs-dispatch rule (sacred)
 - For \`dispatchAgent\`: set \`confirmed: false\` (the default) for ANY topic-shaped or implicit request. The user will see a one-line proposal and reply "yes" to run it.
@@ -128,11 +144,31 @@ When \`vaultSearch\`, \`webSearch\`, \`inbox-list-queued\`, or any other retriev
 
 If the tool's text is already a coherent user-facing reply (most retrieval tools return pre-formatted prose with the items + URLs), the cleanest move is to RELAY it with a one-line lead-in tying it to the user's question. Do not re-summarize it into a shorter version that loses items or links.
 
+## Intent-aware synthesis (ADR-016)
+The relay rule above applies to **retrieval / lookup / list** intent ("show me", "list", "what do we have on"). For **reasoning / recommendation / comparison / decision** intent, your job is different — synthesise over the tool outputs rather than relay them verbatim:
+
+- **Reasoning / recommendation** ("which project should we work on next?", "what's the most urgent ADR?", "what should we prioritise?") → pick one answer with a rationale. Do NOT dump the raw tool list; give a recommendation + why.
+- **Comparison** ("compare X and Y", "what's the difference between…") → state the key distinctions directly, using the tool data as evidence.
+- **Decision** ("should we do X or Y?", "is this ADR ready to ship?") → give a verdict + reasoning, not a list of pros/cons without a conclusion.
+
+The tool text is context for your reasoning, not your reply. Synthesising IS the value-add here; relaying raw tool output for a reasoning question is a failure mode.
+
 ## Available agents (closed enum — only these are valid \`agentId\` values)
 ${agentList}
 
 ## Available skills (closed enum — only these are valid \`skillName\` values)
 ${skillList}
+${ctx.channel === 'web' ? `
+## Browser capabilities (web channel only)
+You are running inside the Soul Hub browser UI. You have THREE additional tools exclusive to this channel:
+
+- \`navigateTo\` — navigate the browser to any Soul Hub page. Pass \`path\` (e.g. \`/scheduler\`, \`/projects/naseej\`) and optional \`params\` for deep-links (\`{ note: "vault/path.md" }\` → vault viewer; \`{ adr: "adr-007" }\` → project ADR drawer). Use when the user says "take me to X", "go to the scheduler", "open the vault", "show me my CRM", etc. The drawer navigates without a page reload. Web-only — do NOT call from WhatsApp/Telegram.
+
+- \`describeCurrentPage\` — describe the page the operator is currently viewing and list what chat can do there. Takes no arguments. Use for "where am I?", "what can I do here?", "what features does this page have?".
+
+- \`listPages\` — list all Soul Hub pages with their routes and descriptions. Available on all channels but most useful in the browser where the operator can click to navigate. Use for "what pages are there?", "where can I go?", "show me the app map".
+
+Navigation routing rule: whenever the user's intent is clearly to change pages ("take me to", "navigate to", "open", "go to", "show me" + a Soul Hub section name), call \`navigateTo\` rather than \`reply\`. The drawer handles navigation automatically.` : ''}
 
 ## Output
 - After your tool calls (if any), produce a final assistant message with the natural-language reply for the user.

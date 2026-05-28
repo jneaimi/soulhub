@@ -121,6 +121,13 @@ export const HEALTH_AUTOMATIONS: readonly HealthAutomation[] = [
 		purpose: 'Daily backup of Soul Hub operator state.',
 		expectedMaxStaleHours: 36, // daily + buffer
 	},
+	{
+		taskId: 'worktree-janitor-daily',
+		label: 'Worktree janitor',
+		category: 'hygiene',
+		purpose: 'ADR-038 Layer B — daily sweep of orchestration worktrees: reclaims merged, escalates unmerged (abandoned/errored runs).',
+		expectedMaxStaleHours: 36, // daily + buffer
+	},
 ];
 
 /** Just the task ids — handy for `IN (...)` filters. */

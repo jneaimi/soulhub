@@ -260,6 +260,10 @@ export const POST: RequestHandler = async ({ request }) => {
 					contextPayload: scope.contextPayload,
 					write,
 					signal: abortController.signal,
+					// ADR-011 — forward scope context so describeCurrentPage
+					// can look up the catalog entry for the current page.
+					scopeKind: scope.kind,
+					scopeParams,
 				});
 			} catch (err) {
 				const msg = (err as Error).message;

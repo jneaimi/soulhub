@@ -3,14 +3,16 @@ import { json } from '@sveltejs/kit';
 import { installSeedRoster, listSeedIds } from '$lib/agents/seed-roster.js';
 import { bumpStoreVersion } from '$lib/agents/store.js';
 
-/** POST /api/agents/seed — install the 10-agent starter roster.
+/** POST /api/agents/seed — install (or refresh) the built-in agent roster.
  *
- *  Idempotent: skips any seed whose Lane A `.md` file already exists. Safe
- *  to call repeatedly; safe on machines that already have files of these
- *  names — no clobbering. */
-export const POST: RequestHandler = async () => {
+ *  Idempotent: skips any seed whose Lane A `.md` file already exists, unless
+ *  `?overwrite=true` is passed. With `overwrite=true`, only files whose
+ *  frontmatter carries `provenance: builtin` (i.e. previously installed by
+ *  Soul Hub) are refreshed — user-customised files are never clobbered. */
+export const POST: RequestHandler = async ({ url }) => {
+	const overwrite = url.searchParams.get('overwrite') === 'true';
 	try {
-		const result = installSeedRoster();
+		const result = installSeedRoster({ overwrite });
 		bumpStoreVersion();
 		return json(result);
 	} catch (err) {

@@ -10,8 +10,11 @@
  */
 
 import * as nodePty from 'node-pty';
+import { Terminal as HeadlessTerminal } from '@xterm/headless';
+import { SerializeAddon } from '@xterm/addon-serialize';
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { config } from '$lib/config.js';
 import { saveMeta, loadMeta, appendLog, getLogSize, type SessionMeta } from './store.js';
@@ -44,6 +47,10 @@ export interface PtySessionOptions {
 	 *  the canonical fix is to keep typed input short and let `--agent` do
 	 *  its job. See `2026-05-06-pty-paste-stall-and-agent-flag` learning. */
 	agentId?: string;
+	/** UI surface that spawned this session (e.g. 'chat-drawer'). Recorded on
+	 *  SessionMeta. For a fresh drawer spawn (no resume/continue) we also mint a
+	 *  `--session-id` so the conversation is resumable later via the picker. */
+	origin?: string;
 }
 
 export interface PtySession {
@@ -55,6 +62,19 @@ export interface PtySession {
 	promptSent: boolean;
 	prompt: string;
 	cwd: string;
+	/** UI surface that spawned this session (e.g. 'chat-drawer'). Used to enforce
+	 *  one live session per (origin, cwd) — the tmux-style singleton. */
+	origin?: string;
+	/**
+	 * Server-side headless xterm mirror. Every PTY output byte is also fed here,
+	 * so it always holds the session's *current* parsed screen. On reconnect we
+	 * `serialize()` it into a VT snapshot string and paint that into the fresh
+	 * client terminal — geometry-matched and complete — instead of replaying the
+	 * raw (tail-truncated, wrong-geometry) log. Optional: a headless-init failure
+	 * never blocks the real session.
+	 */
+	headless?: HeadlessTerminal;
+	serializer?: SerializeAddon;
 }
 
 /**
@@ -106,12 +126,27 @@ function resolveClaudeBinary(configured: string): string | null {
 
 export function spawnSession(opts: PtySessionOptions): PtySession {
 	const sessionId = crypto.randomUUID().slice(0, 8);
-	const rawCwd = opts.cwd || process.env.HOME || '/';
-	const cwd = existsSync(rawCwd) ? rawCwd : (process.env.HOME || '/');
+	const home = process.env.HOME || homedir();
+	const rawCwd = opts.cwd || home || '/';
+	// Expand a leading ~ before existsSync. Callers (e.g. the chat scope resolver)
+	// may pass '~/dev/soul-hub'; on the literal tilde existsSync fails and we'd
+	// silently fall back to HOME — recording the wrong cwd and breaking the
+	// session picker's exact-cwd match (and refresh restore).
+	const expandedCwd = rawCwd === '~' ? home
+		: rawCwd.startsWith('~/') ? resolve(home, rawCwd.slice(2))
+		: rawCwd;
+	const cwd = existsSync(expandedCwd) ? expandedCwd : home;
 	const cols = opts.cols || config.terminal.cols;
 	const rows = opts.rows || config.terminal.rows;
 	const configuredClaude = config.resolved.claudeBinary;
 	const isShell = opts.shell === true;
+	// Mint a Claude session id for fresh (non-resume/continue) sessions that
+	// declare an origin (the chat drawer), so the conversation is resumable later
+	// via the picker. Resuming/continuing must NOT also set --session-id.
+	const claudeSessionUuid = opts.claudeSessionId
+		?? (opts.origin && !opts.resumeSessionId && !opts.continueSession && !isShell
+			? crypto.randomUUID()
+			: undefined);
 	// Resolve lazily for Claude sessions (auto-heals a stale configured path).
 	const claudeBinary = isShell ? configuredClaude : (resolveClaudeBinary(configuredClaude) ?? configuredClaude);
 
@@ -146,8 +181,8 @@ export function spawnSession(opts: PtySessionOptions): PtySession {
 		if (opts.agentId) {
 			args.push('--agent', opts.agentId);
 		}
-		if (opts.claudeSessionId) {
-			args.push('--session-id', opts.claudeSessionId);
+		if (claudeSessionUuid) {
+			args.push('--session-id', claudeSessionUuid);
 		}
 		if (opts.extraArgs) {
 			args.push(...opts.extraArgs);
@@ -178,6 +213,22 @@ export function spawnSession(opts: PtySessionOptions): PtySession {
 		env.CLAUDE_CODE_DISABLE_HOOKS = '1';
 	}
 
+	// Singleton-per-workspace (tmux-style): a chat-drawer spawn replaces any other
+	// live drawer session for the same cwd, so there is exactly one attachable
+	// session per workspace that every browser/device attaches to. Auto-reattach
+	// means we normally attach to the live one instead of reaching here; this
+	// covers explicit "New" and spawn races from two clients at once.
+	if (opts.origin) {
+		for (const [sid, s] of sessions) {
+			if (s.origin === opts.origin && s.cwd === cwd) {
+				try { s.pty.kill(); } catch { /* already dead */ }
+				try { s.headless?.dispose(); } catch { /* best effort */ }
+				sessions.delete(sid);
+				console.log(`[pty:${sid}] replaced by new ${opts.origin} session for ${cwd}`);
+			}
+		}
+	}
+
 	const pty = nodePty.spawn(spawnBinary, args, {
 		name: 'xterm-256color',
 		cols,
@@ -198,7 +249,21 @@ export function spawnSession(opts: PtySessionOptions): PtySession {
 		promptSent: false,
 		prompt: opts.prompt || '',
 		cwd,
+		origin: opts.origin,
 	};
+
+	// Headless mirror for reconnect snapshots (see PtySession.headless). Wrapped
+	// so a headless/serialize init failure degrades to the SIGWINCH-repaint
+	// fallback rather than killing the real terminal.
+	try {
+		const headless = new HeadlessTerminal({ cols, rows, scrollback: 1000, allowProposedApi: true });
+		const serializer = new SerializeAddon();
+		headless.loadAddon(serializer);
+		session.headless = headless;
+		session.serializer = serializer;
+	} catch (err) {
+		console.warn(`[pty:${sessionId}] headless mirror init failed (reconnect snapshots disabled):`, err);
+	}
 
 	// Persist session metadata to disk
 	const meta: SessionMeta = {
@@ -209,7 +274,8 @@ export function spawnSession(opts: PtySessionOptions): PtySession {
 		status: 'running',
 		startedAt: new Date().toISOString(),
 		logSize: 0,
-		claudeSessionId: opts.claudeSessionId,
+		claudeSessionId: claudeSessionUuid ?? opts.resumeSessionId,
+		origin: opts.origin,
 	};
 	saveMeta(meta);
 
@@ -223,11 +289,19 @@ export function spawnSession(opts: PtySessionOptions): PtySession {
 	pty.onData((data: string) => {
 		emitter.emit('output', data);
 
+		// Mirror into the headless terminal so reconnects can serialize the
+		// current screen instead of replaying the raw log.
+		try { session.headless?.write(data); } catch { /* best effort */ }
+
 		// Write to session log file
 		try { appendLog(sessionId, data); } catch { /* best effort */ }
 
-		// Auto-prompt injection: detect when Claude is ready for input
-		if (opts.prompt && !session.promptSent) {
+		// Auto-prompt injection: detect when Claude is ready for input.
+		// ONLY for genuinely new sessions — a resume (--resume) or continue
+		// (--continue) restores an existing conversation, so injecting the scope
+		// primer again would paste it as a fresh user message. Restore must just
+		// reattach, not re-prompt.
+		if (opts.prompt && !session.promptSent && !opts.resumeSessionId && !opts.continueSession) {
 			outputBuffer += data;
 
 			// Handle workspace trust prompt before prompt injection
@@ -278,6 +352,7 @@ export function spawnSession(opts: PtySessionOptions): PtySession {
 
 	pty.onExit(({ exitCode }) => {
 		emitter.emit('exit', exitCode);
+		try { session.headless?.dispose(); } catch { /* best effort */ }
 		sessions.delete(sessionId);
 
 		// Update metadata on disk
@@ -321,7 +396,31 @@ export function resizeSession(sessionId: string, cols: number, rows: number): bo
 	try {
 		session.pty.resize(cols, rows);
 	} catch { /* process already exited — EBADF */ }
+	try { session.headless?.resize(cols, rows); } catch { /* best effort */ }
 	return true;
+}
+
+/**
+ * Serialize a session's current screen into a VT snapshot string for reconnect.
+ * Returns null when the session (or its headless mirror) is unavailable — the
+ * caller then falls back to a SIGWINCH-driven repaint.
+ */
+export function serializeSession(sessionId: string): string | null {
+	const session = sessions.get(sessionId);
+	if (!session?.serializer || !session.headless) return null;
+	try {
+		const body = session.serializer.serialize();
+		// Prepend the alternate-screen enter ONLY when the live process is
+		// actually on the alt buffer (Claude's TUI). serialize() captures the
+		// active buffer's content but not the mode switch; guessing wrong
+		// (forcing alt-screen when the process is on the normal buffer) is what
+		// made reconnect *intermittently* garble. Reading the real buffer type
+		// makes the snapshot self-describing and removes the guess.
+		const isAlt = session.headless.buffer.active.type === 'alternate';
+		return isAlt ? `\x1b[?1049h\x1b[H${body}` : body;
+	} catch {
+		return null;
+	}
 }
 
 /** Kill a session and clean up */
@@ -331,6 +430,7 @@ export function killSession(sessionId: string): boolean {
 	try {
 		session.pty.kill();
 	} catch { /* already dead */ }
+	try { session.headless?.dispose(); } catch { /* best effort */ }
 	sessions.delete(sessionId);
 
 	// Update metadata

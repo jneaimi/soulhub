@@ -17,6 +17,22 @@ import { catalogIndex } from './verbs/catalog.ts';
 import { doctor } from './verbs/doctor.ts';
 import { logs } from './verbs/logs.ts';
 
+// ADR-013 D4 — single-source the write-verb usage lines that carry the
+// content-input forms. These drifted once already: ADR-006 added
+// `--content-file`/`--content -` to the HELP block but not to the per-verb
+// USAGE map, so `soul note update --help` kept advertising only `--content STR`.
+// Defining each line once and referencing it from BOTH the HELP block and the
+// USAGE map makes that class of drift structurally impossible.
+// ADR-013 D5 — the `note update` line also documents the write semantics a
+// caller must know: `--meta-json` shallow-merges into existing frontmatter,
+// while `--content`/`--content-file` replace the body wholesale.
+const USAGE_NOTE_CREATE =
+  'soul note create   --zone Z --filename F --type T [--meta-json JSON] (--content STR | --content-file PATH | --content -)';
+const USAGE_NOTE_UPDATE =
+  'soul note update   PATH [--meta-json JSON] [--content STR | --content-file PATH | --content -]   (--meta-json merges into existing frontmatter; --content/-file replaces the body)';
+const USAGE_ADR_PROPOSE =
+  'soul adr propose   --project P --slug S --title T (--content STR | --content-file PATH | --content -) [--meta-json JSON]';
+
 const HELP = `soul — Soul Hub CLI (ADR-001 + ADR-002 + ADR-003 Phase 3a)
 
 READ VERBS
@@ -53,8 +69,8 @@ READ VERBS
   soul logs [SERVICE] [--errors] [--tail N] [--grep PATTERN]   (local PM2 log tail; works when :2400 is down)
 
 WRITE VERBS (each supports --dry-run)
-  soul note create   --zone Z --filename F --type T [--meta-json JSON] (--content STR | --content-file PATH | --content -)
-  soul note update   PATH [--meta-json JSON] [--content STR | --content-file PATH | --content -]
+  ${USAGE_NOTE_CREATE}
+  ${USAGE_NOTE_UPDATE}
   soul note move     SRC-PATH DST-ZONE [--rename NEW-FILENAME] [--dry-run]   (link-safe: rewrites inbound wikilinks)
   soul note rename   SRC-PATH NEW-FILENAME [--dry-run]
   soul note move-batch (--moves-json '[{src,targetZone?,newFilename?}]' | --moves-file PATH) [--dry-run]
@@ -64,7 +80,7 @@ WRITE VERBS (each supports --dry-run)
   soul project propose-adr SLUG --input-json '{...}' (or --title T --tier "Tier 2" --problem STR)
   soul project ship-slice SLUG --adr X --slice S<N> --status STATUS [--commit SHA]
   soul vault reindex
-  soul adr propose   --project P --slug S --title T (--content STR | --content-file PATH | --content -) [--meta-json JSON]
+  ${USAGE_ADR_PROPOSE}
   soul adr accept    PATH
   soul adr ship      PATH
   soul adr park      PATH --review-after YYYY-MM-DD
@@ -126,7 +142,7 @@ const USAGE: Record<string, string> = {
   'project propose-adr': `soul project propose-adr SLUG --input-json '{...}' (or --title T --tier "Tier 2" --problem STR)`,
   'project ship-slice': 'soul project ship-slice SLUG --adr X --slice S<N> --status STATUS [--commit SHA]',
   'adr list': 'soul adr list   --project SLUG [--status STATUS]',
-  'adr propose': 'soul adr propose   --project P --slug S --title T --content STR [--meta-json JSON]',
+  'adr propose': USAGE_ADR_PROPOSE,
   'adr accept': 'soul adr accept    PATH',
   'adr ship': 'soul adr ship      PATH',
   'adr park': 'soul adr park      PATH --review-after YYYY-MM-DD',
@@ -157,8 +173,8 @@ const USAGE: Record<string, string> = {
   'inbox status': 'soul inbox status                   (sync-health summary; exits 1 if any account stale)',
   'inbox digest-telegram': `soul inbox digest-telegram [--since EPOCH_MS] [--inputs-json '{...}']`,
   'intent metrics': 'soul intent metrics',
-  'note create': 'soul note create   --zone Z --filename F --type T [--meta-json JSON] --content STR',
-  'note update': 'soul note update   PATH [--meta-json JSON] [--content STR]',
+  'note create': USAGE_NOTE_CREATE,
+  'note update': USAGE_NOTE_UPDATE,
   'note move': 'soul note move     SRC-PATH DST-ZONE [--rename NEW-FILENAME] [--dry-run]',
   'note rename': 'soul note rename   SRC-PATH NEW-FILENAME [--dry-run]',
   'note move-batch': `soul note move-batch (--moves-json '[{src,targetZone?,newFilename?}]' | --moves-file PATH) [--dry-run]`,

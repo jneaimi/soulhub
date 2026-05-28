@@ -62,6 +62,9 @@ import {
 	getEdgeSnapshot,
 	upsertEdgeSnapshot,
 	type EdgeSnapshotRow,
+	getPrepSnapshot,
+	upsertPrepSnapshot,
+	type PrepSnapshotRow,
 } from '../../channels/whatsapp/heartbeat-state.js';
 import {
 	extractUnblockCandidates,
@@ -77,6 +80,13 @@ import {
 	type EdgeStaleCandidate,
 	type ProducerIndex,
 } from './vault-scout-edge.js';
+import {
+	extractProactivePrepDispatches,
+	type PrepSnapshot,
+	type PrepSnapshotStore,
+	type PrepResolver,
+} from './proactive-prep.js';
+import { dispatchAgent } from '../../agents/dispatch/index.js';
 import type { TaskFn } from '../task-types.js';
 
 const SYNTH_MODEL = 'gemini-2.5-flash';
@@ -395,6 +405,12 @@ interface RunResult {
 	edgeStaleCandidates?: number;
 	edgesExamined?: number;
 	edgesFirstObserved?: number;
+	/** projects-graph ADR-019 — proactive prep action layer measurement.
+	 *  prepDispatched counts DispatchIntents emitted this run. */
+	prepWatchMs?: number;
+	prepDispatched?: number;
+	prepFirstObservations?: number;
+	prepDeduped?: number;
 }
 
 function validateDecision(d: SynthDecision, today: string): { ok: boolean; reason?: string } {
@@ -596,6 +612,57 @@ export function vaultScoutFactory(rawParams: unknown): TaskFn {
 			},
 		}));
 
+		// projects-graph ADR-019 — proactive prep action layer. Post-step on
+		// the raw unblock candidates just extracted by vault-scout-unblock.
+		// Emits DispatchIntents for human-owned tasks in opted-in projects
+		// that have no prep note yet; fires them detached (fire-and-forget).
+		// First-observation is quiet per ADR-019 guardrail 3 — no dispatch
+		// on the first encounter of any task.
+		const prepStartMs = Date.now();
+		const prepStore: PrepSnapshotStore = {
+			get: (taskPath) => {
+				const row = getPrepSnapshot(taskPath);
+				return row ? (row as PrepSnapshot) : null;
+			},
+			upsert: (row) => upsertPrepSnapshot(row as PrepSnapshotRow),
+		};
+		const prepResolver: PrepResolver = {
+			isProjectOptedIn: (projectFolder) => {
+				const indexPath = `projects/${projectFolder}/index.md`;
+				const indexNote = engine.getNote(indexPath);
+				return indexNote?.meta.proactive_prep_enabled === true;
+			},
+			getNote: (path) => engine.getNote(path),
+		};
+		const prepResult = extractProactivePrepDispatches(
+			unblock.candidates,
+			prepResolver,
+			prepStore,
+			now.getTime(),
+		);
+		const prepWatchMs = Date.now() - prepStartMs;
+
+		// Fire prep dispatches detached — agent_runs threads them into the
+		// Workbench `in_flight` lane automatically via `subjectPath`.
+		for (const intent of prepResult.dispatches) {
+			void (async () => {
+				try {
+					for await (const _event of dispatchAgent(intent.agentId, intent.prompt, {
+						mode: 'production',
+						subjectPath: intent.taskPath,
+						pausableOnCeiling: true,
+					})) {
+						// drain the generator; events persisted to agent_runs
+					}
+				} catch (err) {
+					console.error(
+						`[vault-scout/proactive-prep] dispatch failed for ${intent.taskPath}:`,
+						String(err),
+					);
+				}
+			})();
+		}
+
 		candidates = [...candidates, ...unblockCandidatesBridged, ...edgeStaleBridged];
 
 		// Skip already-decided candidates.
@@ -626,6 +693,10 @@ export function vaultScoutFactory(rawParams: unknown): TaskFn {
 				edgeStaleCandidates: edge.candidates.length,
 				edgesExamined: edge.stats.edgesExamined,
 				edgesFirstObserved: edge.stats.edgesFirstObserved,
+				prepWatchMs,
+				prepDispatched: prepResult.stats.dispatched,
+				prepFirstObservations: prepResult.stats.skippedFirstObservation,
+				prepDeduped: prepResult.stats.skippedDedup,
 			};
 		}
 
@@ -739,6 +810,10 @@ export function vaultScoutFactory(rawParams: unknown): TaskFn {
 			edgeStaleCandidates: edge.candidates.length,
 			edgesExamined: edge.stats.edgesExamined,
 			edgesFirstObserved: edge.stats.edgesFirstObserved,
+			prepWatchMs,
+			prepDispatched: prepResult.stats.dispatched,
+			prepFirstObservations: prepResult.stats.skippedFirstObservation,
+			prepDeduped: prepResult.stats.skippedDedup,
 		};
 	};
 }

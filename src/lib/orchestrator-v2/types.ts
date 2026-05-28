@@ -22,6 +22,14 @@ export interface DecideV2Options {
 	conversationKey?: string;
 	/** Sender phone number (for per-user image quota counters). */
 	senderNumber?: string;
+	/** ADR-011 — current scope kind from the chat scope provider (ADR-002/006).
+	 *  Forwarded from the web API to `buildOrchestratorTools` so
+	 *  `describeCurrentPage` can look up the catalog entry without a DOM read.
+	 *  Undefined on non-web channels (WhatsApp/Telegram have no page scope). */
+	scopeKind?: string;
+	/** ADR-011 — scope-specific params (e.g. `{ slug: 'naseej' }` for the
+	 *  project scope). Forwarded alongside `scopeKind`. */
+	scopeParams?: Record<string, string>;
 	/** ADR-025 — which chat channel this turn is on. Tools that need it
 	 *  (e.g. `scheduleReminder`, which is WhatsApp-only in V1 because the
 	 *  heartbeat reader is hardcoded to `'whatsapp'`) refuse gracefully
@@ -215,6 +223,18 @@ export type V2Output =
 			kind: 'slow-dispatched';
 			toolName: string;
 			ack: string;
+	  }
+	/** ADR-011 — web-only navigate directive. The `dispatchWebTurn` function
+	 *  emits a `navigate` SSE event that the drawer handles by calling
+	 *  SvelteKit's `goto(url)`. `message` is the confirmation text shown in
+	 *  the chat bubble so the operator sees something useful before the route
+	 *  changes. Only produced when `channel === 'web'`. */
+	| {
+			kind: 'navigate';
+			url: string;
+			/** Human-readable confirmation shown in the bubble, e.g.
+			 *  "Navigating to the Scheduler…" */
+			message: string;
 	  };
 
 /** Per-call telemetry surfaced to the inbound handler for analytics. */

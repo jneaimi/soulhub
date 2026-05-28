@@ -75,6 +75,11 @@ export interface VaultMeta {
 	 *  reverse view (`consumes_from`) is COMPUTED read-time by inverting
 	 *  every project's declarations — never stored. */
 	produces_for?: ProducerEdge[];
+	/** projects-graph ADR-019 — when true, the proactive prep action layer
+	 *  will dispatch a prep agent (researcher / author) for human-owned tasks
+	 *  in this project when they become unblocked. Default false (opt-in gate).
+	 *  Applies to the project root `index.md` only. */
+	proactive_prep_enabled?: boolean;
 	/** Catch-all for custom frontmatter fields */
 	[key: string]: unknown;
 }

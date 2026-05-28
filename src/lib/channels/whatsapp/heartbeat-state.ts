@@ -534,6 +534,27 @@ function migrate(db: Database.Database): void {
 		db.exec(`ALTER TABLE agent_runs ADD COLUMN repo TEXT;`);
 		db.pragma('user_version = 22');
 	}
+
+	if (version < 23) {
+		// projects-graph ADR-019 — proactive prep snapshot table.
+		// One row per task_path that the proactive prep action layer has
+		// encountered. prep_path=null means first-observation recorded (quiet,
+		// dispatch not yet emitted); prep_path non-null means a dispatch was
+		// emitted for this task (dedup lock). Mirrors the v16 blocker-snapshot
+		// convention exactly — first observation is QUIET so the first
+		// post-deploy run is noise-free even with a backlog of unblocked tasks.
+		// Single-migration-owner per the v7/v16/v17 precedent.
+		db.exec(`
+			CREATE TABLE IF NOT EXISTS proactive_prep_snapshots (
+				task_path    TEXT    NOT NULL PRIMARY KEY,
+				prep_path    TEXT,
+				recorded_at  INTEGER NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_proactive_prep_snapshots_recorded
+				ON proactive_prep_snapshots(recorded_at DESC);
+		`);
+		db.pragma('user_version = 23');
+	}
 }
 
 /** Heartbeat run statuses logged to `proactive_log`. */
@@ -1152,4 +1173,37 @@ export function upsertEdgeSnapshot(input: EdgeSnapshotRow): void {
 			input.last_flow_mtime,
 			input.last_check_at,
 		);
+}
+
+// ── projects-graph ADR-019 proactive prep snapshots ──────────────────────
+
+export interface PrepSnapshotRow {
+	task_path: string;
+	/** null = first-observation recorded (quiet). Non-null = dispatch was
+	 *  emitted; value is 'dispatched:<ms epoch>'. */
+	prep_path: string | null;
+	recorded_at: number;
+}
+
+export function getPrepSnapshot(taskPath: string): PrepSnapshotRow | null {
+	const row = getHeartbeatDb()
+		.prepare(
+			`SELECT task_path, prep_path, recorded_at
+			 FROM proactive_prep_snapshots
+			 WHERE task_path = ?`,
+		)
+		.get(taskPath) as PrepSnapshotRow | undefined;
+	return row ?? null;
+}
+
+export function upsertPrepSnapshot(input: PrepSnapshotRow): void {
+	getHeartbeatDb()
+		.prepare(
+			`INSERT INTO proactive_prep_snapshots (task_path, prep_path, recorded_at)
+			 VALUES (?, ?, ?)
+			 ON CONFLICT(task_path)
+			 DO UPDATE SET prep_path   = excluded.prep_path,
+			               recorded_at = excluded.recorded_at`,
+		)
+		.run(input.task_path, input.prep_path, input.recorded_at);
 }

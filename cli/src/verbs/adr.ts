@@ -14,6 +14,29 @@ interface AdrHit {
 }
 interface SearchResp { results: AdrHit[]; total?: number; }
 
+// ADR-013 D1 — parse the ADR number from a filename. Anchored on `adr-` so a
+// note whose name merely *mentions* an ADR (e.g. a dated
+// `2026-05-19-adr-009-postship-smoke-decision.md` or a non-ADR decision note)
+// returns null rather than a bogus number. Leading zeros are stripped
+// (`adr-009` → 9) so the value is a true integer for sorting.
+function adrNumberFromPath(path: string): number | null {
+  const file = path.split('/').pop() ?? '';
+  const m = /^adr-0*(\d+)/.exec(file);
+  return m ? Number(m[1]) : null;
+}
+
+// ADR-013 D1/D3 — the projected ADR list row. Carries the parsed `number`
+// (D1) and drops the search-only `score`/`snippet` fields that leak from the
+// `/api/vault/notes` projection (D3); `adr list` never sends a text query, so a
+// snippet is always noise here.
+interface AdrRow {
+  number: number | null;
+  status: string;
+  path: string;
+  title: string;
+  tags: string[];
+}
+
 export async function list(args: Record<string, string | undefined>, opts: OutputOpts) {
   if (!args.project) fail('adr list: --project SLUG is required');
   const params: Record<string, string> = {
@@ -23,14 +46,36 @@ export async function list(args: Record<string, string | undefined>, opts: Outpu
   };
   if (args.status) params.status = args.status;
   const data = await apiGet<SearchResp>('/api/vault/notes', params);
-  emit(data, opts, (d: SearchResp) =>
+
+  // ADR-013 D2 — sort ascending by ADR number; non-`adr-NNN` decision notes
+  // (number === null) sort last so the canonical sequence reads top-to-bottom
+  // and "the next free number" is a glance, not a regex. Applied to the shared
+  // row array so --json and the human table agree.
+  const rows: AdrRow[] = data.results
+    .map((r) => ({
+      number: adrNumberFromPath(r.path),
+      status: r.status ?? '?',
+      path: r.path,
+      title: r.title ?? '',
+      tags: r.tags ?? [],
+    }))
+    .sort((a, b) => {
+      if (a.number === null && b.number === null) return 0;
+      if (a.number === null) return 1;
+      if (b.number === null) return -1;
+      return a.number - b.number;
+    });
+
+  const out = { results: rows, total: data.total ?? rows.length };
+  emit(out, opts, (d: typeof out) =>
     d.results.length === 0
       ? '(no ADRs)'
       : d.results
           .map((r) => {
-            const status = (r.status ?? '?').padEnd(9);
+            const num = (r.number === null ? '—' : String(r.number)).padStart(3);
+            const status = r.status.padEnd(9);
             const file = (r.path.split('/').pop() ?? r.path).padEnd(60);
-            return `${status} ${file}  ${r.title ?? ''}`;
+            return `${num}  ${status} ${file}  ${r.title}`;
           })
           .join('\n')
   );

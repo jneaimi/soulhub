@@ -22,6 +22,33 @@ export type ToolCategory =
 	| 'agent' // dispatchAgent (heavy specialist)
 	| 'skill'; // invokeSkill (scoped utility)
 
+/**
+ * ADR-014 Tier 1 — logical toolset a tool belongs to.
+ *
+ * | Toolset       | Default exposure                                        |
+ * |---------------|----------------------------------------------------------|
+ * | core          | Every turn, every channel                               |
+ * | vault         | vault/project scope or vault intent                     |
+ * | project-adr   | project scope or project/ADR intent (writes web-only)   |
+ * | inbox         | inbox scope or inbox intent                             |
+ * | crm           | crm scope or contact intent                             |
+ * | external-fetch| URL present in message                                  |
+ * | navigation    | web channel only (navigateTo / describeCurrentPage)     |
+ * | actions       | matching intent (image / reminder / skill)              |
+ *
+ * Note: listPages is in the navigation toolset but available on all channels;
+ * the gating layer never adds it to WEB_ONLY_TOOLS.
+ */
+export type ToolsetName =
+	| 'core'
+	| 'vault'
+	| 'project-adr'
+	| 'inbox'
+	| 'crm'
+	| 'external-fetch'
+	| 'navigation'
+	| 'actions';
+
 export interface ToolConfigPointer {
 	/** Settings JSON path the user can edit, e.g. `channels.whatsapp.youtube`. */
 	settingsKey: string;
@@ -59,6 +86,11 @@ export interface ToolManifest {
 	 *  key the AI SDK will report in step.toolCalls. */
 	name: string;
 	category: ToolCategory;
+	/** ADR-014 Tier 1 — logical toolset this tool belongs to. Used by the
+	 *  assembly-time gating policy (`selectToolsets` + `applyGatingFilter`)
+	 *  to decide which tools to include on each turn. Every tool MUST have
+	 *  exactly one toolset; `assertToolsetCoverage()` warns on gaps. */
+	toolset: ToolsetName;
 	/** What the LLM sees in the tool description. MUST match the string
 	 *  passed to `tool({ description, ... })` in index.ts. */
 	llm_description: string;
@@ -91,6 +123,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'reply',
 		category: 'reply',
+		toolset: 'core',
 		llm_description:
 			'Reply to the user with a chat message. Use for greetings, conversation, quick known facts, follow-up summaries, or asking a clarification. NOT for unknown facts (use webSearch) or vault lookups (use vaultSearch).',
 		ui_description:
@@ -99,6 +132,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'webSearch',
 		category: 'read',
+		toolset: 'core',
 		llm_description:
 			"Quick Gemini-grounded Google Search for current real-world facts (weather, news, today's score, single lookups). Returns chat-formatted answer with one source URL. When the user names a specific source (e.g. \"Khaleej Times\", \"The National\", \"Reuters\"), shape the query as `site:<domain> <topic>` — e.g. `site:khaleejtimes.com today's UAE headlines` — so grounding pulls from that source instead of a broad mix.",
 		ui_description:
@@ -112,19 +146,29 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 		],
 	},
 	{
+		// ADR-010 S1 — extended with zone/project/type/tag/limit filter params.
+		// ADR-013 S3 — trimmed from ~15 lines to ~6; routing discriminators preserved.
 		name: 'vaultSearch',
 		category: 'read',
+		toolset: 'core',
 		llm_description:
-			'Recon the accumulated knowledge base (Soul Hub vault, ~/vault/ — prior research, decisions, CRM, learnings). CALL THIS FIRST (ADR-053 vault-recon) for any knowledge / entity / continuity question — a company, person, project, or topic, and "do we have research on X", "what did we save / decide about Y", "have we looked at Z", "find my notes on W" — so you build on prior work before hitting the web. A vault hit is CONTEXT to extend ("we already have a note on X from <date>"), NOT the authoritative answer for current-state facts; a tangential match is not relevant. Do NOT use for current events, news, headlines, weather, live scores, or any question about the outside world — those go to webSearch (a topic-adjacent note does not satisfy a current-events question). Do NOT use for inbox/email queries of ANY kind — "what\'s in my inbox", "what\'s queued", "any new emails", "new mail", "what came in today", "any bank alerts", "msg <N>", "what about msg N", "tell me about N", or any bare 4-6 digit id after a digest/anomaly push. ALL email queries route to `inbox-list-queued` (lists) or `inbox-drill-down` (single id), NEVER here. The vault has an unrelated `inbox/` folder for quick note captures — ignore that name collision; the word "inbox" without an explicit "note"/"vault" qualifier always means EMAIL. Vault returning a topic-adjacent note does not satisfy a news / current-events / inbox question.',
+			'CALL FIRST (ADR-053) for knowledge / entity / continuity questions — "do we have notes on X", "what did we decide about Y", "find research on Z". ' +
+			'Searches ~/vault/ (prior research, decisions, CRM, learnings). A hit is CONTEXT to build on, not authoritative for current facts. ' +
+			'Filters: zone, project, type, tag, limit. ' +
+			'Do NOT use for: current events / news / weather / live scores (→ webSearch). ' +
+			'Do NOT use for inbox/email — "what\'s in my inbox", "any new emails", "msg N", bare 4-6 digit id after a digest → `inbox-list-queued` (lists) or `inbox-drill-down` (single id). ' +
+			'The vault has an unrelated inbox/ folder for note captures — ignore the name; "inbox" without "note/vault" qualifier = EMAIL.',
 		ui_description:
-			'Search the Soul Hub vault notes (lexical / MiniSearch). Used for "do we have notes on..." style questions.',
+			'Search the Soul Hub vault notes (lexical / MiniSearch). Optional filters: zone, project, type, tag, limit. Used for "do we have notes on..." style questions.',
 		examples: [
 			{ user: '"what did we save about hydroponics"', toolArgs: '{ query: "hydroponics" }' },
+			{ user: '"show me all decisions in soul-hub"', toolArgs: '{ project: "soul-hub", type: "decision" }' },
 		],
 	},
 	{
 		name: 'generateImage',
 		category: 'write',
+		toolset: 'actions',
 		latencyClass: 'slow',
 		llm_description:
 			'Generate a single text-to-image via Gemini Nano Banana. Use ONLY for "make me a picture of X" with NO text overlay, NO video, NO voiceover, NO carousel, NO Arabic text. If the user wants any of those, use dispatchAgent with agentId="media-generator".',
@@ -144,6 +188,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'dispatchAgent',
 		category: 'agent',
+		toolset: 'core',
 		latencyClass: 'slow',
 		llm_description:
 			'Dispatch a heavy specialist agent (runs minutes). OMIT confirmed (or set false) to PROPOSE the dispatch — the user replies "yes" to run it. Set confirmed=true ONLY when the user explicitly confirmed a prior proposal OR used an unambiguous command verb ("research X for me", "draft Y about Z", "review this code", "audit Q").',
@@ -153,6 +198,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'youtubeFetch',
 		category: 'read',
+		toolset: 'external-fetch',
 		latencyClass: 'slow',
 		llm_description:
 			'Fetch a YouTube video — title, channel, duration, thumbnail, and (when needed) transcript or summary. ' +
@@ -181,6 +227,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'tiktokFetch',
 		category: 'read',
+		toolset: 'external-fetch',
 		latencyClass: 'slow',
 		llm_description:
 			'Fetch a TikTok video — author, caption, engagement, duration, and (when needed) speech transcript or summary. ' +
@@ -219,6 +266,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'fetchPage',
 		category: 'read',
+		toolset: 'external-fetch',
 		llm_description:
 			'Fetch the readable text of a web page (curl + Readability). ' +
 			'Use `youtubeFetch` for YouTube URLs and `tiktokFetch` for TikTok URLs FIRST — those return richer structured data. ' +
@@ -244,45 +292,243 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 		],
 	},
 	{
+		// ADR-010 S4 — extended with optional `zone` param.
+		// ADR-013 S3 — trimmed.
 		name: 'vaultSave',
 		category: 'write',
+		toolset: 'vault',
 		llm_description:
-			"Save composed content to the user's Soul Hub vault (standalone markdown store at ~/vault/) as a markdown note. " +
-			'Use ONLY when the user explicitly asks to save / capture / remember / add to notes / write down / store. ' +
-			'NEVER call this for discussion-only requests. ' +
-			'For multi-step flows (e.g. user asks to save a YouTube video), call the upstream tool first ' +
-			'(youtubeFetch with mode=summary), then synthesize a clean note body, THEN call vaultSave with the ' +
-			'synthesized title + body. ' +
-			'Always writes to the inbox zone — the user curates from there. After it returns, include the openUrl ' +
-			'in your reply so the user can open the note.',
+			"Save composed content to ~/vault/ as a markdown note. " +
+			'ONLY when user explicitly asks to save / capture / remember / write down / store. NEVER for discussion-only. ' +
+			'Multi-step: call upstream tool first (e.g. youtubeFetch), synthesize, then vaultSave. ' +
+			'Optional `zone` (inbox/projects/knowledge/content/operations/archive); omit to auto-classify. Include openUrl in reply.',
 		ui_description:
-			'Save a composed note to the vault inbox/. Triggered only by explicit save phrasings; used in chains like "summarize this video and save it".',
+			'Save a composed note to the vault. Optional zone param targets a specific zone (inbox, knowledge, etc.). Triggered only by explicit save phrasings.',
 		examples: [
 			{
 				user: '"save this idea: bilingual newsletter MVP"',
 				toolArgs:
 					'{ title: "Bilingual newsletter MVP", content: "...", type: "idea", tags: ["mvp"] }',
 			},
+			{
+				user: '"save this to knowledge"',
+				toolArgs:
+					'{ title: "SQLite WAL mode notes", content: "...", type: "learning", zone: "knowledge" }',
+			},
+		],
+	},
+	{
+		// ADR-010 S2 — fetch a note by vault-relative path.
+		name: 'vaultGet',
+		category: 'read',
+		toolset: 'vault',
+		llm_description:
+			'Fetch a single vault note by its exact vault-relative path (e.g. "projects/soul-hub/adr-010-foo.md"). ' +
+			'Use when you already know the path from a prior vaultSearch result, projectGet listing, or the user typed it explicitly. ' +
+			'PROVENANCE: `path` MUST be a real vault path from a prior tool result or the user\'s own text — NEVER fabricate paths. ' +
+			'Do NOT use for broad searches (use vaultSearch instead). Returns the full note body + frontmatter.',
+		ui_description:
+			'Fetch a single vault note by its vault-relative path. Use after vaultSearch returns a path you need to read in full.',
+		examples: [
+			{
+				user: '"show me the full content of that ADR"',
+				toolArgs: '{ path: "projects/soul-hub/adr-010-cli-aligned-vault-project-tool-surface.md" }',
+			},
+		],
+	},
+	{
+		// ADR-010 S3 — list recently modified vault notes.
+		name: 'vaultRecent',
+		category: 'read',
+		toolset: 'vault',
+		llm_description:
+			'List the most recently modified vault notes, sorted newest-first. ' +
+			'Use for "what did we recently add / update", "what\'s new in the vault", "latest notes" queries. ' +
+			'Optional `limit` param (default 10, max 50). ' +
+			'Do NOT use for targeted searches — use vaultSearch with a query/filter instead.',
+		ui_description:
+			'List the most recently modified vault notes. Sorted newest-first. Mirrors `soul vault recent`.',
+		examples: [
+			{ user: '"what did we recently add to the vault"', toolArgs: '{ limit: 10 }' },
+		],
+	},
+	{
+		// ADR-010 S5 — update an existing note's content and/or metadata.
+		name: 'vaultNoteUpdate',
+		category: 'write',
+		toolset: 'vault',
+		llm_description:
+			'Update an existing vault note\'s content and/or frontmatter metadata. ' +
+			'CONFIRMATION GATE: OMIT `confirmed` (or set false) to PROPOSE the edit — the user replies "yes" to confirm. Set `confirmed=true` ONLY when the user explicitly confirmed a prior proposal in this turn. ' +
+			'Provide `content` to replace the note body, `metaJson` (JSON string) to patch frontmatter fields, or both. ' +
+			'PROVENANCE: `path` MUST be a real vault path from a prior vaultSearch/vaultGet result. NEVER fabricate paths. ' +
+			'NEVER use this to update an ADR\'s status frontmatter — use adrAccept/adrShip/adrPark/adrReject for lifecycle transitions. ' +
+			'Mirrors `soul note update PATH`.',
+		ui_description:
+			'Update an existing vault note\'s content and/or frontmatter metadata. Confirmation-gated. Mirrors `soul note update`.',
+		examples: [
+			{
+				user: '"update the hydro note with these new findings"',
+				toolArgs: '{ path: "knowledge/hydroponics-notes.md", content: "# Updated content...", confirmed: false }',
+			},
+		],
+	},
+	{
+		// ADR-010 S6 — move a note to a different zone (web-only, confirmation gate).
+		// ADR-014 — in WEB_ONLY_TOOLS: never assembled off web.
+		name: 'vaultNoteMove',
+		category: 'write',
+		toolset: 'vault',
+		llm_description:
+			'Move a vault note to a different zone and/or rename its filename. WEB CHANNEL ONLY. ' +
+			'CONFIRMATION GATE: OMIT `confirmed` (or set false) to PROPOSE the move — the user replies "yes" to confirm. Set `confirmed=true` ONLY when the user explicitly confirmed. ' +
+			'Provide `targetZone` to relocate (inbox/projects/knowledge/content/operations/archive) and/or `newFilename` to rename. Must provide at least one. ' +
+			'The move is link-safe — inbound wikilinks from other notes are rewritten to the new path. ' +
+			'PROVENANCE: `src` MUST be a real vault path from a prior vaultSearch/vaultGet result. NEVER fabricate. ' +
+			'Mirrors `soul note move SRC DST-ZONE`.',
+		ui_description:
+			'Move a vault note to a different zone (link-safe). Web only, confirmation-gated. Mirrors `soul note move`.',
+		examples: [
+			{
+				user: '"move the hydroponics note from inbox to knowledge"',
+				toolArgs: '{ src: "inbox/2026-05-01-hydro.md", targetZone: "knowledge", confirmed: false }',
+			},
+		],
+	},
+	{
+		// ADR-010 S7 — get project summary + ADR list.
+		// ADR-013 S1 — routing guard: explicit "Do NOT use" clause against page-description overlap.
+		name: 'projectGet',
+		category: 'read',
+		toolset: 'project-adr',
+		llm_description:
+			'Get a project\'s summary, ADR list, and status counts by slug. ' +
+			'Use for "what\'s the status of project X", "show me soul-hub ADRs", "what\'s open in project Y", "how is the [project] project". ' +
+			'Do NOT use for "what page am I on?", "what can I do here?", "describe this screen" — use `describeCurrentPage` for those (page-description questions). ' +
+			'PROVENANCE: `slug` MUST be a real project slug from a prior projectList result or the user\'s explicit text. NEVER fabricate. ' +
+			'Mirrors `soul project get SLUG`.',
+		ui_description:
+			'Get a project\'s index + ADR list with status counts. Mirrors `soul project get SLUG`.',
+		examples: [
+			{ user: '"what are the ADRs in soul-hub"', toolArgs: '{ slug: "soul-hub" }' },
+			{ user: '"show me the status of project naseej"', toolArgs: '{ slug: "naseej" }' },
+		],
+	},
+	{
+		// ADR-010 S8 — list all active projects.
+		// ADR-013 S1 — routing guard: explicit "Do NOT use" for health/page overlap.
+		name: 'projectList',
+		category: 'read',
+		toolset: 'project-adr',
+		llm_description:
+			'List all active projects (scans projects/*/index.md). Returns project slugs, titles, open ADR counts, and status. ' +
+			'Use for "what projects do we have", "list all projects", "show me the project list". ' +
+			'Do NOT use for system health / server status / "is everything ok" / "are services up" questions — use `systemHealth` for those. ' +
+			'Mirrors `soul project list`.',
+		ui_description:
+			'List all active projects with open ADR counts. Mirrors `soul project list`.',
+		examples: [
+			{ user: '"what projects are there"', toolArgs: '{ limit: 20 }' },
+		],
+	},
+	{
+		// ADR-010 S9 — ADR lifecycle: proposed → accepted.
+		// ADR-014 — in WEB_ONLY_TOOLS: never assembled off web.
+		name: 'adrAccept',
+		category: 'write',
+		toolset: 'project-adr',
+		llm_description:
+			'Transition an ADR from `proposed` → `accepted`. WEB CHANNEL ONLY — ADR status changes are available in the browser chat only. ' +
+			'CONFIRMATION GATE: OMIT `confirmed` (or set false) to PROPOSE the action — the user replies "yes" to confirm. Set `confirmed=true` ONLY when the user explicitly confirmed. ' +
+			'PROVENANCE: `path` MUST be a real vault-relative ADR path from a prior vaultSearch/projectGet/vaultGet result. NEVER fabricate paths. ' +
+			'Mirrors `soul adr accept PATH`.',
+		ui_description:
+			'Transition an ADR proposed → accepted. Web only, confirmation-gated. Mirrors `soul adr accept`.',
+		examples: [
+			{
+				user: '"accept the ADR-010 for soul-hub"',
+				toolArgs: '{ path: "projects/soul-hub/adr-010-cli-aligned-vault-project-tool-surface.md", confirmed: false }',
+			},
+		],
+	},
+	{
+		// ADR-010 S9 — ADR lifecycle: accepted → shipped.
+		// ADR-014 — in WEB_ONLY_TOOLS: never assembled off web.
+		name: 'adrShip',
+		category: 'write',
+		toolset: 'project-adr',
+		llm_description:
+			'Transition an ADR from `accepted` → `shipped`. WEB CHANNEL ONLY — ADR status changes are available in the browser chat only. ' +
+			'CONFIRMATION GATE: OMIT `confirmed` (or set false) to PROPOSE the action — the user replies "yes" to confirm. Set `confirmed=true` ONLY when the user explicitly confirmed. ' +
+			'PROVENANCE: `path` MUST be a real vault-relative ADR path. NEVER fabricate. ' +
+			'Mirrors `soul adr ship PATH`.',
+		ui_description:
+			'Transition an ADR accepted → shipped. Web only, confirmation-gated. Mirrors `soul adr ship`.',
+		examples: [
+			{
+				user: '"mark ADR-010 as shipped"',
+				toolArgs: '{ path: "projects/soul-hub/adr-010-cli-aligned-vault-project-tool-surface.md", confirmed: false }',
+			},
+		],
+	},
+	{
+		// ADR-010 S9 — ADR lifecycle: proposed → parked.
+		// ADR-014 — in WEB_ONLY_TOOLS: never assembled off web.
+		name: 'adrPark',
+		category: 'write',
+		toolset: 'project-adr',
+		llm_description:
+			'Transition an ADR from `proposed` → `parked`. WEB CHANNEL ONLY — ADR status changes are available in the browser chat only. ' +
+			'CONFIRMATION GATE: OMIT `confirmed` (or set false) to PROPOSE the action — the user replies "yes" to confirm. Set `confirmed=true` ONLY when the user explicitly confirmed. ' +
+			'Mirrors `soul adr park PATH`.',
+		ui_description:
+			'Transition an ADR proposed → parked. Web only, confirmation-gated. Mirrors `soul adr park`.',
+		examples: [
+			{
+				user: '"park ADR-010 until next month"',
+				toolArgs: '{ path: "projects/soul-hub/adr-010-cli-aligned-vault-project-tool-surface.md", reviewAfter: "2026-07-01", confirmed: false }',
+			},
+		],
+	},
+	{
+		// ADR-010 S9 — ADR lifecycle: proposed → rejected.
+		// ADR-014 — in WEB_ONLY_TOOLS: never assembled off web.
+		name: 'adrReject',
+		category: 'write',
+		toolset: 'project-adr',
+		llm_description:
+			'Transition an ADR from `proposed` → `rejected`. WEB CHANNEL ONLY — ADR status changes are available in the browser chat only. ' +
+			'CONFIRMATION GATE: OMIT `confirmed` (or set false) to PROPOSE the action — the user replies "yes" to confirm. Set `confirmed=true` ONLY when the user explicitly confirmed. ' +
+			'`reason` is REQUIRED for rejection. ' +
+			'Mirrors `soul adr reject PATH`.',
+		ui_description:
+			'Transition an ADR proposed → rejected (reason required). Web only, confirmation-gated. Mirrors `soul adr reject`.',
+		examples: [
+			{
+				user: '"reject ADR-010, we are going a different direction"',
+				toolArgs: '{ path: "projects/soul-hub/adr-010-cli-aligned-vault-project-tool-surface.md", reason: "Superseded by new approach", confirmed: false }',
+			},
 		],
 	},
 	{
 		name: 'invokeSkill',
 		category: 'skill',
+		toolset: 'actions',
 		llm_description:
 			'Invoke a Claude Skill — fast scoped utility (seconds, not minutes). Prefer this over dispatchAgent for narrow tasks. Skills run synchronously and the output is threaded back to you so you can compose the final reply.',
 		ui_description:
 			'Invoke a chat-enabled skill (research, recipe, arabic, etc.). Synchronous, seconds. Skill list is dynamic — see /orchestration/skills.',
 	},
 	{
+		// ADR-013 S3 — trimmed; routing discriminators preserved.
 		name: 'inbox-list-queued',
 		category: 'read',
+		toolset: 'inbox',
 		llm_description:
-			"STRICT ROUTING: any user mention of 'my inbox', 'queued', 'new emails', 'new mail', 'what came in', 'mail today', 'any bank alerts', 'show me my receipts', or similar list-style email queries routes HERE — these are EMAIL queries against the IMAP-synced messages table. NOT vaultSearch — that's for Soul Hub vault markdown notes; the vault has an unrelated `inbox/` folder for quick note captures and the name collision MUST be ignored. The word 'inbox' without an explicit 'note'/'vault' qualifier always means EMAIL. " +
-			"List the user's queued inbox messages (post-Layer-2 filter, agent-relevant only). " +
-			"Use when the user asks 'what's in my inbox', 'any new emails', 'show me bank alerts', 'what came in today'. " +
-			"Filter by category for targeted queries: personal (human mail), transactional (bank/orders/receipts), notification (service alerts), unclassified (filter wasn't confident). " +
-			"Returns newest first. " +
-			"OUTPUT FORMAT: when rendering rows to the user, you MUST preserve the `(msg N)` annotation next to each row — those ids are how the user drills down with phrases like 'tell me about msg N' or 'what about N'. Dropping the ids breaks the follow-up loop. If you summarize or group rows by category, still include `(msg N)` on every row.",
+			"STRICT ROUTING: 'my inbox', 'queued', 'new emails', 'new mail', 'what came in', 'any bank alerts', 'show me receipts' → HERE (EMAIL, NOT vaultSearch). " +
+			"Lists queued IMAP-synced messages (post-Layer-2 filter). " +
+			"Filter by category: personal / transactional / notification / unclassified. Returns newest first. " +
+			"MUST preserve `(msg N)` ids in every row — the user drills down with 'tell me about msg N'.",
 		ui_description:
 			'List queued inbox messages, optionally filtered by category. The queued stream is what Layer 2 deemed agent-relevant.',
 		examples: [
@@ -293,6 +539,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'inbox-mark-processed',
 		category: 'write',
+		toolset: 'inbox',
 		llm_description:
 			"Mark an inbox message as processed (agent has handled it). The message transitions queued → processed; it stays cached for 365 days as audit trail but stops appearing in queued listings. " +
 			"Use after summarizing, routing-to-vault, replying, or otherwise handling a message. " +
@@ -304,6 +551,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'inbox-apply-recommendation',
 		category: 'write',
+		toolset: 'inbox',
 		llm_description:
 			"Apply the keeper's recommendation for a stuck-transactional inbox message — operator's accept/advise loop. " +
 			"Use when the operator replies 'accept #N' / 'yes route N' / 'archive N' / 'advise: kind=X, zone=Y' after the keeper surfaced an inboxDecisions item with a recommendation. " +
@@ -315,6 +563,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'inbox-correct-classification',
 		category: 'write',
+		toolset: 'inbox',
 		llm_description:
 			"Correct the Layer 2 classification of a message and update the cache so future similar messages get the new category. " +
 			"Use when the user pushes back (\"that's not promotional, it's a receipt\") or when the agent notices a clear miscategorization. " +
@@ -325,6 +574,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'inbox-read-body',
 		category: 'read',
+		toolset: 'inbox',
 		llm_description:
 			"Fetch the full body text of a queued inbox message. " +
 			"Use ONLY after inbox-list-queued returned a row whose preview is insufficient to answer the user's question. " +
@@ -343,6 +593,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'inbox-extract-data',
 		category: 'read',
+		toolset: 'inbox',
 		llm_description:
 			"Extract structured transactional data (kind, amount, currency, merchant, date, cardLast4, referenceNumber, anomalyHint) from a queued message. Returns cached extraction if present; otherwise runs the extractor (subject + 500-char preview) and caches the result. " +
 			"Use for 'how much was that charge', 'what merchant', 'is this transaction unusual', 'what was the OTP'. " +
@@ -358,13 +609,16 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 		],
 	},
 	{
+		// ADR-013 S3 — trimmed; routing discriminators preserved.
 		name: 'inbox-drill-down',
 		category: 'read',
+		toolset: 'inbox',
 		llm_description:
-			"STRICT ROUTING: any user mention of 'msg <N>', 'message <N>', 'about <N>', or a bare 4-6 digit number that appears in the recent conversation context (digest / anomaly push / list-queued result) routes HERE. NOT vaultSearch — that's for vault notes, NOT inbox rows. NOT reply — drill-down composes the answer for you. " +
-			"Returns everything cheap-to-fetch about a single inbox message: envelope (from/subject/when), cached extracted_data, agent-action history, and a 200-char body preview. Typical triggers: 'what about msg 33602', 'tell me about 33425', 'more on 33877', or just the bare number '33877' as a reply to a digest. " +
-			"Does NOT fetch the full body — call `inbox-read-body` next if the user wants more after seeing the preview. " +
-			"PROVENANCE: `messageId` MUST be a real id from a prior `inbox-list-queued`, `inbox-anomaly-push`, `inbox-digest`, or a number the user explicitly typed in their reply. NEVER fabricate.",
+			"STRICT ROUTING: 'msg N', 'message N', 'about N', or a bare 4-6 digit number from a digest/list-queued reply → HERE. NOT vaultSearch (vault notes ≠ inbox rows). " +
+			"Returns envelope (from/subject/when) + cached extract + agent-action history + 200-char body preview for one message. " +
+			"Triggers: 'what about msg 33602', 'tell me about 33425', bare '33877' reply to a digest. " +
+			"PROVENANCE: messageId MUST be real (from prior inbox-list-queued / digest / user-typed). NEVER fabricate. " +
+			"For full body: call `inbox-read-body` next.",
 		ui_description:
 			"Composite drill-down on one message — envelope + cached extract + agent_actions audit history + body preview snippet. Server-formatted, no LLM in the path. Closes the digest/anomaly-push reply loop.",
 		examples: [
@@ -375,6 +629,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'crm-add-contact',
 		category: 'write',
+		toolset: 'crm',
 		llm_description:
 			"Add a new CRM contact. Use when the user says 'add X as a new lead', 'remember Sarah from Acme', " +
 			"'create a contact for Y'. Provide displayName plus any combination of company, role, source, stage " +
@@ -392,6 +647,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'crm-find-contact',
 		category: 'read',
+		toolset: 'crm',
 		llm_description:
 			"Search CRM contacts. Pass `email` for exact-email lookup (case-insensitive), `phone` for exact-phone lookup (as-typed — phones are stored unnormalized), or `query` for FTS5 over name, company, role, and notes. Returns the matches with stage and primary email. " +
 			"Use for 'who is X', 'do I have a contact at Acme', 'find John's record', 'is sarah@acme.com in my CRM', 'who owns +971 50 123 4567'.",
@@ -412,6 +668,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'crm-log-interaction',
 		category: 'write',
+		toolset: 'crm',
 		llm_description:
 			"Log an interaction with a CRM contact (channel: email/call/meeting/social/whatsapp/other). " +
 			"Resolve the contact via `contactId` (CRM-YYYY-NNN) OR `email`. Provide a short `summary`. " +
@@ -430,6 +687,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'crm-update-stage',
 		category: 'write',
+		toolset: 'crm',
 		llm_description:
 			"Move a CRM contact between pipeline stages: Lead → Contacted → In Conversation → Proposal → Won → Lost. " +
 			"Resolve via `contactId` or `email`. Writes a stage_history row + refreshes the vault note frontmatter. " +
@@ -447,6 +705,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'crm-set-followup',
 		category: 'write',
+		toolset: 'crm',
 		llm_description:
 			"Schedule the next follow-up date for a CRM contact. Resolve via `contactId` or `email`. " +
 			"Emit `dueAt` as ISO 8601 with timezone offset (parse natural language relative to Asia/Dubai). " +
@@ -466,6 +725,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'crm-list-followups',
 		category: 'read',
+		toolset: 'crm',
 		llm_description:
 			"List CRM contacts with overdue or upcoming follow-ups. Optional knobs: `overdueWindowDays` " +
 			"(how far back to look for overdue rows) + `upcomingWindowDays` (default 3). Returns the lists " +
@@ -481,6 +741,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'crm-add-email',
 		category: 'write',
+		toolset: 'crm',
 		llm_description:
 			"Add an additional email address to an existing CRM contact. Resolve via `contactId` or " +
 			"`currentEmail` (one of the contact's existing addresses). Provide the `newEmail` and " +
@@ -499,6 +760,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'crm-add-phone',
 		category: 'write',
+		toolset: 'crm',
 		llm_description:
 			"Add a phone number to an existing CRM contact. Resolve via `contactId` or `email` (one of the contact's existing emails). Provide `phone` (any format — stored as-typed, no E.164 normalization) and optional `label` ('mobile' | 'home' | 'work' | other) and `isPrimary`. Phones are globally unique across the CRM — reusing a number attached to another contact errors. " +
 			"PROVENANCE: `contactId` / `email` MUST come from a prior `crm-find-contact` / `crm-add-contact` result. `phone` MUST come from the user explicitly (a message they typed). NEVER fabricate phone numbers.",
@@ -514,6 +776,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'crm-attach-note',
 		category: 'write',
+		toolset: 'crm',
 		llm_description:
 			'Attach a vault note (transcript, document, reference) to a CRM contact. ' +
 			'Resolve via `contactId` (CRM-YYYY-NNN) OR `email`. `vaultPath` is the ' +
@@ -538,6 +801,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'crm-find-website-leads',
 		category: 'read',
+		toolset: 'crm',
 		llm_description:
 			"Find inbox messages that look like website leads — subject contains a configurable tag " +
 			"(default a configurable subject tag) AND the sender is NOT already a CRM contact. Returns a list " +
@@ -556,6 +820,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'projectShipSlice',
 		category: 'write',
+		toolset: 'project-adr',
 		llm_description:
 			'Mark a project ADR slice (S<N>, CP<N>, Phase <N>, PASS <N>, Stage <N>) as shipped/accepted/parked/superseded/rejected. ' +
 			'Atomically updates the ADR Status section + the project index Ship log via the ADR-046 chokepoint. Use after a commit closes a slice — pass the project slug, ADR slug (or bare ordinal like "007"), slice label, status, and commit short-SHA. ' +
@@ -578,15 +843,17 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 		],
 	},
 	{
+		// ADR-010 S10 — description aligned with `soul adr propose` engine path.
 		name: 'proposeAdr',
 		category: 'write',
+		toolset: 'project-adr',
 		llm_description:
-			'Draft a NEW ADR (architecture decision record) note in a project, with status `proposed`. Picks the next-available `adr-NNN-<slug>` ordinal and writes via the ADR-046 chokepoint with `actor: proposeAdr` (audit log shows this distinct from `projectShipSlice` closures). ' +
+			'Draft a NEW ADR (architecture decision record) note in a project, with status `proposed`. Uses the same `applyProposeAdr` engine path as `soul adr propose`. Picks the next-available `adr-NNN-<slug>` ordinal, composes the standard ADR structure (one H1 + Status / Context / Decision / Falsifiers / Implementation plan / Related sections), and writes via the ADR-046 chokepoint with `actor: proposeAdr`. ' +
 			'STRICT ROUTING: only fires when the user explicitly asks to "draft / propose / write a new ADR" for a specific project. NEVER fires for vague "we should write something about X" — needs a concrete project slug + working title. NEVER mutates an existing ADR (that\'s the operator\'s job via the AdrDrawer). ' +
 			'PROVENANCE — DO NOT INVENT ARGS: pull `problem_statement` and `falsifier_conditions` from the user\'s own words in the conversation, never fabricate. If the user hasn\'t articulated a problem statement or at least one falsifier, ASK before calling. ' +
-			'The new ADR lands as `status: proposed`; the operator confirms via the existing AdrDrawer Accept button (no new acceptance UI). The tool returns 404 if `projects/<slug>/index.md` is missing, 409 on two consecutive ordinal collisions (rare race with manual hand-creation).',
+			'The new ADR lands as `status: proposed`; the operator confirms via the existing AdrDrawer Accept button (no new acceptance UI) or `adrAccept` tool (S9). The tool returns 404 if `projects/<slug>/index.md` is missing, 409 on two consecutive ordinal collisions (rare race with manual hand-creation).',
 		ui_description:
-			'Draft a new project ADR with `status: proposed` — operator accepts via existing AdrDrawer Accept button. Replaces "operator types every ADR by hand" with a structured propose-then-accept flow.',
+			'Draft a new project ADR with `status: proposed` via the same engine path as `soul adr propose`. Operator accepts via AdrDrawer or adrAccept tool.',
 		examples: [
 			{
 				user: '"draft an ADR for naseej about caching the rendered peer-brief PDFs"',
@@ -598,6 +865,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'suggestAdrEdit',
 		category: 'write',
+		toolset: 'project-adr',
 		llm_description:
 			'Suggest a structured edit to an EXISTING ADR\'s prose. Writes a NEW proposal note under `projects/<slug>/proposals/YYYY-MM-DD-NN-<short-slug>.md` (NEVER mutates the target ADR). Frontmatter records `target_adr`, `proposed_section`, `status: open`. Operator reviews via the project page proposals panel and decides to apply, edit, or reject. ' +
 			'STRICT ROUTING: only fires when the user explicitly asks to "suggest / propose / draft an edit" to a specific ADR section. NEVER fires on vague "we could rewrite X". NEVER mutates the target ADR — that\'s the operator\'s job after review. NEVER creates a new ADR (that\'s `proposeAdr`). NEVER adds a slice row (that\'s `proposeSlice`). ' +
@@ -616,6 +884,7 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 	{
 		name: 'proposeSlice',
 		category: 'write',
+		toolset: 'project-adr',
 		llm_description:
 			'Add a NEW slice row to an EXISTING ADR\'s `## Implementation plan` table. Writes the row via the ADR-046 chokepoint with `actor: proposeSlice` (distinct from `proposeAdr` creations and `projectShipSlice` closures in the audit log). ' +
 			'STRICT ROUTING: only fires when the user explicitly asks to "add / propose a slice / phase / stage" to a specific ADR. NEVER fires on vague "we should plan more work on X". NEVER mutates the ADR\'s Status section, Decision section, frontmatter status, or any closure markers — that is `projectShipSlice`\'s job. NEVER creates a new ADR — that is `proposeAdr`\'s job. ' +
@@ -636,9 +905,159 @@ export const TOOL_MANIFESTS: ToolManifest[] = [
 			},
 		],
 	},
+	// ── ADR-011 — Browser navigation tools ──────────────────────────────────────
+	{
+		// ADR-014 — in WEB_ONLY_TOOLS: never assembled off web.
+		name: 'navigateTo',
+		category: 'read',
+		toolset: 'navigation',
+		llm_description:
+			'Navigate the browser to a Soul Hub page. ONLY works in the browser chat (web channel) — ' +
+			'on WhatsApp/Telegram this returns a graceful error. ' +
+			'Use when the user says "take me to X", "go to the scheduler", "open the vault", ' +
+			'"navigate to projects", "show me the CRM". ' +
+			'Pass `path` as a concrete route (e.g. `/scheduler`, `/projects/naseej`, `/vault`). ' +
+			'For deep-links: pass `params` with `{ note: "vault/relative/path.md" }` to pre-select ' +
+			'a vault note, or `{ adr: "adr-007" }` to open a project ADR drawer. ' +
+			'Path MUST be an internal Soul Hub route — external URLs are rejected (use `fetchPage` for those). ' +
+			'Call `listPages` first if unsure which route to use.',
+		ui_description:
+			'Navigate the browser to a Soul Hub page (web-only). Supports deep-links for vault notes and project ADRs. Validates path against the internal page catalog.',
+		examples: [
+			{ user: '"take me to the scheduler"', toolArgs: '{ path: "/scheduler" }' },
+			{
+				user: '"open the naseej project"',
+				toolArgs: '{ path: "/projects/naseej" }',
+			},
+			{
+				user: '"open ADR-007 in the naseej project"',
+				toolArgs: '{ path: "/projects/naseej", params: { adr: "adr-007" } }',
+			},
+			{
+				user: '"show me that vault note"',
+				toolArgs: '{ path: "/vault", params: { note: "projects/naseej/adr-007.md" } }',
+			},
+		],
+	},
+	{
+		// ADR-014 — in navigation toolset but NOT in WEB_ONLY_TOOLS: listPages is
+		// all-channel (returns text list; no browser navigation needed).
+		name: 'listPages',
+		category: 'read',
+		toolset: 'core',
+		llm_description:
+			'List all Soul Hub pages with their routes and descriptions. ' +
+			'Use for "what pages are there?", "where can I go?", "show me the app map", ' +
+			'"what sections does Soul Hub have?". ' +
+			'Available on all channels (web + WhatsApp + Telegram).',
+		ui_description:
+			'List all Soul Hub pages with routes and descriptions. Available on all channels.',
+		examples: [
+			{ user: '"what pages are there?"', toolArgs: '{}' },
+			{ user: '"show me the app map"', toolArgs: '{}' },
+		],
+	},
+	{
+		// ADR-013 S1 — STRICT-ROUTING preamble added: scopes this tool to
+		// page/screen/UI description questions only; explicit redirect to
+		// projectGet for project-status questions ("how is project X").
+		// ADR-014 — in WEB_ONLY_TOOLS: never assembled off web.
+		// ADR-014 S6 — disambiguation examples vs projectGet.
+		name: 'describeCurrentPage',
+		category: 'read',
+		toolset: 'navigation',
+		llm_description:
+			'STRICT ROUTING — use ONLY for questions about the BROWSER UI ITSELF: "where am I?", "what is this screen?", ' +
+			'"what can I do here?", "what features does this page have?", "describe this view". ' +
+			'Takes no arguments. ONLY works in the browser chat (web channel). ' +
+			'Do NOT use for project-status questions ("how is project X?", "what\'s open in Y?", ' +
+			'"what\'s the status of Z?", "how is the soul-hub project?") — those are about vault project data, NOT the page UI → use `projectGet`. ' +
+			'Returns the page title, description, and chat capabilities for the current scope.',
+		ui_description:
+			'Describe the current browser page and list chat capabilities for the active scope. Web-only.',
+		examples: [
+			{ user: '"where am I?"', toolArgs: '{}' },
+			{ user: '"what can I do here?"', toolArgs: '{}' },
+			{ user: '"describe this screen"', toolArgs: '{}' },
+			{ user: '"what features does this page have?"', toolArgs: '{}' },
+		],
+	},
+	// ─────────────────────────────────────────────────────────────────────────────
+	// ADR-013 S2 — systemHealth tool: gives "system health / is everything ok /
+	// are services up" questions a real target so they don't fall through to
+	// projectList. Read-only, all channels, no confirmation gate.
+	{
+		// ADR-013 S2 — systemHealth added.
+		// ADR-014 S6 — added disambiguation examples vs projectList.
+		name: 'systemHealth',
+		category: 'read',
+		toolset: 'core',
+		llm_description:
+			'STRICT ROUTING — use for system health / server status / "is everything ok" / "are services up" / ' +
+			'"show me the system health" questions. ' +
+			'Returns Soul Hub server reachability, vault health summary, inbox sync freshness, ' +
+			'catalog-index status, and hook installation status. All-channel, read-only. ' +
+			'Do NOT use for project listing — use `projectList` for that. ' +
+			'Do NOT use for vault note search — use `vaultSearch` for that.',
+		ui_description:
+			'Report Soul Hub system health: server status, vault health, inbox sync age, catalog freshness, hook status. All channels.',
+		examples: [
+			{ user: '"show me the system health"', toolArgs: '{}' },
+			{ user: '"is everything ok?"', toolArgs: '{}' },
+			{ user: '"are services up?"', toolArgs: '{}' },
+			{ user: '"is the server running?"', toolArgs: '{}' },
+		],
+	},
+	// ── ADR-014 S5 — Dynamic discovery meta-tools (Tier 3) ───────────────────────
+	{
+		// enableToolset: signals that a toolset should be loaded for subsequent
+		// turns. Called when the model detects it needs a tool that isn't currently
+		// assembled (gating under-selected). The toolset expansion persists for the
+		// rest of the conversation session.
+		name: 'enableToolset',
+		category: 'read',
+		toolset: 'core',
+		llm_description:
+			'ADR-014 Tier 3 — Enable an additional toolset for this conversation. ' +
+			'Call ONLY when you need a tool that is not currently available and you know which toolset contains it. ' +
+			'Available toolsets: core, vault, project-adr, inbox, crm, external-fetch, navigation, actions. ' +
+			'After enabling, tell the user the relevant tools are now available and ask them to re-state their request. ' +
+			'Do NOT call this for toolsets that are already loaded. Use `listToolsets` to see what is currently loaded.',
+		ui_description:
+			'ADR-014 Tier 3 — Enable an additional toolset for this conversation session. Self-healing fallback when gating under-selected.',
+		examples: [
+			{
+				user: '"(model needs crm tools but they are not loaded)"',
+				toolArgs: '{ toolset: "crm" }',
+			},
+			{
+				user: '"(model needs vault tools for a save operation)"',
+				toolArgs: '{ toolset: "vault" }',
+			},
+		],
+	},
+	{
+		// listToolsets: lets the model discover what toolsets exist and which are
+		// currently active, so it can call enableToolset intelligently.
+		name: 'listToolsets',
+		category: 'read',
+		toolset: 'core',
+		llm_description:
+			'ADR-014 Tier 3 — List all available toolsets and which tools each contains. ' +
+			'Use when you are unsure whether a needed tool exists or which toolset it belongs to. ' +
+			'Returns the toolset names, their descriptions, current load status, and the tool names in each set. ' +
+			'After reviewing, call `enableToolset` if you need tools from an unloaded set.',
+		ui_description:
+			'ADR-014 Tier 3 — List all toolsets with their current load status and tool inventory.',
+		examples: [
+			{ user: '"what tools are available?"', toolArgs: '{}' },
+			{ user: '"(model needs to know if CRM tools are loaded)"', toolArgs: '{}' },
+		],
+	},
 	{
 		name: 'scheduleReminder',
 		category: 'write',
+		toolset: 'actions',
 		llm_description:
 			'Schedule a one-time reminder for the user. ' +
 			'Use ONLY when the user explicitly asks to be reminded ("remind me to X at Y", "ping me tomorrow about Z"). ' +

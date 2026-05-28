@@ -920,4 +920,76 @@ describe('ADR-033 isGateGreen — content-based gate matching', () => {
 		const { isGateGreen } = await import('$lib/agents/handback.ts');
 		assert.equal(isGateGreen('error'), false);
 	});
+
+	// ── ADR-039 — fail-zero phrases must not red a green gate ────────────
+
+	test('ADR-039: "pass — 43/43 tests, 0 failures" → green (the bug that triggered this ADR)', async () => {
+		const { isGateGreen } = await import('$lib/agents/handback.ts');
+		// Exact gate value from the projects-graph ADR-019 implementer handback
+		// that blocked ship-merge — "failures" matched the fail-token regex even
+		// though it was prefixed with "0".
+		assert.equal(isGateGreen('pass — 43/43 tests, 0 failures'), true);
+	});
+
+	test('ADR-039: "pass — no failures" → green', async () => {
+		const { isGateGreen } = await import('$lib/agents/handback.ts');
+		assert.equal(isGateGreen('pass — no failures'), true);
+	});
+
+	test('ADR-039: "pass — zero failures" → green', async () => {
+		const { isGateGreen } = await import('$lib/agents/handback.ts');
+		assert.equal(isGateGreen('pass — zero failures'), true);
+	});
+
+	test('ADR-039: "pass — 0 failed" → green (singular "failed", not "failures")', async () => {
+		const { isGateGreen } = await import('$lib/agents/handback.ts');
+		assert.equal(isGateGreen('pass — 0 failed'), true);
+	});
+
+	test('ADR-039: "all passed — 0/43 failures" → green (slash-count form)', async () => {
+		const { isGateGreen } = await import('$lib/agents/handback.ts');
+		assert.equal(isGateGreen('all passed — 0/43 failures'), true);
+	});
+
+	test('ADR-039: "no failures, all pass" → green (negation must not match after strip)', async () => {
+		const { isGateGreen } = await import('$lib/agents/handback.ts');
+		// Without the scrubbed-input negation check, "no…pass" would false-red.
+		assert.equal(isGateGreen('no failures, all pass'), true);
+	});
+
+	test('ADR-039: regression — "1 failed, 13 pass" still red (non-zero count preserved)', async () => {
+		const { isGateGreen } = await import('$lib/agents/handback.ts');
+		assert.equal(isGateGreen('1 failed, 13 pass'), false);
+	});
+
+	test('ADR-039: regression — "passed but 2 failures" still red', async () => {
+		const { isGateGreen } = await import('$lib/agents/handback.ts');
+		assert.equal(isGateGreen('passed but 2 failures'), false);
+	});
+
+	test('ADR-039: regression — "0 failed 1 failed, 5 pass" still red (real fail preserved after strip)', async () => {
+		const { isGateGreen } = await import('$lib/agents/handback.ts');
+		// The "0 failed" gets stripped; the remaining "1 failed" must still red the gate.
+		assert.equal(isGateGreen('0 failed 1 failed, 5 pass'), false);
+	});
+
+	test('ADR-039: regression — "did not pass — 0 failures" still red (negation survives strip)', async () => {
+		const { isGateGreen } = await import('$lib/agents/handback.ts');
+		assert.equal(isGateGreen('did not pass — 0 failures'), false);
+	});
+
+	test('ADR-039: integration — gates_green=true on the ADR-019 handback shape', async () => {
+		const { handbackGatesGreen } = await import('$lib/agents/handback.ts');
+		const hb = makeHandback({
+			typecheck_gate: 'pass — 0 errors, 0 == baseline',
+			cli_tsc: 'pass — cli/src typechecks clean',
+			no_owner_domain: 'pass — build clean',
+			unit_tests: 'pass — 43/43 tests, 0 failures',
+		});
+		assert.equal(
+			handbackGatesGreen(hb),
+			true,
+			'the gate set that blocked ADR-019 ship-merge must now pass',
+		);
+	});
 });

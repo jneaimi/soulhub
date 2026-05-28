@@ -27,6 +27,7 @@ import { notificationBudgetFalsifierFactory } from '$lib/scheduler/handlers/noti
 import { operatorNotificationBudgetFalsifierFactory } from '$lib/scheduler/handlers/operator-notification-budget-falsifier.js';
 import { hygieneAgentProposeOnlyCheckFactory } from '$lib/scheduler/handlers/hygiene-agent-propose-only-check.js';
 import { updateCheckTaskFactory } from '$lib/scheduler/handlers/update-check.js';
+import { worktreeJanitorFactory } from '$lib/scheduler/handlers/worktree-janitor.js';
 import { initVault, getVaultEngine } from '$lib/vault/index.js';
 import { initSystemHealth, getSystemHealth } from '$lib/system/index.js';
 import { listSessions, killSession } from '$lib/pty/manager.js';
@@ -300,6 +301,11 @@ try {
 		'update-check',
 		updateCheckTaskFactory,
 		'ADR-010 — daily public-release drift check; fetches GitHub /releases/latest and caches the latest tag for the update-available banner. Task instance only reconciled when features.updateCheck is true.',
+	);
+	registerTaskHandler(
+		'worktree-janitor',
+		worktreeJanitorFactory,
+		'ADR-038 Layer B — daily safety-net sweep of orchestration worktrees. Reclaims merged worktrees; escalates unmerged (abandoned/errored runs) for operator review. Never force-deletes unreviewed work.',
 	);
 } catch (err) {
 	console.error('[scheduler] handler registration failed:', err);

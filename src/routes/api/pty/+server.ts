@@ -8,6 +8,7 @@ import {
 	killSession,
 	listSessions,
 	isAlive,
+	serializeSession,
 } from '$lib/pty/manager.js';
 
 export const POST: RequestHandler = async ({ request }) => {
@@ -28,6 +29,19 @@ export const POST: RequestHandler = async ({ request }) => {
 			return json({ error: 'Session not found' }, { status: 404 });
 		}
 		return json({ ok: true });
+	}
+
+	if (action === 'snapshot') {
+		// Reconnect support: VT serialization of the session's current screen from
+		// its server-side headless mirror. null ⇒ no mirror (caller falls back to
+		// a SIGWINCH repaint). Resize first (separate 'resize' action) so the
+		// snapshot reflects the reconnecting terminal's geometry.
+		const { sessionId } = body;
+		const snapshot = serializeSession(sessionId);
+		if (snapshot === null) {
+			return json({ error: 'Session not found or snapshot unavailable' }, { status: 404 });
+		}
+		return json({ snapshot });
 	}
 
 	if (action === 'kill') {
@@ -111,7 +125,7 @@ export const POST: RequestHandler = async ({ request }) => {
 	}
 
 	// action === 'spawn'
-	const { prompt, cwd, cols, rows, continueSession, resumeSessionId, shell } = body;
+	const { prompt, cwd, cols, rows, continueSession, resumeSessionId, shell, origin } = body;
 
 	// spawnSession throws when the Claude binary is missing (or node-pty can't
 	// spawn). Surface that as a legible 422 instead of a bare 500 — the message
@@ -126,6 +140,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			continueSession: !!continueSession,
 			resumeSessionId: resumeSessionId || undefined,
 			shell: !!shell,
+			origin: origin || undefined,
 		});
 	} catch (err) {
 		console.error('[pty] spawn failed:', err);
@@ -194,13 +209,20 @@ export const POST: RequestHandler = async ({ request }) => {
 				session.emitter.removeListener('exit', onExit);
 				session.emitter.removeListener('prompt_sent', onPromptSent);
 
-				// Orphan cleanup: kill after 5 min if no reconnect
+				// Orphan cleanup. Drawer chat sessions are long-lived: the operator
+				// may collapse the drawer / refresh / step away while a coding run
+				// continues server-side, then reconnect via the session picker. Give
+				// those a 6-hour window (manual kill is available in the picker);
+				// other sessions keep the original 5-minute safety net.
+				const longLived = origin === 'chat-drawer' || origin === 'chat-terminal';
+				const orphanMs = longLived ? 24 * 60 * 60_000 : 300_000;
+				const orphanLabel = longLived ? '24h' : '5min';
 				setTimeout(() => {
 					if (isAlive(sessionId)) {
-						console.log(`[pty:${sessionId}] orphan cleanup — killing after 5min with no reconnect`);
+						console.log(`[pty:${sessionId}] orphan cleanup — killing after ${orphanLabel} with no reconnect`);
 						killSession(sessionId);
 					}
-				}, 300_000);
+				}, orphanMs);
 			});
 		},
 		cancel() {

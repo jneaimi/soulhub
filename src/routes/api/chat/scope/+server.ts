@@ -21,10 +21,24 @@
 
 import type { RequestHandler } from './$types';
 import { json } from '@sveltejs/kit';
+import { homedir } from 'node:os';
+import { resolve } from 'node:path';
 import { getVaultEngine } from '$lib/vault/index.js';
 import { resolveScope } from '$lib/chat/scope/resolve.js';
 import type { ScopeReader, CrmContactScopeShape, CrmInteractionScopeItem } from '$lib/chat/scope/types.js';
 import { getContact, listInteractions } from '$lib/crm/index.js';
+
+/** Expand a leading ~ so the client, the PTY spawn, and the session picker all
+ *  share the SAME absolute cwd. resolveScope is pure (no Node) and returns
+ *  '~/dev/soul-hub' for global scope; on the literal tilde, spawnSession's
+ *  existsSync failed and silently fell back to HOME — so the recorded session
+ *  cwd never matched the picker's exact-cwd query (empty picker, no restore). */
+function expandTilde(p: string): string {
+	const home = process.env.HOME || homedir();
+	if (p === '~') return home;
+	if (p.startsWith('~/')) return resolve(home, p.slice(2));
+	return p;
+}
 
 // ── Scope reader ─────────────────────────────────────────────────────────────
 
@@ -139,5 +153,5 @@ export const GET: RequestHandler = ({ url }) => {
 	const reader = buildScopeReader();
 	const scope  = resolveScope(scopeKind, params, reader);
 
-	return json({ cwd: scope.cwd, primer: scope.primer, kind: scope.kind });
+	return json({ cwd: expandTilde(scope.cwd), primer: scope.primer, kind: scope.kind });
 };

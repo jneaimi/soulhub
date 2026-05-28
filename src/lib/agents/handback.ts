@@ -268,6 +268,11 @@ export function parseHandback(raw: string | null): ParsedHandback | null {
  * Note: "error"/"errors" is deliberately NOT a fail token; green typecheck values
  * legitimately read "pass — 0 errors == baseline 0".
  *
+ * ADR-039 extension: fail-zero phrases (`0 failures`, `no failures`, `zero failed`,
+ * `0/43 failures`) are stripped before the fail-token AND negation checks so that
+ * "pass — 43/43 tests, 0 failures" stays green. Any non-zero count (`1 failed`,
+ * `2 failures`) is preserved, so real failures keep the gate red.
+ *
  * Supersedes ADR-029's `/^pass/i` prefix match which could not handle count-prefixed
  * values such as "14/14 pass (5 ADR-016 + 7 ADR-018 falsifiers)".
  */
@@ -275,11 +280,23 @@ export function isGateGreen(v: string): boolean {
 	const t = v.trim();
 	const hasPass = /\bpass(ed|ing)?\b/i.test(t);
 	if (!hasPass) return false;
-	const hasFail = /\bfail(ed|ures?|ings?)?\b/i.test(t) || t.includes('✗') || t.includes('❌');
+	// ADR-039: strip benign fail-zero phrases ("0 failures", "no failures",
+	// "zero failures", "0/43 failed") before the downstream fail-token AND
+	// negation checks. Without this, "pass — 43/43 tests, 0 failures" false-reds
+	// even though it is plainly green. Both checks consume `scrubbed` because
+	// otherwise "no failures, all pass" matches the `/\b(no|...)\b[^.]*\bpass/`
+	// negation pattern. Symbol fails (`✗`, `❌`) are checked on the unscrubbed
+	// string — there is no zero-prefix variant to strip.
+	const scrubbed = t.replace(
+		/\b(0|no|zero)(\s*\/\s*\d+)?\s+(fail(?:ed|ures?|ings?|s)?)\b/gi,
+		'',
+	);
+	const hasFail =
+		/\bfail(ed|ures?|ings?)?\b/i.test(scrubbed) || t.includes('✗') || t.includes('❌');
 	if (hasFail) return false;
 	const negated =
-		/\b(no|not|never|without)\b[^.]*\bpass/i.test(t) ||
-		/\bdid\s?n[o']?t\b[^.]*\bpass/i.test(t);
+		/\b(no|not|never|without)\b[^.]*\bpass/i.test(scrubbed) ||
+		/\bdid\s?n[o']?t\b[^.]*\bpass/i.test(scrubbed);
 	return !negated;
 }
 

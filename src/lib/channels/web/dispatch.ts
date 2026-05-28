@@ -72,6 +72,11 @@ export interface WebTurnOpts {
 	/** Optional abort signal — the SSE route wires the request's signal
 	 *  here so a browser navigation or tab close cancels the LLM call. */
 	signal?: AbortSignal;
+	/** ADR-011 — current scope kind forwarded to decideV2 so
+	 *  `describeCurrentPage` can look up the correct catalog entry. */
+	scopeKind?: string;
+	/** ADR-011 — scope-specific params (e.g. `{ slug: 'naseej' }`). */
+	scopeParams?: Record<string, string>;
 }
 
 /**
@@ -92,6 +97,10 @@ function assistantTextForOutput(out: V2Output): string {
 			return `[dispatching ${out.agentId}]`;
 		case 'slow-dispatched':
 			return out.ack;
+		// ADR-011 — navigate directive: save the confirm message as the
+		// assistant turn so the conversation history shows what happened.
+		case 'navigate':
+			return `[navigate] ${out.url} — ${out.message}`;
 	}
 }
 
@@ -102,7 +111,7 @@ function assistantTextForOutput(out: V2Output): string {
  * emitted. The caller is responsible for closing the SSE stream afterward.
  */
 export async function dispatchWebTurn(opts: WebTurnOpts): Promise<void> {
-	const { message, conversationKey, contextPayload, write, signal } = opts;
+	const { message, conversationKey, contextPayload, write, signal, scopeKind, scopeParams } = opts;
 	const turnNow = Date.now();
 
 	// Prepend contextPayload as a `system` history entry so the orchestrator
@@ -126,7 +135,9 @@ export async function dispatchWebTurn(opts: WebTurnOpts): Promise<void> {
 
 	try {
 		// Initial placeholder bubble: "🟡 Thinking…" morphs as tools fire.
-		await presence.bubble('vault-chat', { isFocusQuery: isFocusQuery(message) });
+		// ADR-015 S1 — capture the assigned bubble id so fallback writes can
+		// target the real message instead of the hardcoded sentinel '1'.
+		const assignedBubbleId = await presence.bubble('vault-chat', { isFocusQuery: isFocusQuery(message) });
 
 		// Invoke decideV2 — wired to presence so the bubble morphs through
 		// tool-call stages (ADR-029 streaming). `onStreamEvent` also forwards
@@ -142,6 +153,10 @@ export async function dispatchWebTurn(opts: WebTurnOpts): Promise<void> {
 				// settings page once per-user prefs are shipped.
 				timezone: 'Asia/Dubai',
 				signal,
+				// ADR-011 — forward scope context so describeCurrentPage can
+				// look up the catalog entry for the operator's current page.
+				scopeKind,
+				scopeParams,
 				// ADR-029 — stream tool lifecycle events to both the presence
 				// bubble (morphs the spinner text) and the browser (for the
 				// drawer's live progress ring).
@@ -165,7 +180,10 @@ export async function dispatchWebTurn(opts: WebTurnOpts): Promise<void> {
 			const errorText = 'Something went wrong — please try again.';
 			// Try to morph the bubble into the error; fall back to raw event.
 			const finalized = await presence.finalizeError(errorText);
-			if (!finalized) write({ kind: 'bubble-update', messageId: '1', text: errorText });
+			// ADR-015 S1 — use the real bubble id; omit the key entirely when
+			// no bubble was sent (undefined) so the client falls back to its
+			// tracked bubbleId rather than matching a stale/phantom id.
+			if (!finalized) write({ kind: 'bubble-update', ...(assignedBubbleId && { messageId: assignedBubbleId }), text: errorText });
 			write({ kind: 'error', message: errorText });
 			return;
 		}
@@ -177,18 +195,21 @@ export async function dispatchWebTurn(opts: WebTurnOpts): Promise<void> {
 			// Derive the text to morph the bubble with. Image does not have a
 			// direct text reply. Dispatch (ADR-007) gets a CTA label so the
 			// bubble resolves from spinner → actionable card offer.
+			// Navigate (ADR-011) shows the confirm message before goto() fires.
 			const bubbleText: string | null =
 				out.kind === 'text' || out.kind === 'proposal' || out.kind === 'error'
 					? out.text
 					: out.kind === 'dispatch'
 						? '🚀 Heavy build — ready to dispatch to the Workbench'
-						: null;
+						: out.kind === 'navigate'
+							? out.message
+							: null;
 
 			if (bubbleText) {
 				// Attempt to edit the bubble in place (standard path). Fall back
 				// to a raw `bubble-update` event — the drawer handles both.
 				const finalized = await presence.finalize(bubbleText);
-				if (!finalized) write({ kind: 'bubble-update', messageId: '1', text: bubbleText });
+				if (!finalized) write({ kind: 'bubble-update', ...(assignedBubbleId && { messageId: assignedBubbleId }), text: bubbleText });
 			}
 
 			// Persist the turn in chat_history for context on the next turn.
@@ -198,6 +219,13 @@ export async function dispatchWebTurn(opts: WebTurnOpts): Promise<void> {
 				assistantTextForOutput(out),
 				turnNow + 1,
 			);
+
+			// ADR-011 — emit the navigate event BEFORE `complete` so the drawer
+			// calls goto() before the stream ends. The route change may cancel the
+			// stream, but both events are already enqueued server-side.
+			if (out.kind === 'navigate') {
+				write({ kind: 'navigate', url: out.url });
+			}
 
 			// Terminal event — the browser renders the full structured output
 			// (drawer builds buttons for proposals, image previews, etc.).
@@ -213,7 +241,7 @@ export async function dispatchWebTurn(opts: WebTurnOpts): Promise<void> {
 
 		saveTurn(conversationKey, 'user', message, turnNow);
 		const finalized = await presence.finalize(fallbackText);
-		if (!finalized) write({ kind: 'bubble-update', messageId: '1', text: fallbackText });
+		if (!finalized) write({ kind: 'bubble-update', ...(assignedBubbleId && { messageId: assignedBubbleId }), text: fallbackText });
 		saveTurn(conversationKey, 'assistant', fallbackText, turnNow + 1);
 		write({ kind: 'complete', output: { kind: 'text', text: fallbackText } });
 	} finally {

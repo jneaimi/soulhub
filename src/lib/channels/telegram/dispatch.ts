@@ -597,6 +597,12 @@ async function dispatchOrchestrated(
 			return;
 		}
 
+		// ADR-011 — navigate is web-only; guard so TypeScript narrows out.text.
+		if (out.kind === 'navigate') {
+			console.warn('[telegram/orchestrator] navigate output on non-web channel — ignoring');
+			return;
+		}
+
 		// kind: 'text' | 'error' — already-formatted text payload.
 		// ADR-014: when a youtubeFetch turn produced a summary, attach a
 		// follow-up keyboard (Save / Full transcript / Skip).

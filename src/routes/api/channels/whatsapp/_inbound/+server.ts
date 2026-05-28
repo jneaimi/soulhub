@@ -752,6 +752,11 @@ export const POST: RequestHandler = async ({ request }) => {
 					});
 					return json({ ok: true, action: 'drop' });
 				}
+				// ADR-011 — navigate is web-only; drop silently so TypeScript
+				// narrows out.text below.
+				if (out.kind === 'navigate') {
+					return json({ ok: true, action: 'drop' });
+				}
 				// `text` / `proposal` / `error` — all carry `out.text` as the
 				// pre-formatted user-facing string. Edit the presence bubble
 				// in place; on edit failure fall back to a fresh send so the

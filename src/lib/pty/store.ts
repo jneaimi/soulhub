@@ -31,6 +31,11 @@ export interface SessionMeta {
 	 *  capture read the clean JSONL transcript instead of the raw PTY log.
 	 *  Absent for plain interactive terminals. */
 	claudeSessionId?: string;
+	/** Which UI surface spawned this session, e.g. 'chat-drawer'. Lets the chat
+	 *  drawer's session picker list only the operator's own drawer conversations
+	 *  (and resume them via `claude --resume <claudeSessionId>`), instead of the
+	 *  thousands of automated agent/classifier sessions in ~/.claude. */
+	origin?: string;
 }
 
 /** Validate session ID — only alphanumeric, hyphens, underscores allowed */

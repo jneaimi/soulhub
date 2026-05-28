@@ -273,16 +273,56 @@ export async function detectOrphanWorktrees(
 }
 
 /**
- * Clean up orphaned worktrees. Per orphan: unlock → remove → prune → delete branch.
+ * ADR-038 Layer B — merged-into-main guard.
+ *
+ * Returns true only when `branch` is a confirmed ancestor of `main` (i.e.
+ * its commits have already landed on main). Any error (branch missing, no
+ * main, git unavailable) returns false so the safe default — never delete
+ * unconfirmed work — is always applied.
+ */
+async function isMergedIntoMain(projectPath: string, branch: string): Promise<boolean> {
+	try {
+		// exit 0  → branch IS an ancestor of main (merged)
+		// exit 1  → not an ancestor
+		// other   → git error; treat as "not merged"
+		await git(['merge-base', '--is-ancestor', branch, 'main'], projectPath);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Clean up orphaned worktrees.
+ *
+ * ADR-038 Layer B safety contract:
+ *   - **Merged** worktrees (branch is an ancestor of main): unlock → remove
+ *     → prune → `git branch -d` (safe delete — refuses if somehow unmerged).
+ *   - **Unmerged** worktrees (inactive but not yet on main, i.e. abandoned or
+ *     errored runs awaiting operator review): added to `escalated`, NEVER
+ *     deleted. The caller surfaces these for operator action.
+ *
+ * Never uses `branch -D` (force) so an unreviewed run cannot be silently
+ * destroyed by the scheduled janitor.
  */
 export async function cleanupOrphanWorktrees(
 	projectPath: string,
 	orphans: WorktreeInfo[],
-): Promise<{ cleaned: number; errors: string[] }> {
+): Promise<{ cleaned: number; escalated: string[]; errors: string[] }> {
 	let cleaned = 0;
+	const escalated: string[] = [];
 	const errors: string[] = [];
 
 	for (const orphan of orphans) {
+		// ADR-038 — merged guard: only reclaim if the branch is on main.
+		// Unmerged + inactive means the run was abandoned or errored before
+		// ship-merge; it is unreviewed work, not garbage. Escalate, never delete.
+		const merged = await isMergedIntoMain(projectPath, orphan.branch);
+		if (!merged) {
+			escalated.push(orphan.branch);
+			continue;
+		}
+
 		await git(['worktree', 'unlock', orphan.path], projectPath).catch(() => {});
 
 		if (existsSync(orphan.path)) {
@@ -300,7 +340,9 @@ export async function cleanupOrphanWorktrees(
 		await git(['worktree', 'prune'], projectPath).catch(() => {});
 
 		try {
-			await git(['branch', '-D', orphan.branch], projectPath);
+			// Use safe `-d` (not `-D`): git refuses if the branch isn't fully
+			// merged, providing a double-guard in case isMergedIntoMain was wrong.
+			await git(['branch', '-d', orphan.branch], projectPath);
 			cleaned++;
 		} catch (err) {
 			if (String(err).includes('not found')) {
@@ -311,7 +353,7 @@ export async function cleanupOrphanWorktrees(
 		}
 	}
 
-	return { cleaned, errors };
+	return { cleaned, escalated, errors };
 }
 
 // ── Lock cleanup ─────────────────────────────────────────────────
