@@ -99,6 +99,7 @@
     "workspaces": false,
     "playbook": false,
     "updateCheck": true,
-    "localRedeploy": false
+    "localRedeploy": false,
+    "realtimeVoice": false
   }
 }

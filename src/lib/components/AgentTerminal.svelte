@@ -162,6 +162,108 @@
 		toggleAlt();
 	}
 
+	// ── Voice dictation (ADR-020 P2) — capture → review overlay → inject ────────
+	// Reuses the same realtime-STT capture module as the Orchestrator drawer, but
+	// transcription lands in an editable overlay textbox (NOT straight into the
+	// PTY). The operator reviews/edits, then clicks Insert to send it to the
+	// terminal — safer than streaming raw, possibly-misheard text into a live shell.
+	let voiceOpen   = $state(false);  // overlay visible
+	let voiceState  = $state<'idle' | 'recording' | 'error'>('idle');
+	let voiceHint   = $state('');     // live readout while recording
+	let voiceErr    = $state('');     // error text (shown inside the overlay)
+	let voiceText   = $state('');     // editable transcript (bound to the textarea)
+	let _voiceHandle: { stop: () => void } | null = null;
+	let _voiceCommitted = '';         // accumulated committed segments
+
+	/** Stop the audio stream (keeps the overlay + text for review/editing). */
+	function _stopStream() {
+		if (_voiceHandle) { try { _voiceHandle.stop(); } catch { /* closed */ } _voiceHandle = null; }
+		if (voiceState === 'recording') voiceState = 'idle';
+		voiceHint = '';
+	}
+
+	/** Open the overlay (if needed) and begin streaming speech into the textbox. */
+	async function startVoice() {
+		voiceErr  = '';
+		voiceHint = '';
+		voiceOpen = true;
+		if (!sessionId) { voiceErr = 'Start a session first, then dictate.'; voiceState = 'error'; return; }
+
+		voiceText = '';
+		_voiceCommitted = '';
+
+		// Acquire the mic *inside the tap gesture* so iOS/Android actually prompt
+		// for consent (a getUserMedia after awaits is silently denied on iOS).
+		let probe: MediaStream;
+		try {
+			probe = await navigator.mediaDevices.getUserMedia({ audio: true });
+		} catch (e) {
+			const name = (e as { name?: string }).name;
+			voiceErr = (name === 'NotAllowedError' || name === 'PermissionDeniedError')
+				? 'Microphone blocked — allow it in browser settings (use Chrome/Safari, not in-app browsers like Arc).'
+				: `Microphone error: ${(e as Error).message ?? 'unknown'}`;
+			voiceState = 'error';
+			return;
+		}
+		probe.getTracks().forEach((t) => t.stop());
+
+		try {
+			const { startRealtimeStt } = await import('$lib/voice/realtime-stt');
+			const htmlLang = (typeof document !== 'undefined' && document.documentElement.lang) || '';
+			let heard = 0;
+			voiceHint = 'connecting…';
+			_voiceHandle = await startRealtimeStt({
+				languageCode: htmlLang ? htmlLang.split('-')[0] : undefined,
+				onOpen:           () => { voiceHint = 'connected…'; },
+				onSessionStarted: () => { voiceHint = 'listening — speak now'; },
+				onPartial: (t) => {
+					heard++;
+					voiceHint = `listening · ${heard} heard`;
+					voiceText = (_voiceCommitted + ' ' + t).trim();
+				},
+				onCommitted: (t) => {
+					_voiceCommitted = (_voiceCommitted + ' ' + t.trim()).trim();
+					voiceText = _voiceCommitted;
+				},
+				onError: (msg) => { voiceErr = msg; voiceState = 'error'; _stopStream(); },
+			});
+			voiceState = 'recording';
+		} catch (e) {
+			voiceErr = `Voice unavailable: ${(e as Error).message ?? 'unknown'}`;
+			voiceState = 'error';
+			_voiceHandle = null;
+		}
+	}
+
+	/** Header/toolbar mic button: open+record, or stop, or re-record. */
+	function voiceButton() {
+		if (!voiceOpen) { void startVoice(); return; }
+		if (voiceState === 'recording') _stopStream();
+		else void startVoice();
+	}
+
+	/** Inject the reviewed text into the PTY. `run` appends Enter to execute it. */
+	function insertVoice(run: boolean) {
+		const text = voiceText.trim();
+		if (!text) return;
+		_stopStream();
+		sendInput(run ? text + '\r' : text + ' ');
+		voiceOpen = false;
+		voiceText = '';
+		_voiceCommitted = '';
+		terminal?.focus();
+	}
+
+	/** Discard the dictation and close the overlay. */
+	function cancelVoice() {
+		_stopStream();
+		voiceOpen = false;
+		voiceState = 'idle';
+		voiceText = '';
+		_voiceCommitted = '';
+		voiceErr = '';
+	}
+
 	let resizeObserver: ResizeObserver | null = null;
 
 	function handleBeforeUnload() {
@@ -520,6 +622,7 @@
 		if (uploadToastTimer) clearTimeout(uploadToastTimer);
 		if (longPressTimer) clearTimeout(longPressTimer);
 		cleanupSelection?.();
+		_stopStream();
 		if (abortController) abortController.abort();
 		// Only kill the session if keepAlive is false (default behavior for interactive terminals).
 		// PM and worker terminals use keepAlive=true so collapsing doesn't kill the session.
@@ -966,6 +1069,20 @@
 				{#if uploading}Uploading...{:else}Upload{/if}
 			</button>
 			{#if running}
+				<button
+					onclick={voiceButton}
+					class="flex items-center gap-1 px-2 py-1 rounded transition-colors cursor-pointer {voiceOpen ? 'text-hub-cta bg-hub-cta/10' : 'text-hub-muted hover:bg-hub-surface hover:text-hub-text'}"
+					title="Voice dictation — review in a box, then inject into the terminal"
+					aria-label="Voice dictation"
+				>
+					<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+						<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+						<path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+						<line x1="12" y1="19" x2="12" y2="23"/>
+						<line x1="8" y1="23" x2="16" y2="23"/>
+					</svg>
+					{voiceState === 'recording' ? 'Stop' : 'Voice'}
+				</button>
 				<button onclick={kill} class="px-2 py-1 rounded text-red-400 hover:bg-red-400/10 transition-colors cursor-pointer">Kill</button>
 			{/if}
 			<button onclick={clear} class="px-2 py-1 rounded text-hub-muted hover:bg-hub-surface transition-colors cursor-pointer">Clear</button>
@@ -974,6 +1091,43 @@
 
 	<div class="relative flex-1 min-h-0 overflow-hidden">
 		<div bind:this={terminalEl} class="w-full h-full"></div>
+
+		<!-- Voice dictation review overlay (ADR-020 P2) — capture → review → inject -->
+		{#if voiceOpen}
+			<div class="absolute inset-x-0 bottom-0 z-30 p-2.5 bg-[#0d0d14]/98 backdrop-blur-sm border-t border-hub-cta/40 shadow-[0_-8px_24px_rgba(0,0,0,0.4)]">
+				<div class="flex items-center gap-1.5 mb-1.5 text-[11px]">
+					{#if voiceState === 'recording'}
+						<span class="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse flex-shrink-0"></span>
+						<span class="text-red-400">{voiceHint || 'listening…'}</span>
+					{:else if voiceErr}
+						<svg class="w-3 h-3 flex-shrink-0 text-red-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+							<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+						</svg>
+						<span class="text-red-400 flex-1">{voiceErr}</span>
+					{:else}
+						<span class="text-hub-muted">Review &amp; edit, then inject into the terminal</span>
+					{/if}
+				</div>
+				<textarea
+					bind:value={voiceText}
+					rows="2"
+					placeholder="Your dictation appears here…"
+					aria-label="Dictation text to review before inserting"
+					class="w-full resize-none rounded bg-hub-card border border-hub-border px-2 py-1.5 text-xs text-hub-text placeholder:text-hub-dim focus:outline-none focus:border-hub-cta/50"
+				></textarea>
+				<div class="flex items-center gap-1.5 mt-1.5">
+					<button
+						onclick={voiceButton}
+						class="px-2.5 py-1 rounded text-[11px] transition-colors cursor-pointer {voiceState === 'recording' ? 'bg-red-400/15 text-red-400' : 'bg-hub-surface text-hub-muted hover:text-hub-text'}"
+					>{voiceState === 'recording' ? 'Stop' : 'Record'}</button>
+					<div class="ml-auto flex items-center gap-1.5">
+						<button onclick={cancelVoice} class="px-2.5 py-1 rounded text-[11px] text-hub-muted hover:bg-hub-surface transition-colors cursor-pointer">Cancel</button>
+						<button onclick={() => insertVoice(false)} disabled={!voiceText.trim()} class="px-2.5 py-1 rounded text-[11px] bg-hub-card border border-hub-border text-hub-text hover:border-hub-cta/50 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed">Insert</button>
+						<button onclick={() => insertVoice(true)} disabled={!voiceText.trim()} class="px-2.5 py-1 rounded text-[11px] bg-hub-cta text-hub-bg font-medium hover:bg-hub-cta/90 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed">Insert &amp; Run</button>
+					</div>
+				</div>
+			</div>
+		{/if}
 
 		<!-- Drag-to-upload overlay — only while a file is being dragged over -->
 		{#if dragActive}
@@ -1056,6 +1210,7 @@
 				<button ontouchstart={xkey('-')} class="xkey">-</button>
 				<button ontouchstart={(e) => { e.preventDefault(); openCopyOverlay(); }} class="xkey text-[9px] text-hub-cta" title="Copy text">COPY</button>
 				<button ontouchstart={(e) => { e.preventDefault(); pasteFromClipboard(); }} class="xkey text-[9px] text-hub-cta" title="Paste from clipboard">PASTE</button>
+				<button ontouchstart={(e) => { e.preventDefault(); voiceButton(); }} class="xkey text-[9px] {voiceOpen ? 'xkey-active text-hub-cta' : 'text-hub-cta'}" title="Voice dictation">MIC</button>
 				<div class="ml-auto flex gap-0.5">
 					<div class="w-9"></div>
 					<button ontouchstart={xkey('\x1b[A')} class="xkey xkey-arrow">&uarr;</button>

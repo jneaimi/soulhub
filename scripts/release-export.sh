@@ -75,11 +75,11 @@ if [ -f "$SEX" ]; then
 import json, sys
 p = sys.argv[1]
 d = json.load(open(p))
-d["features"] = {"naseej": False, "workspaces": False, "playbook": False, "updateCheck": True, "localRedeploy": False}
+d["features"] = {"naseej": False, "workspaces": False, "playbook": False, "updateCheck": True, "localRedeploy": False, "realtimeVoice": False}
 json.dump(d, open(p, "w"), indent=2)
 open(p, "a").write("\n")
 PY
-  ok "features = {naseej:false, workspaces:false, playbook:false, updateCheck:true, localRedeploy:false}"
+  ok "features = {naseej:false, workspaces:false, playbook:false, updateCheck:true, localRedeploy:false, realtimeVoice:false}"
 else
   warn "settings.example.json missing in export — features not seeded"
 fi

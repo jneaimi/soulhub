@@ -243,7 +243,7 @@ describe('getReviewableRunForSubject', () => {
 		const { getReviewableRunForSubject } = await import('$lib/agents/runs.ts');
 		const fresh = createTestDb();
 		const now = Date.now();
-		const NON_SOUL_HUB_REPO = '/Users/jneaimi/claude-config';
+		const NON_SOUL_HUB_REPO = '/Users/jneaimi/.claude';
 
 		insertRun(fresh, {
 			runId: 'repo-bound',

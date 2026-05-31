@@ -145,8 +145,8 @@ export async function doctor(_args: Record<string, string | undefined>, opts: Ou
     notes: [],
   };
 
-  // Claude-config dead-symlink scan — out-of-band counterpart to the
-  // ~/claude-config pre-push gate (.githooks/pre-push). Catches dead
+  // ~/.claude dead-symlink scan — out-of-band counterpart to the
+  // ~/.claude pre-push gate (.githooks/pre-push). Catches dead
   // links between commits so you don't only discover them on push.
   // Note-only: never flips report.ok (the pre-push gate is enforcement).
   const configRoot = resolveClaudeConfigRoot();

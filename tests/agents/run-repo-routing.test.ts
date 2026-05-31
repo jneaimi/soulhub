@@ -97,7 +97,7 @@ describe('ADR-031 P1 — repo-aware routing', () => {
 
 	describe('repoDir resolution', () => {
 		test('run.repo set to a non-soul-hub absolute path → repoDir matches that path', async () => {
-			const NON_SH = '/Users/jneaimi/claude-config';
+			const NON_SH = '/Users/jneaimi/.claude';
 			const dir = await resolveRepoDir(
 				{ repo: NON_SH },
 				{ SOUL_HUB_REPO: '/Users/jneaimi/dev/soul-hub', cwd: '/Users/jneaimi/dev/soul-hub' },
@@ -136,8 +136,8 @@ describe('ADR-031 P1 — repo-aware routing', () => {
 		});
 
 		test('run.repo with leading ~ is expanded to absolute path', async () => {
-			const TILDE_PATH = '~/claude-config';
-			const EXPECTED = join(homedir(), 'claude-config');
+			const TILDE_PATH = '~/.claude';
+			const EXPECTED = join(homedir(), '.claude');
 			const dir = await resolveRepoDir(
 				{ repo: TILDE_PATH },
 				{ SOUL_HUB_REPO: '/Users/jneaimi/dev/soul-hub' },
@@ -154,7 +154,7 @@ describe('ADR-031 P1 — repo-aware routing', () => {
 		test('non-soul-hub repo round-trips through DB intact', async () => {
 			const { getReviewableRunForSubject } = await import('$lib/agents/runs.ts');
 			const db = createTestDb();
-			const REPO = '/Users/jneaimi/claude-config';
+			const REPO = '/Users/jneaimi/.claude';
 			const now = Date.now();
 
 			insertFinishedRun(db, {
@@ -203,13 +203,13 @@ describe('ADR-031 P1 — repo-aware routing', () => {
 				runId: 'new-run',
 				startedAt: now - 60_000,
 				subjectPath: SUBJECT,
-				repo: '/Users/jneaimi/claude-config',
+				repo: '/Users/jneaimi/.claude',
 			});
 
 			const run = getReviewableRunForSubject(SUBJECT, db);
 			assert.ok(run);
 			assert.equal(run.runId, 'new-run', 'newest run wins');
-			assert.equal(run.repo, '/Users/jneaimi/claude-config', 'newest repo returned');
+			assert.equal(run.repo, '/Users/jneaimi/.claude', 'newest repo returned');
 			db.close();
 		});
 	});

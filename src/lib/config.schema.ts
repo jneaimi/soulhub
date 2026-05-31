@@ -61,6 +61,13 @@ export const FeaturesSchema = z.object({
 	// benefits from the guard); the public export seeds it OFF (public installs
 	// don't use pm2 in the same way and have no local HEAD to track).
 	localRedeploy: z.boolean().default(true),
+	// ADR-020 (soul-hub-chat) — ElevenLabs realtime streaming STT for the
+	// chat-drawer mic (Orchestrator + PTY). Default ON for the operator (who
+	// has an ELEVENLABS_API_KEY and wants low-latency phone dictation); the
+	// public export seeds it OFF since it needs a paid key + a token-mint route.
+	// When OFF, the `/api/chat/web/scribe-token` route 404s and the mic falls
+	// back to the ADR-019 Gemini batch-upload path automatically.
+	realtimeVoice: z.boolean().default(true),
 });
 export type FeaturesConfig = z.infer<typeof FeaturesSchema>;
 

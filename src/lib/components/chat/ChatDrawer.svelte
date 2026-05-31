@@ -206,23 +206,10 @@
 	 *  Null until the first turn completes (nothing to show on a fresh conversation). */
 	let contextUsage = $state<WindowUsage | null>(null);
 
-	// ── Voice recording state (ADR-019) ────────────────────────────────────────
-	// Web Speech API — not in lib.dom.d.ts for TS 6.x; define the minimal surface
-	// we actually use so we get proper typing without an external @types package.
-	interface _WSRResultItem { transcript: string; }
-	interface _WSRResult { isFinal: boolean; [i: number]: _WSRResultItem; }
-	interface _WSRResultList { length: number; [i: number]: _WSRResult; }
-	interface _WSREvent extends Event { resultIndex: number; results: _WSRResultList; }
-	interface _WSRSpeechRecognition extends EventTarget {
-		lang: string;
-		continuous: boolean;
-		interimResults: boolean;
-		onresult: ((ev: _WSREvent) => void) | null;
-		onend:    (() => void) | null;
-		onerror:  (() => void) | null;
-		start(): void;
-		stop():  void;
-	}
+	// ── Voice input state (ADR-019 batch + ADR-020 realtime streaming) ──────────
+	// Primary path: ElevenLabs realtime STT (streaming, low-latency). Fallback:
+	// MediaRecorder → /api/chat/web/transcribe → Gemini batch (ADR-019). The old
+	// Web Speech tier was removed in ADR-020 (fragile, Chrome-bound, weak Arabic).
 
 	// Three mutually exclusive mic states visible to the template.
 	type VoiceMicState = 'idle' | 'recording' | 'transcribing' | 'error';
@@ -232,13 +219,15 @@
 	let micHint    = $state('');  // transient hint (e.g. "long clip" warning)
 
 	// Non-reactive internals — not exposed to the template.
-	let _mediaStream:   MediaStream             | null = null;
-	let _mediaRecorder: MediaRecorder           | null = null;
-	let _speechRecog:   _WSRSpeechRecognition   | null = null;
+	let _mediaStream:   MediaStream   | null = null;
+	let _mediaRecorder: MediaRecorder | null = null;
 	let _audioChunks:   BlobPart[] = [];
 	let _elapsedTimer:  ReturnType<typeof setInterval> | null = null;
-	let _speechText  = '';
-	let _speechDone  = false;
+
+	// ADR-020 realtime streaming handle + transcript accumulators.
+	let _voiceHandle:   { stop: () => void } | null = null;
+	let _voiceBase     = '';   // input text present before dictation began
+	let _committedText = '';   // accumulated committed segments this session
 
 	const MAX_RECORD_S = 60; // 60-second ceiling — matches WhatsApp inbound cap
 
@@ -246,34 +235,114 @@
 		if (_elapsedTimer !== null) { clearInterval(_elapsedTimer); _elapsedTimer = null; }
 	}
 
-	/** Stop the active mic session: timer, Web Speech, and MediaRecorder.
-	 *  MediaRecorder.stop() fires onstop, which handles the S3/S2 decision. */
+	/** Start the elapsed-seconds timer, enforcing the 60 s ceiling. */
+	function _startElapsedTimer() {
+		_elapsedTimer = setInterval(() => {
+			micElapsed++;
+			if (micElapsed >= MAX_RECORD_S) {
+				micHint = 'Long clips are split into multiple sends.';
+				_stopMicSession();
+			}
+		}, 1000);
+	}
+
+	/** Stop whichever capture path is active (realtime stream or MediaRecorder). */
 	function _stopMicSession() {
 		_stopElapsedTimer();
-		try { _speechRecog?.stop(); } catch { /* already stopped */ }
-		_speechRecog = null;
+		// ADR-020 realtime streaming path.
+		if (_voiceHandle) {
+			try { _voiceHandle.stop(); } catch { /* already closed */ }
+			_voiceHandle = null;
+			micState = 'idle';
+			return;
+		}
+		// ADR-019 batch path — MediaRecorder.stop() fires onstop → upload.
 		if (_mediaRecorder && _mediaRecorder.state !== 'inactive') {
-			_mediaRecorder.stop(); // triggers onstop → S3 vs S2 path
+			_mediaRecorder.stop();
 		}
 		_mediaRecorder = null;
 	}
 
-	/** Toggle the microphone: start on first click, stop on second. */
+	/** Toggle the microphone: start on first click, stop on second.
+	 *  Tries ADR-020 realtime streaming first; falls back to the ADR-019 batch
+	 *  upload when the realtime path is unavailable (flag off, no key, offline). */
 	async function toggleMic() {
 		if (micState === 'recording') {
 			_stopMicSession();
 			return;
 		}
 
-		// ── First click: start ────────────────────────────────────────────────
-		micError   = '';
-		micHint    = '';
-		micElapsed = 0;
-		_speechText = '';
-		_speechDone = false;
-		_audioChunks = [];
+		// ── First click: reset state ───────────────────────────────────────────
+		micError       = '';
+		micHint        = '';
+		micElapsed     = 0;
+		_audioChunks   = [];
+		_committedText = '';
+		_voiceBase     = input ? input.trim() + ' ' : '';
 
-		// Request microphone access.
+		// ── Acquire the mic *inside the tap gesture* (iOS/Android consent) ─────
+		// getUserMedia must be invoked synchronously within the user gesture, or
+		// iOS Safari silently denies it without ever prompting (the symptom: no
+		// permission dialog, no audio). Calling it here — before the token-fetch
+		// and SDK-import awaits — guarantees the consent dialog fires. Once the
+		// permission is granted it persists, so the realtime SDK (and the batch
+		// fallback) re-acquire the mic with no second prompt.
+		let _probe: MediaStream;
+		try {
+			_probe = await navigator.mediaDevices.getUserMedia({ audio: true });
+		} catch (err) {
+			const name = (err as { name?: string }).name;
+			micError = (name === 'NotAllowedError' || name === 'PermissionDeniedError')
+				? 'Microphone access denied. Enable it in your browser settings and reload.'
+				: `Could not access microphone: ${(err as Error).message ?? 'unknown error'}`;
+			micState = 'error';
+			return;
+		}
+		_probe.getTracks().forEach((t) => t.stop());
+
+		// ── Try realtime streaming (primary) ──────────────────────────────────
+		try {
+			const { startRealtimeStt } = await import('$lib/voice/realtime-stt');
+			const htmlLang =
+				(typeof document !== 'undefined' && document.documentElement.lang) || '';
+			let _heard = 0; // partial-transcript count — drives the live readout
+			micHint = 'connecting…';
+			_voiceHandle = await startRealtimeStt({
+				languageCode: htmlLang ? htmlLang.split('-')[0] : undefined,
+				onOpen: () => { micHint = 'connected…'; },
+				onSessionStarted: () => { micHint = 'listening — speak now'; },
+				onPartial: (t) => {
+					_heard++;
+					micHint = `listening · ${_heard} heard`;
+					input = (_voiceBase + _committedText + t).trim();
+				},
+				onCommitted: (t) => {
+					_committedText += t.trim() + ' ';
+					input = (_voiceBase + _committedText).trim();
+				},
+				onError: (msg) => {
+					micError  = msg;
+					micState  = 'error';
+					_stopMicSession();
+				},
+			});
+			micState = 'recording';
+			_startElapsedTimer();
+			return;
+		} catch (err) {
+			// Realtime unavailable — fall through to the batch path. The capture
+			// module only throws RealtimeSttUnavailableError before touching the
+			// mic, so a permission prompt has not yet been shown here.
+			console.warn('[voice] realtime unavailable, using batch fallback:', err);
+			_voiceHandle = null;
+		}
+
+		// ── Fallback: ADR-019 batch record → upload → Gemini ──────────────────
+		await _startBatchRecording();
+	}
+
+	/** ADR-019 batch path: record a clip, upload it on stop, transcribe via Gemini. */
+	async function _startBatchRecording() {
 		let stream: MediaStream;
 		try {
 			stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -289,59 +358,6 @@
 		}
 		_mediaStream = stream;
 
-		// ── S3: Start Web Speech API (fast path, opportunistic) ──────────────
-		// Feature-detect at runtime — never at module init (SSR guard).
-		type SpeechRecCtor = new () => _WSRSpeechRecognition;
-		const w = window as Window & {
-			SpeechRecognition?:       SpeechRecCtor;
-			webkitSpeechRecognition?: SpeechRecCtor;
-		};
-		const SpeechRecognitionAPI = w.SpeechRecognition ?? w.webkitSpeechRecognition;
-
-		if (SpeechRecognitionAPI) {
-			try {
-				const sr = new SpeechRecognitionAPI();
-				// Derive language hint from the page's <html lang> attribute (e.g.
-				// "ar" for Arabic operators); defaults to "en-US".
-				const htmlLang =
-					(typeof document !== 'undefined' && document.documentElement.lang)
-						? document.documentElement.lang
-						: 'en-US';
-				sr.lang           = htmlLang;
-				sr.continuous     = true;
-				sr.interimResults = true;
-
-				sr.onresult = (ev: _WSREvent) => {
-					let interim = '';
-					for (let i = ev.resultIndex; i < ev.results.length; i++) {
-						const seg = ev.results[i][0].transcript;
-						if (ev.results[i].isFinal) {
-							_speechText += seg;
-						} else {
-							interim += seg;
-						}
-					}
-					// Show live interim transcript while the operator speaks.
-					const live = (_speechText + interim).trim();
-					if (live) input = live;
-				};
-
-				sr.onend = () => { _speechDone = true; };
-				sr.onerror = () => {
-					// API error → mark done with empty text so the upload tier takes over.
-					_speechDone = true;
-					_speechText = '';
-				};
-
-				sr.start();
-				_speechRecog = sr;
-			} catch {
-				// Web Speech failed to start — silently fall through to upload tier.
-				_speechRecog = null;
-			}
-		}
-
-		// ── S2: Start MediaRecorder (universal / truth tier) ─────────────────
 		let recorder: MediaRecorder;
 		try {
 			const mimeType =
@@ -370,15 +386,6 @@
 			_mediaStream?.getTracks().forEach((t) => t.stop());
 			_mediaStream = null;
 
-			// ── S3 decision: did Web Speech succeed? ─────────────────────────
-			if (_speechDone && _speechText.trim()) {
-				// Web Speech produced clean text → no API spend, instant result.
-				input    = _speechText.trim();
-				micState = 'idle';
-				return;
-			}
-
-			// ── S2: upload the blob to the server transcription tier ──────────
 			if (_audioChunks.length === 0) {
 				micError = 'No audio captured — please try again.';
 				micState = 'error';
@@ -386,7 +393,6 @@
 			}
 
 			micState = 'transcribing';
-			input    = ''; // clear the live Web Speech interim text, if any
 
 			const blob     = new Blob(_audioChunks, { type: recorder.mimeType || 'audio/webm' });
 			const formData = new FormData();
@@ -410,7 +416,7 @@
 					return;
 				}
 
-				input    = text;
+				input    = (_voiceBase + text).trim();
 				micState = 'idle';
 			} catch (err) {
 				micError = `Network error: ${(err as Error).message ?? 'could not reach server'}`;
@@ -421,15 +427,7 @@
 		recorder.start(250); // 250 ms timeslice for low-latency chunks
 		_mediaRecorder = recorder;
 		micState       = 'recording';
-
-		// Elapsed timer — also enforces the 60-second ceiling.
-		_elapsedTimer = setInterval(() => {
-			micElapsed++;
-			if (micElapsed >= MAX_RECORD_S) {
-				micHint = 'Long clips are split into multiple sends.';
-				_stopMicSession();
-			}
-		}, 1000);
+		_startElapsedTimer();
 	}
 
 	// Resize drag
@@ -510,6 +508,10 @@
 			void loadTranscript();
 		}
 
+		// ADR-020 — pre-warm the realtime-STT SDK so the first mic tap has no
+		// dynamic-import latency (keeps iOS Safari's user-activation intact).
+		void import('$lib/voice/realtime-stt').then((m) => m.warmupRealtimeStt());
+
 		return () => window.removeEventListener('resize', computeMaxH);
 	});
 
@@ -517,9 +519,10 @@
 		// Clear all workbench poll timers to prevent memory leaks (ADR-007).
 		for (const handle of pollTimers.values()) clearInterval(handle);
 		pollTimers.clear();
-		// Clean up any active voice recording (ADR-019).
+		// Clean up any active voice capture (ADR-019 batch + ADR-020 realtime).
 		_stopElapsedTimer();
-		try { _speechRecog?.stop(); } catch { /* already stopped */ }
+		try { _voiceHandle?.stop(); } catch { /* already closed */ }
+		_voiceHandle = null;
 		if (_mediaRecorder && _mediaRecorder.state !== 'inactive') {
 			try { _mediaRecorder.stop(); } catch { /* already stopped */ }
 		}
@@ -1846,7 +1849,7 @@
 					{#if micState === 'recording'}
 						<div class="flex items-center gap-1.5 px-3 pb-1.5 text-[11px] text-red-400">
 							<span class="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse flex-shrink-0"></span>
-							<span>Recording… speak now, then click the stop button</span>
+							<span>{micHint || 'Recording… speak now, then tap stop'}</span>
 						</div>
 					{:else if micError}
 						<!-- Error chip with optional "enable mic in settings" link for permission errors -->
