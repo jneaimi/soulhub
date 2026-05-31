@@ -138,6 +138,10 @@ async function handleSmeAction(body: ActionBody): Promise<Response> {
 		);
 	}
 
+	// ADR-009 #2 — the brief routes to the project the post-call webhook resolved
+	// and stored in the durable record. Undefined → writeBrief uses its default.
+	const project = loadPending(sessionKey)?.project;
+
 	switch (action) {
 		case 'amend': {
 			const amendments = body.amendments;
@@ -171,7 +175,7 @@ async function handleSmeAction(body: ActionBody): Promise<Response> {
 			savePending(sessionKey, {
 				brief: patched,
 				transcript,
-				project: loadPending(sessionKey)?.project,
+				project,
 			});
 			return json({ ok: true, action, brief: patched });
 		}
@@ -188,7 +192,7 @@ async function handleSmeAction(body: ActionBody): Promise<Response> {
 				sme_confirmed_at: new Date().toISOString(),
 				sme_amendments_count: amendCount,
 			};
-			const briefPath = await writeBrief(sessionKey, stamped);
+			const briefPath = await writeBrief(sessionKey, stamped, project);
 			pendingPreview.delete(sessionKey);
 			pendingTranscript.delete(sessionKey);
 			pendingBriefPath.delete(sessionKey);
@@ -204,7 +208,7 @@ async function handleSmeAction(body: ActionBody): Promise<Response> {
 				sme_confirmed: false,
 				sme_confirmed_at: new Date().toISOString(),
 			};
-			const briefPath = await writeBrief(sessionKey, out);
+			const briefPath = await writeBrief(sessionKey, out, project);
 			pendingPreview.delete(sessionKey);
 			pendingTranscript.delete(sessionKey);
 			pendingBriefPath.delete(sessionKey);

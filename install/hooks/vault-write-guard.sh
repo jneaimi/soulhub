@@ -91,7 +91,7 @@ Fallback only if no soul verb fits — the /vault-write skill wrapper:
    ~/.claude/skills/vault-write/scripts/vault-write.sh --zone … --filename … --meta-json … --content …
 Or the API directly: POST http://localhost:2400/api/vault/notes (PUT /<path> to update).
 
-See ~/claude-config/rules/vault.md for the full rule.
+See ~/.claude/rules/vault.md for the full rule.
 EOF
 
 exit 2

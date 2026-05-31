@@ -114,9 +114,9 @@ function loadSymlinkAllowlist(configRoot: string): { entries: Set<string>; missi
   return { entries, missing: false };
 }
 
-// Resolve ~/.claude to its real path. The expected layout is ~/.claude →
-// ~/claude-config, but defensive callers can pass any directory as override
-// (kept simple — no env-var support until someone asks).
+// Resolve ~/.claude to its real path. Post-ADR-024 ~/.claude IS the git repo
+// (the symlink to ~/claude-config was collapsed); realpathSync still resolves
+// it correctly whether it's a real dir or a legacy symlink on older machines.
 function resolveClaudeConfigRoot(): string | null {
   const candidate = join(homedir(), '.claude');
   if (!existsSync(candidate)) return null;

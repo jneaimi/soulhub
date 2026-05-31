@@ -22,8 +22,9 @@ import type { Brief } from '$lib/evaluate-session/index.js';
 import { runAllGates } from '$lib/evaluate-session/analyst-gates.js';
 import { savePending } from '$lib/evaluate-session/preview-store.js';
 
-const BRIEF_ZONE = 'projects/coffee-ops-sandiego/sessions';
-const PROJECT = 'coffee-ops-sandiego';
+/** Fallback when the conversation carries no validated project (see
+ *  resolveProject). The brief-zone is always `projects/<project>/sessions`. */
+const DEFAULT_PROJECT = 'coffee-ops-sandiego';
 
 interface ElevenLabsTurn {
 	role: 'agent' | 'user';
@@ -42,7 +43,33 @@ interface ElevenLabsWebhook {
 		transcript: ElevenLabsTurn[];
 		analysis?: Record<string, unknown>;
 		metadata?: Record<string, unknown>;
+		// ADR-009 #2 — the app passes `dynamicVariables: { project }` at
+		// startSession; ElevenLabs echoes them back here. This is the ONLY
+		// channel by which the project reaches soul-hub (it's off the start
+		// path). Treated as untrusted input — validated by resolveProject.
+		conversation_initiation_client_data?: {
+			dynamic_variables?: Record<string, unknown>;
+		};
 	};
+}
+
+/** Resolve the brief's target project from the webhook's echoed dynamic
+ *  variables. SECURITY: this is untrusted, conversation-supplied input — it
+ *  MUST NOT be allowed to steer the vault write path (path-injection guard,
+ *  see index.ts). Two gates: (1) strict slug regex, (2) the project must
+ *  already exist in the vault (`projects/<slug>/index.md`). Anything that
+ *  fails either gate falls back to DEFAULT_PROJECT. New customers are onboarded
+ *  by provisioning the project in the vault first — never by the webhook. */
+function resolveProject(
+	engine: ReturnType<typeof getVaultEngine>,
+	data: ElevenLabsWebhook['data'],
+): string {
+	const raw = data.conversation_initiation_client_data?.dynamic_variables?.project;
+	if (typeof raw !== 'string') return DEFAULT_PROJECT;
+	const slug = raw.trim().toLowerCase();
+	if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) return DEFAULT_PROJECT;
+	if (!engine || !engine.getNote(`projects/${slug}/index.md`)) return DEFAULT_PROJECT;
+	return slug;
 }
 
 /** Resolve the HMAC key bytes from the env-supplied secret.
@@ -170,16 +197,20 @@ export const POST: RequestHandler = async ({ request }) => {
 
 	// Persist verbatim transcript (satisfies ADR-005)
 	const engine = getVaultEngine();
+	// ADR-009 #2 — route this brief to the customer's project. Validated against
+	// the project allow-list; falls back to DEFAULT_PROJECT for unknown/missing.
+	const project = resolveProject(engine, payload.data);
+	const briefZone = `projects/${project}/sessions`;
 	if (engine && transcript.length > 0) {
 		const req: CreateNoteRequest = {
-			zone: BRIEF_ZONE,
+			zone: briefZone,
 			filename: `${stem}.transcript.md`,
 			meta: {
 				type: 'transcript',
 				status: 'raw',
 				created: date,
-				project: PROJECT,
-				tags: ['coffee-ops-sandiego', 'evaluate-session', 'voice-transcript', 'adr-008'],
+				project,
+				tags: [project, 'evaluate-session', 'voice-transcript', 'adr-008'],
 				source_agent: 'elevenlabs-agent',
 				source_context: `ElevenLabs conversation ${conversation_id}`,
 			} as VaultMeta,
@@ -250,10 +281,10 @@ export const POST: RequestHandler = async ({ request }) => {
 					savePending(conversation_id, {
 						brief,
 						transcript: transcript.map((t) => ({ role: t.role, message: t.message })),
-						project: PROJECT,
+						project,
 					});
 					// Persist the human-facing brief note to the vault.
-					await writeBrief(conversation_id, brief);
+					await writeBrief(conversation_id, brief, project);
 				}
 			} catch {
 				// Non-fatal: transcript is already persisted; brief write can be retried

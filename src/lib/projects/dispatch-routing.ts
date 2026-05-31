@@ -59,13 +59,17 @@ export interface SurfaceInfo {
 	declared?: string;
 }
 
-/** Known out-of-worktree surfaces → the git repo that owns them. */
+/** Known out-of-worktree surfaces → the git repo that owns them.
+ *  Per ADR-024 the ~/.claude symlink was collapsed: ~/.claude IS now the
+ *  git repo (formerly ~/claude-config), Soul-Hub-managed + backed up. The
+ *  'claude-config' / 'agent-config' / 'skill-config' surface labels are kept
+ *  as aliases for older ADR frontmatter, all resolving to the live store. */
 const SURFACE_REPOS: Record<string, string> = {
-	'agent-config': '~/claude-config',
-	'skill-config': '~/claude-config',
-	'~/.claude/agents': '~/claude-config',
-	'~/.claude/skills': '~/claude-config',
-	'claude-config': '~/claude-config',
+	'agent-config': '~/.claude',
+	'skill-config': '~/.claude',
+	'~/.claude/agents': '~/.claude',
+	'~/.claude/skills': '~/.claude',
+	'claude-config': '~/.claude',
 };
 
 /** ADR-012 P3 — classify an artifact's implementation surface from its

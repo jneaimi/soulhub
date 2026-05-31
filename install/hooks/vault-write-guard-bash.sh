@@ -146,7 +146,7 @@ Exempt subdirs (hook passes these through): ~/vault/.vault/, .git/,
 .gitnexus/, .obsidian/. If your write targets one of those, re-check
 the literal path in the command.
 
-See ~/claude-config/rules/vault.md and ADR-046 for the full rule.
+See ~/.claude/rules/vault.md and ADR-046 for the full rule.
 EOF
 
 exit 2

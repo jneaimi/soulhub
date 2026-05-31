@@ -27,12 +27,12 @@ describe('classifySurface', () => {
 		assert.equal(classifySurface({ surface: 'Soul-Hub' }).kind, 'soul-hub'); // case-insensitive
 	});
 
-	test('global agent/skill config → config-repo with claude-config repo', async () => {
+	test('global agent/skill config → config-repo with ~/.claude repo (ADR-024)', async () => {
 		const { classifySurface } = await import('$lib/projects/dispatch-routing.ts');
 		for (const s of ['~/.claude/agents', '~/.claude/skills', 'agent-config', 'skill-config', 'claude-config']) {
 			const r = classifySurface({ surface: s });
 			assert.equal(r.kind, 'config-repo', `${s} → config-repo`);
-			assert.equal(r.repo, '~/claude-config', `${s} → claude-config repo`);
+			assert.equal(r.repo, '~/.claude', `${s} → ~/.claude repo (collapsed per ADR-024)`);
 			assert.equal(r.declared, s);
 		}
 	});
@@ -41,7 +41,7 @@ describe('classifySurface', () => {
 		const { classifySurface } = await import('$lib/projects/dispatch-routing.ts');
 		const r = classifySurface({ surface: '~/.CLAUDE/Agents' });
 		assert.equal(r.kind, 'config-repo');
-		assert.equal(r.repo, '~/claude-config');
+		assert.equal(r.repo, '~/.claude');
 	});
 
 	test('an unknown declared surface → external (no known repo)', async () => {

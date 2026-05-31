@@ -19,9 +19,13 @@ import type { CreateNoteRequest, VaultMeta } from '$lib/vault/types.js';
 
 /** Single source of truth for the scenario script (the IP). */
 const SCENARIO_PATH = 'projects/coffee-ops-sandiego/2026-05-26-evaluate-scenario.md';
-/** Server-hardcoded write target — NOT derived from client/conversation input. */
-const BRIEF_ZONE = 'projects/coffee-ops-sandiego/sessions';
-const PROJECT = 'coffee-ops-sandiego';
+/** Fallback project when the session carries no validated project (legacy
+ *  text-turn path, or a webhook whose dynamic-variable project failed the
+ *  allow-list). The brief-zone is ALWAYS `projects/<project>/sessions` where
+ *  `<project>` is a validated slug — never raw conversation input. The
+ *  caller (post-call route) is responsible for validation; writeBrief trusts
+ *  the slug it is handed. */
+const DEFAULT_PROJECT = 'coffee-ops-sandiego';
 const MAX_TOKENS = 1200;
 const BRIEF_MARKER = '<<<BRIEF>>>';
 
@@ -126,7 +130,7 @@ function val(s: string | undefined): string {
 	return t.length > 0 ? t : '_(not captured in session)_';
 }
 
-function buildBriefMarkdown(date: string, sessionKey: string, brief: Brief): string {
+function buildBriefMarkdown(date: string, sessionKey: string, brief: Brief, project: string): string {
 	const title = (brief.title ?? '').trim() || 'Untitled use-case';
 	const roi = `${val(brief.roi_baseline)} → ${val(brief.roi_target)}`;
 	const verdict = (brief.verdict ?? '').trim() || 'back-to-draft';
@@ -137,7 +141,7 @@ function buildBriefMarkdown(date: string, sessionKey: string, brief: Brief): str
 		'',
 		`- **SME / tester:** ${sessionKey}`,
 		`- **Session date:** ${date}`,
-		'- **Scenario:** `[[coffee-ops-sandiego/2026-05-26-evaluate-scenario]]` (draft v0.1)',
+		`- **Project:** [[${project}/index]] — scenario owned by the Evaluate Session app (ADR-011)`,
 		'- **Produced by:** Evaluate Session app (automated capture from the live session)',
 		'',
 		'## Output',
@@ -159,9 +163,17 @@ function buildBriefMarkdown(date: string, sessionKey: string, brief: Brief): str
 	].join('\n');
 }
 
-export async function writeBrief(sessionKey: string, brief: Brief): Promise<string | null> {
+export async function writeBrief(
+	sessionKey: string,
+	brief: Brief,
+	project: string = DEFAULT_PROJECT,
+): Promise<string | null> {
 	const engine = getVaultEngine();
 	if (!engine) return null;
+	// Brief-zone is derived from the (already-validated) project slug. The
+	// post-call route validates against the project allow-list before handing
+	// the slug here; the legacy text path uses DEFAULT_PROJECT.
+	const briefZone = `projects/${project}/sessions`;
 	const now = new Date();
 	const date = now.toISOString().slice(0, 10);
 	const hhmm = now.toTimeString().slice(0, 5).replace(':', '');
@@ -188,15 +200,15 @@ export async function writeBrief(sessionKey: string, brief: Brief): Promise<stri
 		type: 'output',
 		status: 'proposed',
 		created: date,
-		project: PROJECT,
+		project,
 		tags: [
-			'coffee-ops-sandiego',
+			project,
 			'sme-led-ai-adoption',
 			'evaluate-session',
 			'use-case-brief',
 			verdictTag,
 		],
-		relates_to: '[[coffee-ops-sandiego/2026-05-26-evaluate-scenario]]',
+		relates_to: `[[${project}/index]]`,
 		source_agent: 'evaluate-session-app',
 		source_context: `Evaluate session brief for "${sessionKey}" (${date})`,
 	};
@@ -204,7 +216,7 @@ export async function writeBrief(sessionKey: string, brief: Brief): Promise<stri
 	if (typeof stamp.sme_confirmed_at === 'string') meta.sme_confirmed_at = stamp.sme_confirmed_at;
 	if (typeof stamp.sme_amendments_count === 'number') meta.sme_amendments_count = stamp.sme_amendments_count;
 
-	const content = buildBriefMarkdown(date, sessionKey, brief);
+	const content = buildBriefMarkdown(date, sessionKey, brief, project);
 	const audit = { actor: 'evaluate-session-app', actorContext: `session:${sessionKey}` };
 
 	// Update-or-create: the post-call webhook writes the analyst's initial
@@ -220,14 +232,14 @@ export async function writeBrief(sessionKey: string, brief: Brief): Promise<stri
 	}
 
 	const req: CreateNoteRequest = {
-		zone: BRIEF_ZONE,
+		zone: briefZone,
 		filename,
 		meta: meta as VaultMeta,
 		content,
 	};
 	const res = await engine.createNote(req, audit);
 	if ('success' in res && res.success === false) return null;
-	const path = 'path' in res && typeof res.path === 'string' ? res.path : `${BRIEF_ZONE}/${filename}`;
+	const path = 'path' in res && typeof res.path === 'string' ? res.path : `${briefZone}/${filename}`;
 	pendingBriefPath.set(sessionKey, path);
 	return path;
 }

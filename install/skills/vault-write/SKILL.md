@@ -113,7 +113,7 @@ ADRs (`projects/<slug>/adr-NNN-*.md`) carry extra fields beyond the global `type
 - **`assignee:`** — agent slug (e.g. `soul-hub-implementer`, `developer`, `architect`). Optional; if absent, `soul adr accept` resolves via the routing matrix using `work_type` + project `repo:` binding.
 - **`parent_project:`** — wikilink to the parent project (e.g. `'[[soul-hub|soul-hub]]'`). Required per ADR-038 for graph navigation. Must be quoted (YAML wikilink rule).
 - **`falsifier_date:`** — `YYYY-MM-DD`. Falsifier validation deadline. Renders in the workbench as a deadline chip.
-- **`shipped_phases:`** — array of phase IDs (e.g. `[P1]`). For multi-phase ADRs that ship phase-by-phase; `status:` stays `accepted` until all phases ship. Convention documented in `~/claude-config/rules/vault.md`.
+- **`shipped_phases:`** — array of phase IDs (e.g. `[P1]`). For multi-phase ADRs that ship phase-by-phase; `status:` stays `accepted` until all phases ship. Convention documented in `~/.claude/rules/vault.md`.
 - **`repo:`** (on the project's `index.md`, NOT on ADRs) — absolute path to the project's git repo (e.g. `~/dev/soul-hub`). Inherited by every ADR in the project; lets the routing matrix bind `work_type: coding` ADRs to the right implementer agent.
 
 Example ADR frontmatter using all the new fields:

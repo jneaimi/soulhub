@@ -2,7 +2,7 @@
 // Soul Hub health check. Cross-platform. Read-only.
 // Run after bootstrap, or any time something feels off.
 
-import { existsSync, readFileSync, accessSync, constants } from 'node:fs';
+import { existsSync, readFileSync, accessSync, constants, lstatSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { resolve, join } from 'node:path';
 import { execSync } from 'node:child_process';
@@ -216,6 +216,46 @@ try {
       add('vault git', 'warn', 'repo initialized but no commits — set git config user.{name,email} and re-run setup');
     }
   }
+}
+
+// ── 10.5 ~/.claude store collapsed + git-backed (ADR-024) ─────
+// ADR-024 collapsed the ~/.claude symlink so ~/.claude IS a git repo
+// (Soul-Hub-managed; backed up nightly by claude-config-backup-daily). On a
+// fresh/secondary install that has not run the collapse, ~/.claude may still
+// be a symlink — warn with the remedy, do not fail.
+{
+  const claudeDir = join(HOME, '.claude');
+  let stat = null;
+  try {
+    stat = lstatSync(claudeDir);
+  } catch {
+    stat = null;
+  }
+  if (!stat) {
+    add('~/.claude store', 'warn', '~/.claude missing');
+  } else if (stat.isSymbolicLink()) {
+    add('~/.claude store', 'warn', 'still a symlink — run: bash scripts/migrate-claude-config-collapse.sh (ADR-024)');
+  } else if (!existsSync(join(claudeDir, '.git'))) {
+    add('~/.claude store', 'warn', 'real dir but no .git — config not under Soul Hub git backup');
+  } else {
+    try {
+      const sha = execSync(`git -C "${claudeDir}" rev-parse HEAD`, {
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).toString().trim();
+      add('~/.claude store', 'ok', `collapsed git store, HEAD ${sha.slice(0, 7)}`);
+    } catch {
+      add('~/.claude store', 'warn', 'git repo but no commits');
+    }
+  }
+}
+
+// ── 11.6 claude-config-backup-daily scheduler task (ADR-024) ──
+// Nightly ~/.claude snapshot + push — Soul Hub's backup authority for the
+// collapsed config store. Operator/primary-machine; absent is fine elsewhere.
+{
+  const tasks = settings?.scheduler?.tasks ?? [];
+  const found = Array.isArray(tasks) && tasks.some((t) => t?.id === 'claude-config-backup-daily');
+  add('claude-config-backup task', 'ok', found ? 'scheduler task registered' : 'not configured — opt-in for the primary machine (ADR-024)');
 }
 
 // ── 11. vault-backup-daily scheduler task (ADR-019 / ADR-012 Fix 1) ─
