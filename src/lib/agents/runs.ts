@@ -63,6 +63,13 @@ export interface AgentRunInput {
 	 *  null = legacy/soul-hub (backward compatible). Written by the dispatcher
 	 *  using the resolved `effectiveRepo` (project repo ?? agent.repo). */
 	repo?: string;
+	/** ADR-020 P1 — phase tag for this run.  Conventional values: 'initial' |
+	 *  'P1' | 'P2' | 'finish' | 'falsifier' | 'iterate-N'. */
+	phase?: string;
+	/** ADR-020 P4 — JSON-serialised scope snapshot ({allowed_paths,
+	 *  forbidden_paths}). Mirrors the value the start row would have written;
+	 *  the hook reads this back by claude_session_id. */
+	scopeJson?: string;
 }
 
 export interface AgentRunRow {
@@ -96,6 +103,12 @@ export interface AgentRunRow {
 	 *  null = legacy/soul-hub. ship-merge and review-handoff fall back to
 	 *  `SOUL_HUB_REPO ?? cwd` when null. */
 	repo: string | null;
+	/** ADR-020 P1 — phase tag for this run (descriptive, not validated).
+	 *  Conventional values: 'initial' | 'P1' | 'P2' | 'finish' | 'falsifier' |
+	 *  'iterate-N'. null = pre-migration runs, treated as 'initial' at read time.
+	 *  The drawer's per-ADR run-history strip groups by phase + sums cumulative
+	 *  cost. Foundation for ADR-020 P2 (resume UX) and P3 (cumulative budget). */
+	phase: string | null;
 }
 
 export interface AgentLifetimeStats {
@@ -130,7 +143,8 @@ const SELECT_COLS = `
 	claude_session_id AS claudeSessionId,
 	subject_path    AS subjectPath,
 	handback        AS handback,
-	repo            AS repo
+	repo            AS repo,
+	phase           AS phase
 `;
 
 function db(): Database.Database {
@@ -153,8 +167,8 @@ export function recordAgentRun(input: AgentRunInput): number {
 				task_spec, source_message, jid,
 				started_at, finished_at, duration_ms, status,
 				cost_usd, num_turns, result_excerpt, error_message, claude_session_id,
-				handback, repo
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				handback, repo, phase, scope_json
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		)
 		.run(
 			input.runId,
@@ -179,6 +193,11 @@ export function recordAgentRun(input: AgentRunInput): number {
 			input.handback ?? null,
 			// ADR-031 P1 — persist the run's repo; null = legacy/soul-hub.
 			input.repo ?? null,
+			// ADR-020 P1 — phase tag; null = pre-migration / un-tagged, treated
+			// as 'initial' at read time.
+			input.phase ?? null,
+			// ADR-020 P4 — scope snapshot; null = hook bypass (no enforcement).
+			input.scopeJson ?? null,
 		);
 	return Number(result.lastInsertRowid);
 }
@@ -202,6 +221,17 @@ export interface AgentRunStartInput {
 	 *  null = legacy/soul-hub (backward compatible). Written at dispatch-start
 	 *  so review-handoff and ship-merge can route git to the right repo. */
 	repo?: string;
+	/** ADR-020 P1 — phase tag for this run.  Conventional values: 'initial' |
+	 *  'P1' | 'P2' | 'finish' | 'falsifier' | 'iterate-N'.  Descriptive, not
+	 *  validated; the operator/dispatcher sets it.  Absent → null in DB →
+	 *  treated as 'initial' at read time. */
+	phase?: string;
+	/** ADR-020 P4 — JSON-serialised `{ allowed_paths, forbidden_paths }`
+	 *  snapshot from the ADR's frontmatter (or `opts.scope` override). The
+	 *  dispatch-scope-guard.sh PreToolUse hook reads this back by
+	 *  claude_session_id to refuse out-of-scope writes. null = no enforcement
+	 *  (legacy runs or ADRs without a `scope:` block). */
+	scopeJson?: string;
 }
 
 /** ADR-002 Layer 1 — insert a `running` row the moment a dispatch starts, so
@@ -213,8 +243,8 @@ export function startAgentRun(input: AgentRunStartInput): number {
 			`INSERT INTO agent_runs (
 				run_id, agent_id, backend, model, provider, mode,
 				task_spec, source_message, jid,
-				started_at, status, subject_path, repo
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)`,
+				started_at, status, subject_path, repo, phase, scope_json
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)`,
 		)
 		.run(
 			input.runId,
@@ -231,8 +261,102 @@ export function startAgentRun(input: AgentRunStartInput): number {
 			// ADR-031 P1 — persist repo at run start so review-handoff can read it
 			// even if the process crashes before finishAgentRun.
 			input.repo ?? null,
+			// ADR-020 P1 — phase tag at run start; null when caller doesn't set
+			// it (legacy/un-tagged dispatches), treated as 'initial' at read time.
+			input.phase ?? null,
+			// ADR-020 P4 — scope_json snapshot at run start; null = hook bypass
+			// (no enforcement). Hook joins on claude_session_id once the dispatcher
+			// has set it via updateRunSessionId.
+			input.scopeJson ?? null,
 		);
 	return Number(result.lastInsertRowid);
+}
+
+/** ADR-020 P1 — auto-derive a phase tag when the caller doesn't supply one.
+ *  Looks at prior finished runs for the same `subjectPath`:
+ *    - no priors             → 'initial'
+ *    - has any prior success → 'follow-up'   (post-ship continuation)
+ *    - only failures         → 'retry-N'     (N = prior failures + 1)
+ *  Returns null when `subjectPath` is absent (non-artifact dispatch — no ADR
+ *  to group by). Caller-supplied `opts.phase` always wins; this is the fallback
+ *  so the column populates even when the dispatcher call site forgot to label.
+ *
+ *  Closes the dark-column gap surfaced 2026-05-29: schema + persistence existed
+ *  but only `bump-continue` was injecting a value, so `agent_runs.phase` was
+ *  NULL for every chat / scheduler / hygiene / orchestrator dispatch, defeating
+ *  the workbench drawer's per-phase grouping and blocking ADR-020 P3's
+ *  cumulative-budget aggregation. */
+const SUCCESS_STATUSES_FOR_PHASE = new Set(['success', 'goal_achieved']);
+const FAILURE_STATUSES_FOR_PHASE = new Set([
+	'error',
+	'timeout',
+	'cancelled',
+	'interrupted',
+	'budget-exceeded',
+]);
+
+export function derivePhase(subjectPath: string | undefined | null): string | null {
+	if (!subjectPath) return null;
+	const priors = db()
+		.prepare(
+			`SELECT status FROM agent_runs
+			 WHERE subject_path = ? AND finished_at IS NOT NULL`,
+		)
+		.all(subjectPath) as Array<{ status: string }>;
+	if (priors.length === 0) return 'initial';
+	if (priors.some((p) => SUCCESS_STATUSES_FOR_PHASE.has(p.status))) return 'follow-up';
+	const failures = priors.filter((p) => FAILURE_STATUSES_FOR_PHASE.has(p.status)).length;
+	if (failures > 0) return `retry-${failures + 1}`;
+	return 'initial';
+}
+
+/** ADR-020 P3 — cumulative `cost_usd` across all finished runs of one
+ *  vault artifact. Drives the dispatcher's per-ADR budget gate: a fresh
+ *  dispatch refuses when `cumulativeAdrSpend(subjectPath) +
+ *  agent.budget.max_usd > dispatch_budget_usd`.
+ *
+ *  Excludes:
+ *   - In-flight rows (`finished_at IS NULL`) — they're not terminal; ADR-022 D3
+ *     already refuses concurrent dispatches so they can't double-count anyway.
+ *   - `status = 'error'` runs — bug fix #61 (2026-05-29). The premise: if a run
+ *     ended in `error` (PTY crash, stall, infra fault, operator-cancelled mid-
+ *     run via the error-tagged exit), the operator's budget was wasted by a
+ *     fault, not consumed by productive work. Counting it against the cap
+ *     punishes the operator twice — first the wasted spend, then headroom for
+ *     a fresh attempt. The other terminal statuses (`success`, `goal_achieved`,
+ *     `budget-exceeded`, `cancelled`, `interrupted`, `awaiting-*`) DO count
+ *     because the work either succeeded, partial-shipped, or was an explicit
+ *     operator/budget choice — the spend was the operator's call.
+ *
+ *  Returns 0 when no qualifying terminal runs exist or `subjectPath` is absent. */
+export function cumulativeAdrSpend(subjectPath: string | undefined | null): number {
+	if (!subjectPath) return 0;
+	const row = db()
+		.prepare(
+			`SELECT COALESCE(SUM(cost_usd), 0) AS total
+			 FROM agent_runs
+			 WHERE subject_path = ?
+			   AND finished_at IS NOT NULL
+			   AND status != 'error'`,
+		)
+		.get(subjectPath) as { total: number };
+	return Number(row?.total ?? 0);
+}
+
+/** ADR-020 P4 — stamp `claude_session_id` on the running row immediately at
+ *  dispatch start (not just at finish, where it lands via
+ *  `finishAgentRun`'s COALESCE). The dispatch-scope-guard.sh PreToolUse hook
+ *  joins `agent_runs ON claude_session_id` to look up `scope_json`, so it
+ *  needs a real value mid-run, not NULL.
+ *
+ *  Best-effort: no-op when `claudeSessionId` is falsy (other backends may not
+ *  surface it at start). Returns rows-updated for logging. */
+export function updateRunSessionId(runId: string, claudeSessionId: string | undefined | null): number {
+	if (!claudeSessionId) return 0;
+	const res = db()
+		.prepare(`UPDATE agent_runs SET claude_session_id = ? WHERE run_id = ? AND claude_session_id IS NULL`)
+		.run(claudeSessionId, runId);
+	return Number(res.changes);
 }
 
 /** projects-graph ADR-018 S2b — vault paths with an in-flight (unfinished)
@@ -541,6 +665,83 @@ export function getAgentRun(runId: string): AgentRunRow | null {
 		.prepare(`SELECT ${SELECT_COLS} FROM agent_runs WHERE run_id = ? LIMIT 1`)
 		.get(runId);
 	return (row as AgentRunRow) ?? null;
+}
+
+/** CLI helper — list recent runs across all agents with optional filters.
+ *  Powers `soul run list [--status X] [--subject-path Y] [--limit N]`,
+ *  eliminating the recurring `sqlite3 ~/.soul-hub/data/ops/ops.db` escape
+ *  hatch operators reached for tonight.  Read-only; newest-first.
+ *  Limit is bounded [1, 500] like `listAgentRuns`. */
+export function listRecentRuns(opts: {
+	status?: string;
+	subjectPath?: string;
+	agentId?: string;
+	limit?: number;
+} = {}): AgentRunRow[] {
+	const limit = Math.min(Math.max(opts.limit ?? 50, 1), 500);
+	const where: string[] = [];
+	const args: unknown[] = [];
+	if (opts.status) {
+		where.push('status = ?');
+		args.push(opts.status);
+	}
+	if (opts.subjectPath) {
+		where.push('subject_path = ?');
+		args.push(opts.subjectPath);
+	}
+	if (opts.agentId) {
+		where.push('agent_id = ?');
+		args.push(opts.agentId);
+	}
+	const whereClause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+	args.push(limit);
+	return db()
+		.prepare(
+			`SELECT ${SELECT_COLS}
+			FROM agent_runs
+			${whereClause}
+			ORDER BY started_at DESC
+			LIMIT ?`,
+		)
+		.all(...args) as AgentRunRow[];
+}
+
+/** ADR-020 P1 — per-ADR run history.
+ *
+ *  Returns all runs for a given vault subject_path ordered oldest-first
+ *  (so the drawer renders them as a timeline), plus a cumulative cost
+ *  total across all runs.  Powers the drawer's "Run history" strip.
+ *
+ *  A run's `phase` is descriptive (not validated).  Conventional values:
+ *    'initial' | 'P1' | 'P2' | 'finish' | 'falsifier' | 'iterate' | 'iterate-N'
+ *  Null `phase` (pre-migration runs) reads as 'initial' at the UI layer.
+ *
+ *  @param subjectPath  Vault-relative path of the artifact, e.g.
+ *                      `projects/soul-hub-agents/adr-011-...md`.  Returns an
+ *                      empty history when no runs exist for it.
+ *  @returns            `{ runs: AgentRunRow[]; cumulativeCostUsd: number }`.
+ */
+export interface AdrRunHistory {
+	runs: AgentRunRow[];
+	cumulativeCostUsd: number;
+}
+
+export function getAdrRunHistory(
+	subjectPath: string,
+	_overrideDb?: Database.Database,
+): AdrRunHistory {
+	if (!subjectPath) return { runs: [], cumulativeCostUsd: 0 };
+	const database = _overrideDb ?? db();
+	const rows = database
+		.prepare(
+			`SELECT ${SELECT_COLS}
+			FROM agent_runs
+			WHERE subject_path = ?
+			ORDER BY started_at ASC`,
+		)
+		.all(subjectPath) as AgentRunRow[];
+	const cumulativeCostUsd = rows.reduce((sum, r) => sum + (r.costUsd || 0), 0);
+	return { runs: rows, cumulativeCostUsd };
 }
 
 /** ADR-007 — open paused runs awaiting a budget decision, newest-first. The

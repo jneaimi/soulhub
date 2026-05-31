@@ -13,7 +13,8 @@
 	import { onMount, untrack } from 'svelte';
 	import RenderedMarkdown from '../RenderedMarkdown.svelte';
 	import DecisionActions from './DecisionActions.svelte';
-	import { resolveAgentForWork, clusterFromTags, classifySurface } from '$lib/projects/dispatch-routing.js';
+	import { resolveAgentForWork, clusterFromTags, classifySurface, mergeActivePhaseRouting } from '$lib/projects/dispatch-routing.js';
+	import type { PhaseRouting } from '$lib/projects/dispatch-routing.js';
 	import { parseHandback, handbackGatesGreen, type ParsedHandback } from '$lib/agents/handback.js';
 
 	interface NoteLink {
@@ -89,6 +90,14 @@
 	let dispatchDoneNote = $state<string | null>(null);
 	let mutationError = $state('');
 
+	// ADR-042 D3 — "Continue with <phase>" dispatch state.
+	let continuingPhase = $state<string | null>(null);
+
+	// ADR-043 P2 — manual phase ship state (Decision §3 human-phase escape).
+	let markingPhaseShipped = $state(false);
+	let markPhaseShippedError = $state('');
+	let markPhaseReason = $state('');
+
 	// projects-graph ADR-024 D2 — "Send back to AI" iterate loop state.
 	// The affordance lives inside the D1 review card; it collapses until
 	// the operator clicks "↩ Send back to AI…".
@@ -105,6 +114,37 @@
 	let implementerSessionId = $state<string | null>(null);
 	let implementerParseError = $state<string | null>(null);
 
+	// ADR-020 P1 — per-ADR run history strip.  Populated on note-load + after
+	// any dispatch completes.  Shows every agent_run for this artifact's
+	// subject_path with phase tag / status / cost / commit, plus a cumulative
+	// cost summed across all runs.  Foundation for ADR-020 P2 (resume) and
+	// P3 (cumulative budget gate) to compose on top.
+	type AdrRunHistoryItem = {
+		runId: string;
+		agentId: string;
+		status: string;
+		phase: string | null;
+		costUsd: number;
+		startedAt: number;
+		finishedAt: number | null;
+		handback: string | null;
+	};
+	let runHistory = $state<AdrRunHistoryItem[]>([]);
+	let runHistoryCumulativeUsd = $state(0);
+
+	// ADR-044 P2-followup — lint findings for the loaded note.  Fetched in
+	// `load()` via POST /api/vault/adr-lint; populates a chip + an inline
+	// findings panel so operators see misroute-class issues before clicking
+	// Dispatch.  Null = not yet fetched / not applicable; [] = clean; non-empty
+	// = findings (high-severity blocks ship + dispatch chokepoint anyway).
+	type LintFinding = { rule: string; severity: 'high' | 'medium' | 'low'; message: string };
+	let lintFindings = $state<LintFinding[] | null>(null);
+	let lintLoading = $state(false);
+	let lintFindingsExpanded = $state(false);
+	const lintHighCount = $derived(
+		(lintFindings ?? []).filter((f) => f.severity === 'high').length,
+	);
+
 	// projects-graph ADR-024 D4 — blocker status cache.
 	// Keyed by resolved vault path; value is the blocker's status string or
 	// null if unreachable. Undefined (key missing) means "not yet fetched".
@@ -118,6 +158,26 @@
 	const status = $derived(note ? String(note.meta.status ?? '').toLowerCase() : '');
 	const isProposed = $derived(status === 'proposed');
 	const isAccepted = $derived(status === 'accepted');
+
+	// ADR-042 D2/D3 — phase-tracking derived state.
+	/** Ordered phase IDs from frontmatter, or empty array when absent. */
+	const phases = $derived<string[]>(
+		Array.isArray(note?.meta.phases)
+			? (note!.meta.phases as unknown[]).filter((p): p is string => typeof p === 'string')
+			: [],
+	);
+	/** Set of shipped phase IDs. */
+	const shippedPhasesSet = $derived<Set<string>>(
+		new Set(
+			Array.isArray(note?.meta.shipped_phases)
+				? (note!.meta.shipped_phases as unknown[]).filter((p): p is string => typeof p === 'string')
+				: [],
+		),
+	);
+	/** Active phase: first element of `phases` not yet shipped. Null when all done or no phases. */
+	const activePhaseName = $derived<string | null>(
+		phases.find((p) => !shippedPhasesSet.has(p)) ?? null,
+	);
 	// projects-graph ADR-017 P2 — the drawer is type-agnostic on read, but the
 	// lifecycle action strip (accept/park/ship via /api/vault/decisions/transition)
 	// is decision-only until P3 generalises it. Gate the strip on this.
@@ -206,23 +266,87 @@
 	// Moved before dispatchTarget so cluster is available when the derived is evaluated.
 	const tags = $derived(extractStringArray(note?.meta.tags));
 	const cluster = $derived(clusterFromTags(tags));
+	// ADR-011 D2 — true when the loaded note's project has a `repo:` binding.
+	// Loaded in load() by fire-and-forget fetch of projects/<slug>/index.md.
+	// Opens the ADR-014 carve-out for `implementer` so the AI button appears
+	// on project-bound coding work without a static repo on the agent.
+	let subjectHasProjectRepo = $state(false);
+
+	// ADR-043 P2 — per-phase routing override map from `phase_routing:` frontmatter.
+	// When absent or not an object, `phaseRoutingMap` is undefined → no override.
+	const phaseRoutingMap = $derived<Record<string, PhaseRouting> | undefined>(
+		note?.meta.phase_routing &&
+		typeof note.meta.phase_routing === 'object' &&
+		!Array.isArray(note.meta.phase_routing)
+			? (note.meta.phase_routing as Record<string, PhaseRouting>)
+			: undefined,
+	);
+
+	// ADR-043 P2 — merge the active phase's routing overrides into the top-level
+	// frontmatter routing fields.  For ADRs without `phase_routing:`, this is a
+	// constant no-op (returns the same shape as topLevel).
+	const activeRouting = $derived(
+		mergeActivePhaseRouting(
+			{
+				work_type: workType || undefined,
+				assignee: assignee || undefined,
+				surface: typeof note?.meta.surface === 'string' ? note.meta.surface : undefined,
+				owner: typeof note?.meta.owner === 'string' ? note.meta.owner : undefined,
+			},
+			phaseRoutingMap,
+			activePhaseName,
+		),
+	);
+
+	// ADR-043 P2 — true when the active phase is declared as human-owned
+	// (`phase_routing[activePhase].owner === 'human'`).  Hides the AI dispatch
+	// card and shows the "Manual phase" card instead.
+	const isHumanPhase = $derived(
+		phases.length > 0 && activePhaseName !== null && activeRouting.owner === 'human',
+	);
+
+	// ADR-043 P2 — true when there is exactly 1 unshipped phase remaining.
+	// "Ship final {Pn} & merge" uses the full-ship path (no phaseToShip);
+	// "Ship {Pn} & merge" (intermediate) uses the partial-ship path.
+	const isLastUnshippedPhase = $derived(
+		phases.length > 0 &&
+		activePhaseName !== null &&
+		phases.length - shippedPhasesSet.size === 1,
+	);
+
 	// projects-graph ADR-018 S2 — which agent (if any) can run this artifact.
+	// ADR-043 P2 — feeds `activeRouting.work_type` and `activeRouting.assignee`
+	// so the routing reflects the active phase's overrides, not just top-level.
 	// projects-graph ADR-025 D2 — passes cluster so soul-hub coding work routes to
-	// soul-hub-implementer instead of developer when the agent is in the roster.
+	// soul-hub-implementer instead of implementer when the agent is in the roster.
 	// ADR-014 D1 — passes agentRepos so repo-less coding candidates are refused.
-	const dispatchTarget = $derived(resolveAgentForWork(workType, assignee, agentIds, cluster, agentRepos));
-	const canDispatch = $derived(!!dispatchTarget && isTransitionable && status !== 'shipped');
+	// ADR-011 D2 — passes subjectHasProjectRepo for the implementer carve-out.
+	const dispatchTarget = $derived(
+		resolveAgentForWork(
+			activeRouting.work_type ?? null,
+			activeRouting.assignee ?? null,
+			agentIds,
+			cluster,
+			agentRepos,
+			subjectHasProjectRepo,
+		),
+	);
+	// ADR-043 P2 — add !isHumanPhase: human phases never offer an AI dispatch button.
+	const canDispatch = $derived(!!dispatchTarget && isTransitionable && status !== 'shipped' && !isHumanPhase);
 	// projects-graph ADR-024 D1 — implementation dispatches (coding work, or the
 	// soul-hub-implementer) MUST run in production mode: the `test` caps
 	// (60s / 5 turns / $0.10) cannot implement an ADR. Pin them to production
 	// regardless of the toggle; clerical work keeps the test/production choice.
+	// ADR-043 P2 — uses activeRouting.work_type for phase-aware classification.
 	const isImplementationDispatch = $derived(
-		dispatchTarget === 'soul-hub-implementer' || workType === 'coding',
+		dispatchTarget === 'soul-hub-implementer' || activeRouting.work_type === 'coding',
 	);
-	// ADR-012 P3 — the artifact's implementation surface. A non-soul-hub surface
+	// ADR-012 P3 — the artifact's implementation surface.  A non-soul-hub surface
 	// (e.g. `~/.claude/agents`) means the default worktree dispatch is NOT where
 	// this work lands; surface a warning so the operator routes deliberately.
-	const surface = $derived(classifySurface(note?.meta ?? {}));
+	// ADR-043 P2 — uses activeRouting.surface so the warning reflects the active
+	// phase's surface (e.g. 'evaluate-session-app' for a cross-repo phase).
+	const surface = $derived(classifySurface({ surface: activeRouting.surface }));
 	const surfaceOutOfWorktree = $derived(
 		isImplementationDispatch && surface.kind !== 'soul-hub',
 	);
@@ -377,8 +501,18 @@
 		implementerSessionId = null;
 		implementerParseError = null;
 		blockerStatuses = {};
+		// ADR-044 P2-followup — reset lint state per load.
+		lintFindings = null;
+		lintLoading = false;
+		lintFindingsExpanded = false;
+		// ADR-011 D2 — reset the project-repo signal on each new note so a prior
+		// note's repo doesn't bleed into the next. Resolved below by fire-and-forget.
+		subjectHasProjectRepo = false;
 		// ADR-027 — reset ship-merge error on each note navigation.
 		shipMergeError = '';
+		// ADR-043 P2 — reset manual phase state on each note navigation.
+		markPhaseReason = '';
+		markPhaseShippedError = '';
 		// projects-graph ADR-025 D5 — reset auto-dispatch guard for each new note.
 		autoDispatched = false;
 		sendBackExpanded = false;
@@ -393,15 +527,66 @@
 			note = await res.json();
 			// D4: fire background fetches for blocker statuses (non-blocking).
 			loadBlockerStatuses();
+			// ADR-011 D2 — fire-and-forget: if the note is in a project, fetch the
+			// project index to check for a `repo:` binding. Sets subjectHasProjectRepo
+			// which drives the implementer carve-out in resolveAgentForWork. Does NOT
+			// block note rendering — the derived dispatchTarget updates reactively.
+			const projectMatch = p.match(/^projects\/([^/]+)\//);
+			if (projectMatch) {
+				const slug = projectMatch[1];
+				fetch(`/api/vault/notes/projects/${slug}/index.md`)
+					.then(async (r) => {
+						if (!r.ok) return;
+						const data = (await r.json()) as { meta?: { repo?: unknown } };
+						const repo = data?.meta?.repo;
+						subjectHasProjectRepo = typeof repo === 'string' && repo.trim().length > 0;
+					})
+					.catch(() => {
+						// project index unreachable — subjectHasProjectRepo stays false
+					});
+			}
 			// ADR-026 D3 (drawer hydration) — if a PAST dispatch left an un-merged
 			// branch + hand-back, re-show the review card + Ship/Send-back. Skip
 			// when autoDispatch is set: a fresh dispatch will populate the card and
 			// would otherwise reset what we hydrate (avoids a flash).
 			if (!autoDispatch) hydrateReviewCard(p);
+			// ADR-044 P2-followup — fire lint fetch for type=decision notes only.
+			// Best-effort; failures leave lintFindings = null which renders as
+			// "lint unknown" (no chip).
+			if (note?.meta?.type === 'decision' && /\/adr-\d+/.test(p)) {
+				loadLint(p);
+			}
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Failed to load note';
 		} finally {
 			loading = false;
+		}
+	}
+
+	/** ADR-044 P2-followup — fetch lint findings for the loaded ADR. */
+	async function loadLint(p: string) {
+		lintLoading = true;
+		try {
+			const res = await fetch('/api/vault/adr-lint', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ path: p }),
+			});
+			if (!res.ok) {
+				lintFindings = null;
+				return;
+			}
+			const data = (await res.json()) as {
+				findings?: LintFinding[];
+				highSeverityCount?: number;
+			};
+			// Guard against a stale fetch outliving a navigation away.
+			if (currentPath !== p) return;
+			lintFindings = data.findings ?? [];
+		} catch {
+			lintFindings = null;
+		} finally {
+			lintLoading = false;
 		}
 	}
 
@@ -466,6 +651,42 @@
 		});
 	});
 
+	// ADR-020 P1 — fetch per-ADR run history whenever the loaded note path
+	// changes.  Reactive on `note?.path` so re-dispatches and ship-merges
+	// (which trigger a note reload) also refresh the strip.  Best-effort —
+	// failures leave the strip empty rather than blocking the drawer.
+	$effect(() => {
+		const p = note?.path;
+		untrack(() => {
+			if (!p) {
+				runHistory = [];
+				runHistoryCumulativeUsd = 0;
+				return;
+			}
+			void (async () => {
+				try {
+					const res = await fetch(
+						`/api/agents/runs/history?subjectPath=${encodeURIComponent(p)}`,
+					);
+					if (!res.ok) {
+						runHistory = [];
+						runHistoryCumulativeUsd = 0;
+						return;
+					}
+					const data = await res.json() as {
+						runs?: AdrRunHistoryItem[];
+						cumulativeCostUsd?: number;
+					};
+					runHistory = data.runs ?? [];
+					runHistoryCumulativeUsd = data.cumulativeCostUsd ?? 0;
+				} catch {
+					runHistory = [];
+					runHistoryCumulativeUsd = 0;
+				}
+			})();
+		});
+	});
+
 	// projects-graph ADR-025 D5 — fire dispatchToAI() exactly once when the
 	// parent opens the drawer with autoDispatch=true after an Accept → AI confirm.
 	// Guard: note loaded + canDispatch + not already dispatched + not mid-flight.
@@ -483,22 +704,42 @@
 		onClose();
 	}
 
+	/**
+	 * "Mark shipped (status only)" — transitions the note without merging a branch.
+	 *
+	 * ADR-043 P2 — for intermediate phases (unshipped > 1), posts `phaseToShip`
+	 * for a no-merge partial ship (keeps `status: accepted`, appends to
+	 * `shipped_phases:`, splices body entry).  For the last phase or non-phased
+	 * ADRs, the existing full-ship path runs.
+	 */
 	async function shipDecision() {
 		if (!note || shipping) return;
 		shipping = true;
 		mutationError = '';
+		// ADR-043 P2 — partial ship for intermediate phases.
+		const isPhased = phases.length > 0 && activePhaseName !== null;
+		const phaseToShip = isPhased && !isLastUnshippedPhase ? activePhaseName : undefined;
 		try {
 			const res = await fetch('/api/vault/decisions/transition', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ path: note.path, action: 'ship' }),
+				body: JSON.stringify({
+					path: note.path,
+					action: 'ship',
+					...(phaseToShip ? { phaseToShip } : {}),
+				}),
 			});
 			const data = await res.json();
 			if (!res.ok || !data.success) {
 				mutationError = data.error ?? `HTTP ${res.status}`;
 				return;
 			}
-			handleTransition({ path: note.path, action: 'ship', newStatus: data.newStatus });
+			if (data.phaseShipped && data.newStatus === 'accepted') {
+				// Intermediate phase shipped without merge — reload drawer.
+				await load(note.path);
+			} else {
+				handleTransition({ path: note.path, action: 'ship', newStatus: data.newStatus ?? 'shipped' });
+			}
 		} catch (e) {
 			mutationError = e instanceof Error ? e.message : 'Network error';
 		} finally {
@@ -507,27 +748,91 @@
 	}
 
 	/**
+	 * ADR-043 P2 — "Mark {Pn} shipped (manual)" for human-owned phases.
+	 *
+	 * Posts `{ action: 'ship', phaseToShip, reason }` to
+	 * /api/vault/decisions/transition so the phase is appended to
+	 * `shipped_phases:` + a manual body entry is spliced in.  No branch merge.
+	 * On success, reloads the drawer so the next phase renders.
+	 */
+	async function markPhaseManuallyShipped(phase: string) {
+		if (!note || markingPhaseShipped) return;
+		const reason = markPhaseReason.trim();
+		if (!reason) {
+			markPhaseShippedError = 'Enter a one-line reason before marking shipped.';
+			return;
+		}
+		markingPhaseShipped = true;
+		markPhaseShippedError = '';
+		try {
+			const res = await fetch('/api/vault/decisions/transition', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					path: note.path,
+					action: 'ship',
+					phaseToShip: phase,
+					reason,
+				}),
+			});
+			const data = await res.json();
+			if (!res.ok || !data.success) {
+				markPhaseShippedError = data.error ?? `HTTP ${res.status}`;
+				return;
+			}
+			markPhaseReason = '';
+			if (data.newStatus === 'shipped') {
+				// Last phase shipped — close the drawer.
+				handleTransition({ path: note.path, action: 'ship', newStatus: 'shipped' });
+			} else {
+				// Intermediate phase — reload so next phase renders.
+				await load(note.path);
+			}
+		} catch (e) {
+			markPhaseShippedError = e instanceof Error ? e.message : 'Network error';
+		} finally {
+			markingPhaseShipped = false;
+		}
+	}
+
+	/**
 	 * projects-graph ADR-027 P1 — "Ship & merge": merges the implementer's
 	 * orchestration branch to main then flips the ADR status to `shipped`.
 	 * All guards run server-side; this function only drives UI state.
+	 *
+	 * ADR-043 P2 — for phased ADRs with >1 unshipped phases, posts `phaseToShip`
+	 * for a partial merge that keeps `status: accepted` and advances the active
+	 * phase.  For the last phase (isLastUnshippedPhase), no phaseToShip is sent
+	 * and the full-ship path runs (flips status → shipped, closes drawer).
 	 */
 	async function shipAndMerge() {
 		if (!note || shippingAndMerging) return;
 		shippingAndMerging = true;
 		shipMergeError = '';
 		mutationError = '';
+		// ADR-043 P2 — determine per-phase vs full-ship.
+		const isPhased = phases.length > 0 && activePhaseName !== null;
+		const phaseToShip = isPhased && !isLastUnshippedPhase ? activePhaseName : undefined;
 		try {
 			const res = await fetch('/api/agents/ship-merge', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ path: note.path }),
+				body: JSON.stringify({
+					path: note.path,
+					...(phaseToShip ? { phaseToShip } : {}),
+				}),
 			});
 			const data = await res.json();
 			if (!res.ok || !data.success) {
 				shipMergeError = data.error ?? `HTTP ${res.status}`;
 				return;
 			}
-			handleTransition({ path: note.path, action: 'ship', newStatus: data.newStatus });
+			if (data.phaseShipped && !data.newStatus) {
+				// Intermediate phase shipped — reload the drawer so the next phase renders.
+				await load(note.path);
+			} else {
+				handleTransition({ path: note.path, action: 'ship', newStatus: data.newStatus ?? 'shipped' });
+			}
 		} catch (e) {
 			shipMergeError = e instanceof Error ? e.message : 'Network error';
 		} finally {
@@ -643,8 +948,11 @@
 	 *  shows live output, and on completion writes the agent's output back as a
 	 *  linked `output` note + stamps `assignee`. Does NOT flip status — the
 	 *  human reviews the output note and ships via the action strip (operator
-	 *  decision 2026-05-21). */
-	async function dispatchToAI() {
+	 *  decision 2026-05-21).
+	 *
+	 *  @param taskOverride — when set, replaces the default task string. Used by
+	 *    ADR-042 D3 "Continue with <phase>" to inject the continuation prompt. */
+	async function dispatchToAI(taskOverride?: string) {
 		if (!note || dispatching || !dispatchTarget) return;
 		dispatching = true;
 		dispatchOutput = '';
@@ -673,17 +981,22 @@
 				});
 			}
 
-			const task =
+			// ADR-042 D3 — use the caller-supplied continuation prompt when
+			// present (phase continuation flow); fall back to the generic task.
+			const task = taskOverride ?? (
 				`Work on this ${noteType}: "${note.title}".\n\n` +
 				`${note.content ?? ''}\n\n` +
-				`Produce the deliverable and return it as your final output.`;
+				`Produce the deliverable and return it as your final output.`
+			);
 
 			const res = await fetch(`/api/agents/${agent}/test?mode=${effectiveMode}`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				// ADR-014 D2 — pass work_type so the server guard can refuse repo-less
 				// coding dispatches even when reached via direct API or CLI (belt-and-suspenders).
-				body: JSON.stringify({ task: task.slice(0, 4000), subject: artifactPath, work_type: workType }),
+				// ADR-043 P2 — use activeRouting.work_type so the per-phase effective
+				// routing is what the server guard sees, not just the top-level value.
+				body: JSON.stringify({ task: task.slice(0, 4000), subject: artifactPath, work_type: activeRouting.work_type ?? workType }),
 			});
 			if (!res.ok || !res.body) {
 				const data = await res.json().catch(() => ({}));
@@ -945,6 +1258,41 @@
 			dispatching = false;
 		}
 	}
+
+	/**
+	 * ADR-042 D3 — build a continuation prompt for a specific phase.
+	 *
+	 * The prompt tells the implementer agent EXACTLY which phase to deliver,
+	 * what was already shipped (prior context), and embeds the full ADR body so
+	 * the agent has the spec inline without a separate fetch.
+	 */
+	function buildContinuationPrompt(active: string): string {
+		if (!note) return '';
+		const shipped = [...shippedPhasesSet];
+		const priorStr = shipped.length > 0 ? shipped.join(', ') : 'none';
+		return (
+			`Continue work on this decision: "${note.title}".\n\n` +
+			`Deliver phase \`${active}\`. ` +
+			`Prior shipped phases: ${priorStr}. ` +
+			`Read the ADR body below for this phase's specification and implement it end-to-end.\n\n` +
+			`${note.content ?? ''}`
+		);
+	}
+
+	/**
+	 * ADR-042 D3 — dispatch to AI with a phase-specific continuation prompt.
+	 *
+	 * Sets `continuingPhase` so the button can show "⏳ continuing D3…" while
+	 * the dispatch is in flight. Resets on completion.
+	 */
+	async function continueWithPhase(active: string) {
+		continuingPhase = active;
+		try {
+			await dispatchToAI(buildContinuationPrompt(active));
+		} finally {
+			continuingPhase = null;
+		}
+	}
 </script>
 
 {#if path}
@@ -1070,7 +1418,102 @@
 					{#each tags.slice(0, 6) as tag}
 						<span class="px-1.5 py-0.5 rounded bg-hub-card/60 text-hub-dim">{tag}</span>
 					{/each}
+					<!-- ADR-044 P2-followup — lint chip. Only shown for ADR notes; rendered
+					     after lint fetch resolves.  Clean = subtle green; high-severity = red. -->
+					{#if lintFindings !== null && isDecision}
+						{#if lintHighCount > 0}
+							<button
+								onclick={() => (lintFindingsExpanded = !lintFindingsExpanded)}
+								class="px-1.5 py-0.5 rounded bg-hub-danger/15 text-hub-danger font-medium cursor-pointer hover:bg-hub-danger/25 transition-colors"
+								title="Click to {lintFindingsExpanded ? 'collapse' : 'expand'} findings"
+							>
+								⚠ {lintHighCount} lint
+							</button>
+						{:else if lintFindings.length === 0}
+							<span class="px-1.5 py-0.5 rounded bg-hub-cta/15 text-hub-cta" title="Lint clean — all rules pass">
+								✓ lint
+							</span>
+						{:else}
+							<button
+								onclick={() => (lintFindingsExpanded = !lintFindingsExpanded)}
+								class="px-1.5 py-0.5 rounded bg-hub-warning/15 text-hub-warning cursor-pointer hover:bg-hub-warning/25 transition-colors"
+								title="Click to {lintFindingsExpanded ? 'collapse' : 'expand'} findings"
+							>
+								⚠ {lintFindings.length} lint
+							</button>
+						{/if}
+					{/if}
 				</div>
+
+				<!-- ADR-044 P2-followup — lint findings panel. Auto-expanded on high-severity
+				     so the operator can't miss it; collapsible via chip click for clean view.
+				     High-severity findings are the same set blocking the dispatcher chokepoint. -->
+				{#if lintFindings && lintFindings.length > 0}
+					<div
+						class="mb-4 rounded-lg border p-3 {lintHighCount > 0 ? 'border-hub-danger/40 bg-hub-danger/5' : 'border-hub-warning/40 bg-hub-warning/5'}"
+					>
+						<div class="flex items-center justify-between gap-2 mb-2">
+							<p class="text-xs font-semibold {lintHighCount > 0 ? 'text-hub-danger' : 'text-hub-warning'}">
+								{lintHighCount > 0
+									? `⛔ ${lintHighCount} high-severity lint finding${lintHighCount === 1 ? '' : 's'} — dispatch will refuse`
+									: `${lintFindings.length} lint warning${lintFindings.length === 1 ? '' : 's'}`}
+							</p>
+							<button
+								onclick={() => (lintFindingsExpanded = !lintFindingsExpanded)}
+								class="text-[11px] text-hub-dim hover:text-hub-text transition-colors cursor-pointer flex-shrink-0"
+							>
+								{lintFindingsExpanded ? 'hide' : 'show'}
+							</button>
+						</div>
+						{#if lintFindingsExpanded || lintHighCount > 0}
+							<ul class="space-y-2">
+								{#each lintFindings as f}
+									<li class="text-[11px] {f.severity === 'high' ? 'text-hub-danger' : f.severity === 'medium' ? 'text-hub-warning' : 'text-hub-dim'}">
+										<span class="font-mono mr-1">{f.severity === 'high' ? '✗' : f.severity === 'medium' ? '⚠' : 'ℹ'}</span>
+										<span class="font-mono">[{f.rule}]</span>
+										<span class="ml-1">{f.message}</span>
+									</li>
+								{/each}
+							</ul>
+							<p class="mt-2 text-[10px] text-hub-dim leading-snug">
+								Run <span class="font-mono">soul adr lint {note.path}</span> from the terminal for the same output, or fix the body / frontmatter and reload. Operator override: PUT the note with <span class="font-mono">opts.skipLint: "&lt;reason&gt;"</span> (audited).
+							</p>
+						{/if}
+					</div>
+				{/if}
+
+				<!-- ADR-042 D2 — Phase checklist. Rendered only when `phases:` is declared on
+				     the note. Zero-impact on single-phase ADRs (no `phases:` field present).
+				     Visual legend: ✓ = shipped · ▸ = active (next to deliver) · ○ = pending. -->
+				{#if phases.length > 0}
+					<div class="mb-4 rounded-lg border border-hub-border/60 bg-hub-card/40 p-3">
+						<p class="text-[10px] uppercase tracking-wider text-hub-dim mb-2 font-medium">Phases</p>
+						<ol class="space-y-1">
+							{#each phases as phase}
+								{@const isShipped = shippedPhasesSet.has(phase)}
+								{@const isActive = phase === activePhaseName}
+								<li
+									class="flex items-center gap-2 text-xs"
+									class:opacity-40={!isShipped && !isActive}
+								>
+									{#if isShipped}
+										<span class="text-hub-cta w-4 text-center flex-shrink-0">✓</span>
+									{:else if isActive}
+										<span class="text-hub-info w-4 text-center flex-shrink-0">▸</span>
+									{:else}
+										<span class="text-hub-dim w-4 text-center flex-shrink-0">○</span>
+									{/if}
+									<span class="font-mono">{phase}</span>
+									{#if isShipped}
+										<span class="text-hub-dim text-[10px]">shipped</span>
+									{:else if isActive}
+										<span class="px-1.5 py-0.5 rounded bg-hub-info/15 text-hub-info text-[10px] font-medium">active</span>
+									{/if}
+								</li>
+							{/each}
+						</ol>
+					</div>
+				{/if}
 
 				<!-- Action strip for proposed artifacts (P3: any transitionable type, shared canonical-6 vocab) -->
 				{#if isProposed && isTransitionable}
@@ -1154,6 +1597,7 @@
 						</div>
 					{:else if isImplementationDispatch && implementerGatesGreen}
 						<!-- ADR-027: coding artifact with green gates → Ship & merge primary -->
+						<!-- ADR-043 P2: button label is phase-aware for phased ADRs -->
 						<div class="mb-5 p-3 rounded-lg border border-hub-info/30 bg-hub-info/5">
 							<div class="mb-2">
 								<p class="text-xs text-hub-info">Decision accepted{acceptedOn ? ` on ${acceptedOn}` : ''}</p>
@@ -1167,15 +1611,31 @@
 									disabled={shippingAndMerging || shipping}
 									class="px-3 py-1.5 rounded text-xs font-medium bg-hub-cta text-hub-bg hover:bg-hub-cta/90 transition-colors cursor-pointer disabled:opacity-50"
 								>
-									{shippingAndMerging ? '⏳ merging…' : '⇡ Ship & merge'}
+									{#if shippingAndMerging}
+										⏳ merging…
+									{:else if phases.length > 0 && activePhaseName !== null && isLastUnshippedPhase}
+										⇡ Ship final {activePhaseName} &amp; merge
+									{:else if phases.length > 0 && activePhaseName !== null}
+										⇡ Ship {activePhaseName} &amp; merge
+									{:else}
+										⇡ Ship &amp; merge
+									{/if}
 								</button>
 								<button
 									onclick={shipDecision}
 									disabled={shipping || shippingAndMerging}
-									title="Marks status as shipped without merging the branch — for multi-phase ADRs or already-merged branches"
+									title={phases.length > 0 && activePhaseName !== null && !isLastUnshippedPhase
+										? `Marks ${activePhaseName} shipped without merging — advances the active phase`
+										: 'Marks status as shipped without merging the branch — for already-merged branches'}
 									class="px-3 py-1.5 rounded text-xs font-medium bg-hub-card text-hub-dim hover:text-hub-text border border-hub-border/60 transition-colors cursor-pointer disabled:opacity-50"
 								>
-									{shipping ? '…' : 'Mark shipped (status only)'}
+									{#if shipping}
+										…
+									{:else if phases.length > 0 && activePhaseName !== null && !isLastUnshippedPhase}
+										Mark {activePhaseName} shipped (no merge)
+									{:else}
+										Mark shipped (status only)
+									{/if}
 								</button>
 							</div>
 							{#if shipMergeError}
@@ -1202,12 +1662,48 @@
 					{/if}
 				{/if}
 
+				<!-- ADR-043 P2 — "Manual phase" card (Decision §3).
+				     Rendered for accepted, transitionable artifacts when the active
+				     phase declares `owner: human`.  Hides all AI dispatch affordances;
+				     the operator marks the phase done with a one-line reason. -->
+				{#if isHumanPhase && isAccepted && isTransitionable}
+					<div class="mb-5 p-3 rounded-lg border border-hub-warning/30 bg-hub-warning/5">
+						<div class="mb-2">
+							<p class="text-xs text-hub-warning font-medium">Manual phase — {activePhaseName}</p>
+							<p class="text-[11px] text-hub-dim mt-0.5">
+								This phase is owner-marked as human work (no AI dispatch). Complete the work outside the drawer, then mark it shipped with a brief reason.
+							</p>
+						</div>
+						<div class="space-y-1.5">
+							<input
+								type="text"
+								bind:value={markPhaseReason}
+								placeholder="One-line reason (e.g. 'configured ElevenLabs voice clone')"
+								disabled={markingPhaseShipped}
+								class="w-full px-2 py-1.5 rounded bg-hub-bg border border-hub-border text-hub-text text-[11px] placeholder:text-hub-dim focus:outline-none focus:border-hub-warning/50 transition-colors"
+							/>
+							{#if markPhaseShippedError}
+								<p class="text-[10px] text-hub-danger">{markPhaseShippedError}</p>
+							{/if}
+							<button
+								onclick={() => markPhaseManuallyShipped(activePhaseName!)}
+								disabled={markingPhaseShipped || !markPhaseReason.trim()}
+								class="px-3 py-1.5 rounded text-xs font-medium bg-hub-warning text-hub-bg hover:bg-hub-warning/90 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+							>
+								{markingPhaseShipped ? '⏳ marking…' : `Mark ${activePhaseName} shipped (manual)`}
+							</button>
+						</div>
+					</div>
+				{/if}
+
 				<!-- projects-graph ADR-018 S2 / ADR-025 D5 — Dispatch to AI.
 				     Re-dispatch / run surface for an ALREADY-ACCEPTED artifact. A
 				     *proposed* artifact is accepted-and-dispatched via the named
 				     "Accept → 🤖 agent" button in the DecisionActions strip above,
 				     so this standalone control is gated on `isAccepted` to avoid
-				     showing two dispatch paths for one proposed ADR (D5 finding). -->
+				     showing two dispatch paths for one proposed ADR (D5 finding).
+				     ADR-043 P2 — `canDispatch` already excludes `isHumanPhase`,
+				     so this block is mutually exclusive with the Manual phase card. -->
 				{#if canDispatch && isAccepted}
 					<div class="mb-5 p-3 rounded-lg border border-hub-cta/30 bg-hub-cta/5">
 						{#if surfaceOutOfWorktree}
@@ -1226,9 +1722,11 @@
 						<div class="flex items-center justify-between gap-3 flex-wrap">
 							<div>
 								<p class="text-xs text-hub-text font-medium">Dispatch to AI</p>
-								<p class="text-[11px] text-hub-dim mt-0.5">→ <span class="font-mono">{dispatchTarget}</span>{workType ? ` · ${workType}` : ''}</p>
+								<!-- ADR-043 P2 — show activeRouting.work_type so the effective
+								     per-phase routing is surfaced, not just the top-level value. -->
+								<p class="text-[11px] text-hub-dim mt-0.5">→ <span class="font-mono">{dispatchTarget}</span>{activeRouting.work_type ? ` · ${activeRouting.work_type}` : ''}</p>
 							</div>
-							<div class="flex items-center gap-1.5">
+							<div class="flex items-center gap-1.5 flex-wrap">
 								{#if isImplementationDispatch}
 									<!-- D5/D1: implementation dispatches are force-pinned to production.
 									     Hide the toggle to prevent a misleading test click that would
@@ -1247,13 +1745,40 @@
 										<option value="production">run</option>
 									</select>
 								{/if}
+								<!-- ADR-042 D3 — "Continue with <active-phase>" button.
+								     Shown when the ADR declares phases and has an active (un-shipped)
+								     phase. Passes a phase-specific continuation prompt to dispatchToAI
+								     so the agent doesn't have to re-read the ADR to know what's next.
+								     The main Dispatch button remains for fresh/override dispatches. -->
+								{#if phases.length > 0 && activePhaseName !== null}
+									<button
+										onclick={() => continueWithPhase(activePhaseName!)}
+										disabled={dispatching}
+										title="Dispatch with a phase-specific continuation prompt (ADR-042 D3)"
+										class="px-3 py-1.5 rounded text-xs font-medium bg-hub-info text-white hover:bg-hub-info/90 transition-colors cursor-pointer disabled:opacity-50"
+									>
+										{continuingPhase === activePhaseName
+											? `⏳ continuing ${activePhaseName}…`
+											: `Continue with ${activePhaseName}`}
+									</button>
+								{/if}
 								<button
-									onclick={dispatchToAI}
+									onclick={() => dispatchToAI()}
 									disabled={dispatching}
-									title={implementerReturn ? 'A completed run is awaiting your review below — this starts a fresh dispatch on a new branch' : undefined}
+									title={implementerReturn
+										? 'A completed run is awaiting your review below — this starts a fresh dispatch on a new branch'
+										: phases.length > 0 && activePhaseName !== null
+											? 'Start a generic dispatch (ignores phase context — use "Continue with" for phase-aware dispatch)'
+											: undefined}
 									class="px-3 py-1.5 rounded text-xs font-medium bg-hub-cta text-hub-bg hover:bg-hub-cta/90 transition-colors cursor-pointer disabled:opacity-50"
 								>
-									{dispatching ? '🟡 working…' : implementerReturn ? 'Re-dispatch' : 'Dispatch'}
+									{dispatching && continuingPhase === null
+										? '🟡 working…'
+										: implementerReturn
+											? 'Re-dispatch'
+											: phases.length > 0 && activePhaseName !== null
+												? 'Dispatch (generic)'
+												: 'Dispatch'}
 								</button>
 							</div>
 						</div>
@@ -1391,6 +1916,60 @@
 				{/if}
 
 				<RenderedMarkdown html={note.rendered ?? ''} rtl={!!note.contentIsRtl} />
+
+				<!-- ADR-020 P1 — Per-ADR run history strip. Shows every
+				     agent_run for this artifact's subject_path with phase /
+				     status / cost / commit, plus cumulative cost across runs.
+				     Renders only when at least one dispatch has occurred for
+				     this artifact. -->
+				{#if runHistory.length > 0}
+					<div class="mt-6 pt-4 border-t border-hub-border">
+						<div class="flex items-center justify-between mb-2">
+							<h3 class="text-xs font-semibold uppercase tracking-wide text-hub-text-muted">
+								Run history
+								<span class="ml-1 text-hub-text-muted/70">({runHistory.length})</span>
+							</h3>
+							<span class="text-xs text-hub-text-muted">
+								cumulative: <span class="font-mono text-hub-text">${runHistoryCumulativeUsd.toFixed(2)}</span>
+							</span>
+						</div>
+						<ol class="space-y-1.5">
+							{#each runHistory as run, i (run.runId)}
+								{@const phaseLabel = run.phase ?? (i === 0 ? 'initial' : 'iterate')}
+								{@const isTerminal = !!run.finishedAt}
+								{@const statusColor = run.status === 'goal_achieved' || run.status === 'success' || run.status === 'completed-no-artifact'
+									? 'text-hub-success'
+									: run.status === 'error' || run.status === 'budget-exceeded' || run.status === 'timeout' || run.status === 'cancelled' || run.status === 'interrupted'
+									? 'text-hub-danger'
+									: run.status === 'awaiting-budget-approval' || run.status === 'awaiting-operator-input'
+									? 'text-hub-warning'
+									: 'text-hub-text-muted'}
+								<li class="text-xs flex items-center gap-2 leading-tight">
+									<span class="font-mono text-hub-text-muted w-12 shrink-0">
+										#{run.runId.slice(0, 8)}
+									</span>
+									<span class="px-1.5 py-0.5 rounded bg-hub-border/40 text-hub-text-muted font-mono text-[10px] shrink-0">
+										{phaseLabel}
+									</span>
+									<span class="{statusColor} font-medium shrink-0 truncate" title={run.status}>
+										{run.status}
+									</span>
+									<span class="font-mono text-hub-text-muted/70 shrink-0">
+										${run.costUsd.toFixed(2)}
+									</span>
+									<span class="text-hub-text-muted/60 ml-auto shrink-0" title={new Date(run.startedAt).toISOString()}>
+										{new Date(run.startedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+									</span>
+									{#if !isTerminal}
+										<span class="px-1.5 py-0.5 rounded bg-hub-warning/10 text-hub-warning font-mono text-[10px] shrink-0">
+											running
+										</span>
+									{/if}
+								</li>
+							{/each}
+						</ol>
+					</div>
+				{/if}
 
 				<!-- Dependencies panel (Phase 3b) — surfaces typed relationship
 				     fields from the frontmatter (blocks/blocked_by/extends/

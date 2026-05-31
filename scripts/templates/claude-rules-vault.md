@@ -1,6 +1,6 @@
 # Vault-first long-term memory
 
-Claude Code's auto-memory (`~/.claude/projects/.../memory/`) is per-machine, project-scoped, and invisible to `/brain`, the vault watcher, and other machines. For anything worth keeping beyond the current conversation, **also write a vault note** at `~/vault/`.
+Claude Code's auto-memory (`~/.claude/projects/.../memory/`) is per-machine, project-scoped, and invisible to the `soul` CLI (`soul vault search`), the vault watcher, and other machines. For anything worth keeping beyond the current conversation, **also write a vault note** at `~/vault/`.
 
 ## Triage — what goes where
 

@@ -10,8 +10,14 @@
  *
  *  projects-graph ADR-025 D2 — cluster-aware routing layer.
  *  `work_type: coding` in the soul-hub cluster routes to `soul-hub-implementer`
- *  when it is present in the live roster; otherwise falls through to `developer`.
- *  Use `clusterFromTags` to derive the cluster signal from a note's tags array. */
+ *  when it is present in the live roster; otherwise falls through to `implementer`
+ *  (ADR-011: general coding executor, repo-agnostic floor).
+ *  Use `clusterFromTags` to derive the cluster signal from a note's tags array.
+ *
+ *  ADR-043 P2 — per-phase routing override.
+ *  `mergeActivePhaseRouting` + `PhaseRouting` type allow cross-discipline
+ *  multi-phase ADRs to declare phase-specific routing that overrides the
+ *  top-level frontmatter for the currently-active phase only. */
 
 /** Default work_type → agent-slug map. Values are roster ids (see /api/agents).
  *  Kept deliberately small; extend as the roster/work-types grow. */
@@ -20,7 +26,12 @@ const WORK_TYPE_AGENT: Record<string, string> = {
 	writing: 'author',
 	design: 'designer',
 	media: 'media-generator',
-	coding: 'developer',
+	// ADR-025 D2 — Arabic content work routes to the `weaver` specialist.
+	arabic: 'weaver',
+	// ADR-011 — `implementer` is the repo-agnostic general coding floor.
+	// `developer` (hardcoded to jasem-profile-app) is retired as the default;
+	// it stays in the roster until ADR-031 P3 removes it.
+	coding: 'implementer',
 	// `decision` and `manual` intentionally absent — human-owned work.
 };
 
@@ -86,19 +97,44 @@ export function clusterFromTags(tags: string[]): string | null {
 }
 
 /**
- * @param workType  the artifact's `work_type` frontmatter (may be null)
- * @param assignee  the artifact's `assignee` frontmatter (may be null)
- * @param agentIds  lowercased set of valid roster agent ids
- * @param cluster   the artifact's cluster derived from `clusterFromTags`
- *                  (projects-graph ADR-025 D2); may be null/undefined.
- *                  When `"soul-hub"` and `work_type` is `"coding"`, routes
- *                  to `soul-hub-implementer` instead of `developer` — but
- *                  only when `soul-hub-implementer` is in the live roster.
- * @param repoMap   optional map of agent-id → repo path (ADR-014 D1).
- *                  When provided, any candidate for a `coding` dispatch that
- *                  has no repo binding is **skipped** — no worktree, no dispatch.
- *                  Callers that omit this parameter get the pre-ADR-014 behaviour
- *                  (backward-compatible; all existing tests are unaffected).
+ * ADR-025 D2 — returns the roster agent slug expected for a given work_type,
+ * REGARDLESS of whether that agent is currently in the live roster.
+ *
+ * Used by `decisionActionModel` to surface "no `<agent>` installed" hints
+ * when a non-coding specialist is absent.  Returns `null` for:
+ *  - `coding` (uses a runtime floor, not a fixed specialist)
+ *  - `decision` / `manual` (human-owned — no agent expected)
+ *  - absent / empty / unknown work_type
+ *
+ * Pure; no roster lookup. */
+export function expectedSpecialistForWorkType(workType: string | null | undefined): string | null {
+	const wt = (workType ?? '').trim().toLowerCase();
+	if (!wt || wt === 'coding' || wt === 'decision' || wt === 'manual') return null;
+	return WORK_TYPE_AGENT[wt] ?? null;
+}
+
+/**
+ * @param workType             the artifact's `work_type` frontmatter (may be null)
+ * @param assignee             the artifact's `assignee` frontmatter (may be null)
+ * @param agentIds             lowercased set of valid roster agent ids
+ * @param cluster              the artifact's cluster derived from `clusterFromTags`
+ *                             (projects-graph ADR-025 D2); may be null/undefined.
+ *                             When `"soul-hub"` and `work_type` is `"coding"`, routes
+ *                             to `soul-hub-implementer` instead of `implementer` — but
+ *                             only when `soul-hub-implementer` is in the live roster.
+ * @param repoMap              optional map of agent-id → repo path (ADR-014 D1).
+ *                             When provided, any candidate for a `coding` dispatch that
+ *                             has no repo binding is **skipped** — no worktree, no dispatch.
+ *                             Callers that omit this parameter get the pre-ADR-014 behaviour
+ *                             (backward-compatible; all existing tests are unaffected).
+ * @param subjectHasProjectRepo ADR-011 D2 — true when the artifact's project has a
+ *                             `repo:` binding on its `index.md`. Opens the ADR-014
+ *                             carve-out for `implementer` specifically: a project-bound
+ *                             repo satisfies ADR-014's repo requirement for the general
+ *                             implementer, which carries no static repo of its own.
+ *                             Name-specific (`implementer` only) to prevent the carve-out
+ *                             from accidentally re-enabling `developer` or other repo-less
+ *                             coding agents on bound projects. Defaults to false.
  * @returns the agent slug to dispatch to, or null when none fits
  */
 export function resolveAgentForWork(
@@ -107,35 +143,42 @@ export function resolveAgentForWork(
 	agentIds: Set<string>,
 	cluster?: string | null,
 	repoMap?: ReadonlyMap<string, string | undefined>,
+	subjectHasProjectRepo?: boolean,
 ): string | null {
 	const a = (assignee ?? '').trim().toLowerCase();
 	const wt = (workType ?? '').trim().toLowerCase();
+	const hasProjectRepo = subjectHasProjectRepo ?? false;
 
 	// 1. An assignee that is itself a roster agent wins — the operator picked it.
 	//    ADR-014 D1 — for coding work, skip repo-less assignees so an operator
 	//    who set `assignee: developer` (pre-ADR-014 muscle memory) doesn't silently
 	//    run without isolation.  When skipped, routing falls through to the cluster
 	//    and floor steps below so a repo-bound coding agent can still be found.
+	//    ADR-011 D2 — carve-out for `implementer` specifically: if the subject's
+	//    project has a repo binding, accept the repo-less implementer assignee.
 	if (a && agentIds.has(a)) {
-		if (wt !== 'coding' || hasRepo(a, repoMap)) return a;
-		// coding + no repo → fall through to find a repo-bound agent
+		if (wt !== 'coding' || hasRepo(a, repoMap) || (a === 'implementer' && hasProjectRepo)) return a;
+		// coding + no repo + not the project-bound implementer carve-out → fall through
 	}
 
 	// 2. projects-graph ADR-025 D2 — soul-hub cluster coding → soul-hub-implementer.
 	//    Only when the agent is actually installed in the live roster; absent
-	//    roster entry falls through to the default `developer` mapping below.
+	//    roster entry falls through to the default `implementer` mapping below.
 	//    ADR-014 D1 — honour the repoMap check here too for consistency.
 	if (wt === 'coding' && cluster === 'soul-hub' && agentIds.has('soul-hub-implementer')) {
 		if (hasRepo('soul-hub-implementer', repoMap)) return 'soul-hub-implementer';
 		// soul-hub-implementer has no repo (misconfigured) → fall through to floor
 	}
 
-	// 3. Default work_type → agent map (coding → developer for non-soul-hub, etc.).
+	// 3. Default work_type → agent map (coding → implementer for non-soul-hub, etc.).
 	//    ADR-014 D1 — for coding, return null instead of a repo-less floor agent.
+	//    ADR-011 D2 — carve-out: if the floor is `implementer` AND the subject's
+	//    project has a repo binding, allow it (name-specific guard).
 	const mapped = WORK_TYPE_AGENT[wt];
 	if (mapped && agentIds.has(mapped)) {
-		if (wt === 'coding' && !hasRepo(mapped, repoMap)) {
-			// Floor agent has no repo — refuse rather than run without isolation.
+		if (wt === 'coding' && !hasRepo(mapped, repoMap) && !(mapped === 'implementer' && hasProjectRepo)) {
+			// Floor agent has no repo and the implementer carve-out doesn't apply —
+			// refuse rather than run without isolation.
 			return null;
 		}
 		return mapped;
@@ -157,4 +200,51 @@ function hasRepo(
 	if (!repoMap) return true; // no map → don't enforce (backward-compat path)
 	const repo = repoMap.get(agentId);
 	return typeof repo === 'string' && repo.trim().length > 0;
+}
+
+// ── ADR-043 P2 — per-phase routing override ──────────────────────────────────
+
+/**
+ * ADR-043 P2 — shape of a single phase-routing entry in the `phase_routing:`
+ * frontmatter map.  Each field, when present, overrides the corresponding
+ * top-level frontmatter field FOR THAT PHASE ONLY.
+ *
+ * Keys must be a subset of the ADR's `phases:` array (validated by
+ * `validatePhasedAdrFields` in `vault/phases.ts`).
+ */
+export interface PhaseRouting {
+	owner?: 'ai' | 'human';
+	work_type?: string;
+	assignee?: string;
+	surface?: string;
+}
+
+/**
+ * ADR-043 P2 — merge the active phase's routing overrides into the top-level
+ * frontmatter routing inputs.
+ *
+ * When `activePhase` is null or `phaseRouting` is absent, returns `topLevel`
+ * unchanged (backward-compat: ADRs without `phase_routing:` behave identically
+ * to today).  When a phase-specific entry exists, it shallow-merges on top of
+ * `topLevel`, so only the declared per-phase fields are overridden — undeclared
+ * fields fall back to the top-level values.
+ *
+ * Pure; no side-effects.
+ *
+ * @param topLevel        The ADR's top-level frontmatter routing fields.
+ * @param phaseRouting    The `phase_routing:` map (may be undefined/null).
+ * @param activePhase     The currently-active phase ID (first element of
+ *                        `phases` not yet in `shipped_phases`); null when all
+ *                        phases are shipped or `phases:` is absent.
+ * @returns               Merged routing object (always a new plain object).
+ */
+export function mergeActivePhaseRouting(
+	topLevel: { work_type?: string; assignee?: string; surface?: string; owner?: string },
+	phaseRouting: Record<string, PhaseRouting> | undefined | null,
+	activePhase: string | null,
+): { work_type?: string; assignee?: string; surface?: string; owner?: string } {
+	if (!activePhase || !phaseRouting) return topLevel;
+	const override = phaseRouting[activePhase];
+	if (!override) return topLevel;
+	return { ...topLevel, ...override };
 }

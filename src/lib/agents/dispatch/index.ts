@@ -22,13 +22,25 @@ import { claudePtyDispatcher } from './claude-pty.js';
 import { claudeCliFlagDispatcher } from './claude-cli-flag.js';
 import { claudeStreamJsonDispatcher } from './claude-stream-json.js';
 import { aiSdkDispatcher } from './ai-sdk.js';
-import { recordAgentRun, startAgentRun, finishAgentRun, updateRunProgress } from '../runs.js';
+import {
+	recordAgentRun,
+	startAgentRun,
+	finishAgentRun,
+	updateRunProgress,
+	updateRunSessionId,
+	listRunningSubjectPaths,
+	derivePhase,
+	cumulativeAdrSpend,
+} from '../runs.js';
+import { resolveAdrBudget } from './resolve-adr-budget.js';
+import { resolveAdrScope, type AdrScope } from './resolve-adr-scope.js';
 import { extractHandBackBlock } from '../handback.js';
 import { gateStatusForDeliverable } from './deliverable-gate.js';
 import { deriveHandbackFromBranch } from './gate-runner.js';
 import { escalateBudgetApproval, escalateVelocityWarning, escalateOperatorInput } from '../budget-escalation.js';
 import {
 	provisionAgentWorktree,
+	provisionAdrWorktree,
 	provisionResumeWorktree,
 	worktreeDirective,
 	type AgentWorktree,
@@ -80,6 +92,24 @@ export interface DispatchAgentOptions {
 	 *  When set alongside `resumeSessionId`, skips fresh worktree provisioning
 	 *  and re-uses (or adds) the worktree for this branch. */
 	resumeBranch?: string;
+	/** ADR-020 P1 — phase tag for this run.  Persisted to `agent_runs.phase`
+	 *  so the drawer can group runs by phase.  Conventional values: 'initial' |
+	 *  'P1' | 'P2' | 'finish' | 'falsifier' | 'iterate-N'.  Descriptive, not
+	 *  validated.  Endpoints (e.g. `bump-continue`) inject `'iterate-N'`;
+	 *  the workbench's Re-dispatch action will inject `'finish'` (post P2). */
+	phase?: string;
+	/** ADR-020 P3 — bypass the per-ADR cumulative budget gate. Operator-driven
+	 *  override surfaced as `?force=true` on dispatch endpoints (or the
+	 *  workbench "Spend anyway" button, post-P3 UI). Logged on the run so the
+	 *  override is auditable. Backward-compat: undefined = honour the gate. */
+	forceOverBudget?: boolean;
+	/** ADR-020 P4 — per-dispatch scope override. When set, REPLACES the ADR's
+	 *  `scope:` frontmatter for THIS dispatch only (the ADR's authored scope
+	 *  is untouched). Default: scope is snapshotted from the ADR at dispatch
+	 *  start. Used by ad-hoc dispatches (workbench "dispatch with custom
+	 *  scope", falsifier runs with different allowed paths). null = caller
+	 *  explicitly disables enforcement for this run; undefined = honour ADR. */
+	scope?: AdrScope | null;
 }
 
 /** Run an agent. Streams events; the generator's return value is the final
@@ -122,6 +152,30 @@ export async function* dispatchAgent(
 		resolveProjectRepo(opts.subjectPath, (p) => getVaultEngine()?.getNote(p)) ??
 		agent.repo;
 
+	// ADR-020 P1 — resolve once: caller-supplied phase wins; otherwise derive
+	// from prior runs of the same artifact (no priors → 'initial';
+	// prior success → 'follow-up'; only failures → 'retry-N'). Without this
+	// fallback the column went NULL for ~7 call sites that never injected
+	// a value (chat/scheduler/hygiene/orchestrator/intent/inbox/inline-actions),
+	// defeating workbench grouping and ADR-020 P3 cumulative-budget aggregation.
+	// `?? undefined` normalises derive-returns-null to the optional-field shape
+	// expected by AgentRunInput / AgentRunStartInput.
+	const effectivePhase = opts.phase ?? derivePhase(opts.subjectPath) ?? undefined;
+
+	// ADR-020 P4 — snapshot the dispatch scope at start time so the
+	// dispatch-scope-guard.sh PreToolUse hook can look it up by claude_session_id
+	// during the run.  Resolution order:
+	//   1. opts.scope === null              → explicit disable (no enforcement)
+	//   2. opts.scope set + non-null        → per-dispatch override
+	//   3. otherwise                        → resolve from ADR's frontmatter
+	//   4. ADR has no scope: block          → null (no enforcement, backward-compat)
+	// Serialised to JSON for the SQLite column; the hook parses it back.
+	const effectiveScope: AdrScope | null =
+		opts.scope === null
+			? null
+			: (opts.scope ?? resolveAdrScope(opts.subjectPath, (p) => getVaultEngine()?.getNote(p)));
+	const effectiveScopeJson = effectiveScope ? JSON.stringify(effectiveScope) : undefined;
+
 	const dispatcher = dispatchers[agent.backend];
 	if (!dispatcher) {
 		const err = `no dispatcher for backend '${agent.backend}'`;
@@ -151,7 +205,76 @@ export async function* dispatchAgent(
 	// ADR-024 D2 — resume path: when both `resumeSessionId` + `resumeBranch`
 	// are set, skip fresh provisioning and re-use the existing branch's worktree
 	// via `provisionResumeWorktree`. The non-resume path is unchanged.
+	//
+	// ADR-022 — D3 concurrent-dispatch guard.  If another `running` agent_run
+	// already targets this artifact, refuse before provisioning so two dispatches
+	// can't step on each other's commits in the (now-shared) worktree.  Only
+	// fires when `subjectPath` is set; non-artifact dispatches are unaffected.
+	if (opts.subjectPath) {
+		const inFlight = listRunningSubjectPaths();
+		if (inFlight.has(opts.subjectPath)) {
+			const msg = `concurrent dispatch refused — another run is already in flight for ${opts.subjectPath}`;
+			yield { type: 'error', message: msg, ts: Date.now() };
+			return {
+				runId: 'concurrent-dispatch-refused',
+				agentId: id,
+				backend: agent.backend,
+				status: 'error',
+				output: '',
+				cost_usd: 0,
+				num_turns: 0,
+				duration_ms: 0,
+				error: msg,
+			};
+		}
+	}
+
+	// ADR-020 P3 — Per-ADR cumulative budget gate.  Sums `cost_usd` across all
+	// terminal runs of `subjectPath` and refuses fresh dispatch when the cap
+	// (set on the ADR via `dispatch_budget_usd: number` frontmatter) would be
+	// exceeded by THIS run's nominal `max_usd`.  Backward-compatible: ADRs
+	// without `dispatch_budget_usd` skip the gate entirely.  Operator override
+	// via `opts.forceOverBudget` (surfaced as `?force=true` on dispatch
+	// endpoints) bypasses + logs an audit trail.
+	//
+	// Composes with ADR-006 per-run budgets: a single run can still pause +
+	// bump-continue at its OWN ceiling, but if ADR-cumulative is already past
+	// the cap the bump-continue itself refuses on entry.
+	if (opts.subjectPath && !opts.forceOverBudget) {
+		const adrCap = resolveAdrBudget(opts.subjectPath, (p) => getVaultEngine()?.getNote(p));
+		if (adrCap !== undefined) {
+			const cumulative = cumulativeAdrSpend(opts.subjectPath);
+			// Use the resolved per-run max: override beats agent default.
+			const thisRunMax = opts.budget_override?.max_usd ?? agent.budget?.max_usd ?? 0;
+			const projected = cumulative + thisRunMax;
+			if (projected > adrCap) {
+				const msg =
+					`per-ADR budget refused — ${opts.subjectPath} cumulative ` +
+					`$${cumulative.toFixed(2)} + this run's max $${thisRunMax.toFixed(2)} ` +
+					`= $${projected.toFixed(2)} > cap $${adrCap.toFixed(2)}. ` +
+					`Raise dispatch_budget_usd on the ADR or pass forceOverBudget=true to override.`;
+				yield { type: 'error', message: msg, ts: Date.now() };
+				return {
+					runId: 'adr-budget-refused',
+					agentId: id,
+					backend: agent.backend,
+					status: 'error',
+					output: '',
+					cost_usd: 0,
+					num_turns: 0,
+					duration_ms: 0,
+					error: msg,
+				};
+			}
+		}
+	}
+
 	let effectiveTask = task;
+	// R5 fix (2026-05-30) — hoist worktree cwd so it can be passed to the
+	// backend dispatcher. Previously `wt` lived only inside the try block, so
+	// the PTY spawn fell through to its hardcoded `config.resolved.vaultDir`
+	// and run 524 sat idle for 22min with cwd=vault.
+	let effectiveCwd: string | undefined;
 	if (effectiveRepo) {
 		try {
 			let wt: AgentWorktree;
@@ -160,11 +283,21 @@ export async function* dispatchAgent(
 				console.log(
 					`[agents/worktree] ${agent.id} → resume ${wt.branch} @ ${wt.worktreePath}`,
 				);
+			} else if (opts.subjectPath) {
+				// ADR-022 — default for any vault-artifact dispatch: ADR-keyed worktree.
+				// Idempotent — subsequent dispatches against the same ADR re-enter the
+				// same worktree on the same branch, so the agent sees the previous
+				// dispatch's commits at HEAD without explicit operator routing.
+				wt = await provisionAdrWorktree(effectiveRepo, opts.subjectPath);
+				console.log(`[agents/worktree] ${agent.id} → adr ${wt.branch} @ ${wt.worktreePath}`);
 			} else {
+				// Non-artifact dispatches (orchestrator background jobs, CLI tests):
+				// keep the per-run isolation since there's no ADR to key on.
 				wt = await provisionAgentWorktree(effectiveRepo, `run-${startedAt}`, opts.subjectPath);
 				console.log(`[agents/worktree] ${agent.id} → ${wt.branch} @ ${wt.worktreePath}`);
 			}
 			effectiveTask = worktreeDirective(wt) + task;
+			effectiveCwd = wt.worktreePath;
 		} catch (err) {
 			const msg = `worktree provisioning failed: ${(err as Error).message}`;
 			yield { type: 'error', message: msg, ts: Date.now() };
@@ -201,6 +334,9 @@ export async function* dispatchAgent(
 		// ADR-024 D2 — forwarded for completeness; worktree selection already
 		// handled above in the provisioning block.
 		resume_branch: opts.resumeBranch,
+		// R5 fix — PTY spawn cwd. Undefined for non-artifact dispatches; the
+		// backend falls back to its historical default (vaultDir for claude-pty).
+		cwd: effectiveCwd,
 	});
 	let result: DispatchResult;
 	let startRowWritten = false;
@@ -230,7 +366,31 @@ export async function* dispatchAgent(
 					// review-handoff can route git to the run's actual repo. Null for
 					// agents without a bound repo (legacy behaviour unchanged).
 					repo: effectiveRepo ?? undefined,
+					// ADR-020 P1 — phase tag: caller wins (bump-continue injects
+					// 'iterate-N'; Re-dispatch injects 'finish'); otherwise
+					// derived from prior runs of this subject_path so the column
+					// populates even when the call site didn't think to label.
+					phase: effectivePhase,
+					// ADR-020 P4 — JSON-serialised scope snapshot. The
+					// dispatch-scope-guard.sh PreToolUse hook reads this back by
+					// claude_session_id to refuse out-of-scope writes mid-run.
+					scopeJson: effectiveScopeJson,
 				});
+				// ADR-020 P4 — claude-pty surfaces the session UUID at start
+				// (not just finish). Stamp it on the running row immediately so
+				// the PreToolUse hook can join on a real value rather than NULL.
+				// Backward-compat: other backends omit claudeSessionId from the
+				// event; updateRunSessionId is a no-op when arg is undefined.
+				if (ev.claudeSessionId) {
+					try {
+						updateRunSessionId(ev.runId, ev.claudeSessionId);
+					} catch (err) {
+						console.error(
+							'[agents/runs] failed to stamp claude_session_id at start:',
+							(err as Error).message,
+						);
+					}
+				}
 			} catch (err) {
 				console.error('[agents/runs] failed to write start row:', (err as Error).message);
 			}
@@ -248,6 +408,11 @@ export async function* dispatchAgent(
 				reason: ev.reason,
 				spentUsd: ev.spentUsd,
 				turns: ev.turns,
+				// 2026-05-30 — forward the subject path so the Telegram body can
+				// show ADR cumulative spend vs the per-ADR dispatch_budget_usd cap.
+				// Operator decides on a tap with full per-ADR context, not just
+				// the per-dispatch numbers.
+				subjectPath: opts.subjectPath,
 			}).catch((err) =>
 				console.error('[agents/budget] velocity warning failed:', (err as Error).message),
 			);
@@ -283,6 +448,16 @@ export async function* dispatchAgent(
 			reason: pause.reason,
 			spentUsd: result.cost_usd,
 			turns: result.num_turns,
+			// Bug fix 2026-05-29 — capture the artifact + repo at pause time
+			// so `resumeWithRaisedBudget` can forward them to dispatchAgent on
+			// the Telegram-approval resume path. Without this, the resumed
+			// dispatch ran with subjectPath=undefined → start row subject_path
+			// NULL → ADR-022 D3 missed the in-flight run → concurrent dispatch
+			// leak (witnessed: run 0f885fb0 paused, df910cef sailed through).
+			// Also: no subjectPath meant no project repo lookup, so the
+			// resumed PTY ran in cwd=vault instead of the per-ADR worktree.
+			subjectPath: opts.subjectPath,
+			repo: effectiveRepo ?? undefined,
 		}).catch((err) =>
 			console.error('[agents/budget] escalation failed:', (err as Error).message),
 		);
@@ -445,6 +620,26 @@ async function persistRun(
 			// ADR-031 P1 — fallback insert path: same repo as the dispatch-start row
 			// would have written (used when the `started` event was never emitted).
 			repo: effectiveRepo ?? undefined,
+			// ADR-020 P1 — same phase tag the start row would have written.
+			// Re-derive here (vs. threading `effectivePhase` through 4 call sites)
+			// because this path fires only when the `started` event never emitted
+			// — at most once per dispatch, on early failure paths.
+			phase: opts.phase ?? derivePhase(opts.subjectPath) ?? undefined,
+			// ADR-020 P4 — same scope snapshot the start row would have written.
+			// On the early-failure path, no tool_use ever fires so this is a
+			// belt-and-braces audit value — preserves the scope-at-dispatch-time
+			// even when no enforcement happens.
+			scopeJson:
+				opts.scope === null
+					? undefined
+					: opts.scope
+						? JSON.stringify(opts.scope)
+						: (() => {
+								const s = resolveAdrScope(opts.subjectPath, (p) =>
+									getVaultEngine()?.getNote(p),
+								);
+								return s ? JSON.stringify(s) : undefined;
+							})(),
 		});
 	} catch (err) {
 		// Persistence is best-effort — never fail a dispatch because the

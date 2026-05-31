@@ -166,6 +166,272 @@
 	let sending     = $state(false);
 	let streamError = $state('');
 
+	// ── ADR-017 S1: Transcript hydration ─────────────────────────────────────
+	/** True while loading history from GET /api/chat/web/history. */
+	let historyLoading = $state(false);
+
+	// ── ADR-017 S3: Orchestrator chat history picker ──────────────────────────
+	interface OrchestratorConversation {
+		conversationKey: string;
+		scopeKind: string;
+		scopeParams: Record<string, string>;
+		label: string;
+		targetUrl: string;
+		lastTs: number;
+		lastRole: 'user' | 'assistant';
+		snippet: string;
+		turnCount: number;
+	}
+	let showChats         = $state(false);
+	let chatsLoading      = $state(false);
+	let chatList          = $state<OrchestratorConversation[]>([]);
+	let chatsBtnEl: HTMLButtonElement | undefined = $state();
+	let chatsDdLeft   = $state(0);
+	let chatsDdTop    = $state(0);
+	let chatsDdBottom = $state(0);
+	let chatsDdDown   = $state(false);
+
+
+	// ── ADR-018 — Context gauge ──────────────────────────────────────────────────
+	/** Shape of the `usage` field on the `complete` SSE event (ADR-018 S1). */
+	interface WindowUsage {
+		turns:   number;
+		turnCap: number;
+		bytes:   number;
+		byteCap: number;
+		idleMs:  number;
+		idleCap: number;
+	}
+	/** Last window-usage snapshot from the server; updated on every `complete` event.
+	 *  Null until the first turn completes (nothing to show on a fresh conversation). */
+	let contextUsage = $state<WindowUsage | null>(null);
+
+	// ── Voice recording state (ADR-019) ────────────────────────────────────────
+	// Web Speech API — not in lib.dom.d.ts for TS 6.x; define the minimal surface
+	// we actually use so we get proper typing without an external @types package.
+	interface _WSRResultItem { transcript: string; }
+	interface _WSRResult { isFinal: boolean; [i: number]: _WSRResultItem; }
+	interface _WSRResultList { length: number; [i: number]: _WSRResult; }
+	interface _WSREvent extends Event { resultIndex: number; results: _WSRResultList; }
+	interface _WSRSpeechRecognition extends EventTarget {
+		lang: string;
+		continuous: boolean;
+		interimResults: boolean;
+		onresult: ((ev: _WSREvent) => void) | null;
+		onend:    (() => void) | null;
+		onerror:  (() => void) | null;
+		start(): void;
+		stop():  void;
+	}
+
+	// Three mutually exclusive mic states visible to the template.
+	type VoiceMicState = 'idle' | 'recording' | 'transcribing' | 'error';
+	let micState   = $state<VoiceMicState>('idle');
+	let micError   = $state('');
+	let micElapsed = $state(0);   // seconds elapsed since recording started
+	let micHint    = $state('');  // transient hint (e.g. "long clip" warning)
+
+	// Non-reactive internals — not exposed to the template.
+	let _mediaStream:   MediaStream             | null = null;
+	let _mediaRecorder: MediaRecorder           | null = null;
+	let _speechRecog:   _WSRSpeechRecognition   | null = null;
+	let _audioChunks:   BlobPart[] = [];
+	let _elapsedTimer:  ReturnType<typeof setInterval> | null = null;
+	let _speechText  = '';
+	let _speechDone  = false;
+
+	const MAX_RECORD_S = 60; // 60-second ceiling — matches WhatsApp inbound cap
+
+	function _stopElapsedTimer() {
+		if (_elapsedTimer !== null) { clearInterval(_elapsedTimer); _elapsedTimer = null; }
+	}
+
+	/** Stop the active mic session: timer, Web Speech, and MediaRecorder.
+	 *  MediaRecorder.stop() fires onstop, which handles the S3/S2 decision. */
+	function _stopMicSession() {
+		_stopElapsedTimer();
+		try { _speechRecog?.stop(); } catch { /* already stopped */ }
+		_speechRecog = null;
+		if (_mediaRecorder && _mediaRecorder.state !== 'inactive') {
+			_mediaRecorder.stop(); // triggers onstop → S3 vs S2 path
+		}
+		_mediaRecorder = null;
+	}
+
+	/** Toggle the microphone: start on first click, stop on second. */
+	async function toggleMic() {
+		if (micState === 'recording') {
+			_stopMicSession();
+			return;
+		}
+
+		// ── First click: start ────────────────────────────────────────────────
+		micError   = '';
+		micHint    = '';
+		micElapsed = 0;
+		_speechText = '';
+		_speechDone = false;
+		_audioChunks = [];
+
+		// Request microphone access.
+		let stream: MediaStream;
+		try {
+			stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+		} catch (err) {
+			const name = (err as { name?: string }).name;
+			if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+				micError = 'Microphone access denied. Enable it in your browser settings and reload.';
+			} else {
+				micError = `Could not access microphone: ${(err as Error).message ?? 'unknown error'}`;
+			}
+			micState = 'error';
+			return;
+		}
+		_mediaStream = stream;
+
+		// ── S3: Start Web Speech API (fast path, opportunistic) ──────────────
+		// Feature-detect at runtime — never at module init (SSR guard).
+		type SpeechRecCtor = new () => _WSRSpeechRecognition;
+		const w = window as Window & {
+			SpeechRecognition?:       SpeechRecCtor;
+			webkitSpeechRecognition?: SpeechRecCtor;
+		};
+		const SpeechRecognitionAPI = w.SpeechRecognition ?? w.webkitSpeechRecognition;
+
+		if (SpeechRecognitionAPI) {
+			try {
+				const sr = new SpeechRecognitionAPI();
+				// Derive language hint from the page's <html lang> attribute (e.g.
+				// "ar" for Arabic operators); defaults to "en-US".
+				const htmlLang =
+					(typeof document !== 'undefined' && document.documentElement.lang)
+						? document.documentElement.lang
+						: 'en-US';
+				sr.lang           = htmlLang;
+				sr.continuous     = true;
+				sr.interimResults = true;
+
+				sr.onresult = (ev: _WSREvent) => {
+					let interim = '';
+					for (let i = ev.resultIndex; i < ev.results.length; i++) {
+						const seg = ev.results[i][0].transcript;
+						if (ev.results[i].isFinal) {
+							_speechText += seg;
+						} else {
+							interim += seg;
+						}
+					}
+					// Show live interim transcript while the operator speaks.
+					const live = (_speechText + interim).trim();
+					if (live) input = live;
+				};
+
+				sr.onend = () => { _speechDone = true; };
+				sr.onerror = () => {
+					// API error → mark done with empty text so the upload tier takes over.
+					_speechDone = true;
+					_speechText = '';
+				};
+
+				sr.start();
+				_speechRecog = sr;
+			} catch {
+				// Web Speech failed to start — silently fall through to upload tier.
+				_speechRecog = null;
+			}
+		}
+
+		// ── S2: Start MediaRecorder (universal / truth tier) ─────────────────
+		let recorder: MediaRecorder;
+		try {
+			const mimeType =
+				MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+					? 'audio/webm;codecs=opus'
+					: MediaRecorder.isTypeSupported('audio/webm')
+					? 'audio/webm'
+					: '';
+			recorder = mimeType
+				? new MediaRecorder(stream, { mimeType })
+				: new MediaRecorder(stream);
+		} catch (err) {
+			stream.getTracks().forEach((t) => t.stop());
+			_mediaStream = null;
+			micError = `Could not start recorder: ${(err as Error).message ?? 'unknown error'}`;
+			micState = 'error';
+			return;
+		}
+
+		recorder.ondataavailable = (ev) => {
+			if (ev.data.size > 0) _audioChunks.push(ev.data);
+		};
+
+		recorder.onstop = async () => {
+			// Stop the media stream tracks so the browser mic-active indicator clears.
+			_mediaStream?.getTracks().forEach((t) => t.stop());
+			_mediaStream = null;
+
+			// ── S3 decision: did Web Speech succeed? ─────────────────────────
+			if (_speechDone && _speechText.trim()) {
+				// Web Speech produced clean text → no API spend, instant result.
+				input    = _speechText.trim();
+				micState = 'idle';
+				return;
+			}
+
+			// ── S2: upload the blob to the server transcription tier ──────────
+			if (_audioChunks.length === 0) {
+				micError = 'No audio captured — please try again.';
+				micState = 'error';
+				return;
+			}
+
+			micState = 'transcribing';
+			input    = ''; // clear the live Web Speech interim text, if any
+
+			const blob     = new Blob(_audioChunks, { type: recorder.mimeType || 'audio/webm' });
+			const formData = new FormData();
+			formData.append('audio', blob, 'voice-clip.webm');
+			formData.append('mimetype', blob.type);
+
+			try {
+				const res  = await fetch('/api/chat/web/transcribe', { method: 'POST', body: formData });
+				const data = await res.json() as { text?: string; error?: string };
+
+				if (!res.ok || data.error) {
+					micError = data.error ?? `Transcription error (HTTP ${res.status}).`;
+					micState = 'error';
+					return;
+				}
+
+				const text = (data.text ?? '').trim();
+				if (text === '[unintelligible]' || !text) {
+					micError = 'Could not understand the audio — please try again.';
+					micState = 'error';
+					return;
+				}
+
+				input    = text;
+				micState = 'idle';
+			} catch (err) {
+				micError = `Network error: ${(err as Error).message ?? 'could not reach server'}`;
+				micState = 'error';
+			}
+		};
+
+		recorder.start(250); // 250 ms timeslice for low-latency chunks
+		_mediaRecorder = recorder;
+		micState       = 'recording';
+
+		// Elapsed timer — also enforces the 60-second ceiling.
+		_elapsedTimer = setInterval(() => {
+			micElapsed++;
+			if (micElapsed >= MAX_RECORD_S) {
+				micHint = 'Long clips are split into multiple sends.';
+				_stopMicSession();
+			}
+		}, 1000);
+	}
+
 	// Resize drag
 	let resizing       = $state(false);
 	let anchorY        = 0;
@@ -238,6 +504,12 @@
 			const ev = sessionStorage.getItem(ENGINE_KEY);
 			if (ev === 'pty' || ev === 'orchestrator' || ev === 'terminal') engine = ev;
 		} catch { /* sessionStorage unavailable (private mode etc.) */ }
+
+		// ADR-017 S1 — Hydrate transcript on mount (orchestrator engine only).
+		if (engine === 'orchestrator') {
+			void loadTranscript();
+		}
+
 		return () => window.removeEventListener('resize', computeMaxH);
 	});
 
@@ -245,6 +517,13 @@
 		// Clear all workbench poll timers to prevent memory leaks (ADR-007).
 		for (const handle of pollTimers.values()) clearInterval(handle);
 		pollTimers.clear();
+		// Clean up any active voice recording (ADR-019).
+		_stopElapsedTimer();
+		try { _speechRecog?.stop(); } catch { /* already stopped */ }
+		if (_mediaRecorder && _mediaRecorder.state !== 'inactive') {
+			try { _mediaRecorder.stop(); } catch { /* already stopped */ }
+		}
+		_mediaStream?.getTracks().forEach((t) => t.stop());
 	});
 
 	// ── Persist open/height ─────────────────────────────────────────────────────
@@ -537,9 +816,15 @@
 		// notePath/contactId changes also clear the transcript.
 		const key = `${scopeKind}:${JSON.stringify(scopeParams)}`;
 		if (_prevScopeKey && key !== _prevScopeKey) {
-			// Orchestrator: clear chat transcript
-			messages    = [];
-			streamError = '';
+			// ADR-017 S1 — Orchestrator: re-hydrate from server history rather
+			// than just clearing, so navigating to a scope you chatted in before
+			// restores the visible transcript immediately.
+			if (engine === 'orchestrator') {
+				void loadTranscript();
+			} else {
+				messages    = [];
+				streamError = '';
+			}
 			// PTY: detach (don't kill) — the old scope's session stays alive so
 			// returning to that workspace re-attaches; activation re-runs for the
 			// new scope and re-attaches to ITS live session (if any).
@@ -548,6 +833,102 @@
 		}
 		_prevScopeKey = key;
 	});
+
+	// ── ADR-017 S1 — Transcript hydration ───────────────────────────────────────
+
+	/**
+	 * Fetch and restore the persisted transcript for the current scope.
+	 * Called on mount (when orchestrator engine is active) and on every
+	 * scope-key change so the visible transcript always reflects server state.
+	 * Clears the current messages first so stale rows never linger.
+	 */
+	async function loadTranscript() {
+		if (engine !== 'orchestrator') return;
+		messages       = [];
+		streamError    = '';
+		contextUsage   = null; // ADR-018 — clear gauge while transcript reloads
+		historyLoading = true;
+		try {
+			const params = new URLSearchParams({ scopeKind });
+			if (scopeKind === 'project'     && scopeSlug)      params.set('slug',      scopeSlug);
+			if (scopeKind === 'vault-note'  && scopeNotePath)  params.set('notePath',  scopeNotePath);
+			if (scopeKind === 'crm-contact' && scopeContactId) params.set('contactId', scopeContactId);
+			const res  = await fetch(`/api/chat/web/history?${params.toString()}`);
+			if (!res.ok) return; // silent: empty transcript is fine on error
+			const data = await res.json() as { messages?: { role: 'user' | 'assistant'; content: string; ts: number }[] };
+			if (!data.messages?.length) return;
+			// Map server rows → ChatMsg format. No streaming flag — these are settled.
+			messages = data.messages.map((m) => ({
+				id:   `h-${m.ts}`,
+				role: m.role as MsgRole,
+				text: m.content,
+			}));
+		} catch {
+			// Network hiccup — treat as empty transcript.
+		} finally {
+			historyLoading = false;
+		}
+	}
+
+	// ── ADR-017 S2 — New-chat reset (orchestrator) ────────────────────────────
+
+	/**
+	 * Clear the server-side conversation history for the current scope and
+	 * wipe the visible transcript. The PTY/Terminal "New" button calls
+	 * `newSession()` instead (kills processes); this is the orchestrator
+	 * equivalent that only wipes the stored turns.
+	 */
+	async function newOrchestratorChat() {
+		if (sending) return;
+		try {
+			const params = new URLSearchParams({ scopeKind });
+			if (scopeKind === 'project'     && scopeSlug)      params.set('slug',      scopeSlug);
+			if (scopeKind === 'vault-note'  && scopeNotePath)  params.set('notePath',  scopeNotePath);
+			if (scopeKind === 'crm-contact' && scopeContactId) params.set('contactId', scopeContactId);
+			await fetch(`/api/chat/web/history?${params.toString()}`, { method: 'DELETE' });
+		} catch {
+			// Best-effort: wipe locally regardless.
+		}
+		messages     = [];
+		streamError  = '';
+		contextUsage = null; // ADR-018 — fresh conversation, no gauge until first turn
+	}
+
+	// ── ADR-017 S3 — Cross-scope conversations picker ────────────────────────
+
+	async function loadChatHistory() {
+		chatsLoading = true;
+		try {
+			const res = await fetch('/api/chat/web/conversations?limit=50');
+			chatList  = res.ok ? ((await res.json()).conversations ?? []) as OrchestratorConversation[] : [];
+		} catch {
+			chatList = [];
+		} finally {
+			chatsLoading = false;
+		}
+	}
+
+	function toggleChats() {
+		if (showChats) { showChats = false; return; }
+		if (chatsBtnEl) {
+			const r     = chatsBtnEl.getBoundingClientRect();
+			chatsDdLeft   = r.left;
+			chatsDdDown   = r.top < window.innerHeight / 2;
+			chatsDdTop    = r.bottom + 4;
+			chatsDdBottom = window.innerHeight - r.top + 4;
+		}
+		void loadChatHistory();
+		showChats = true;
+	}
+
+	/** Navigate to a past conversation's scope URL. The scope-change $effect
+	 *  (S1) will detect the new scopeKey and re-hydrate the transcript. */
+	function pickConversation(c: OrchestratorConversation) {
+		showChats = false;
+		if (c.targetUrl) {
+			void goto(c.targetUrl);
+		}
+	}
 
 	// ── Send message ────────────────────────────────────────────────────────────
 	async function send() {
@@ -675,6 +1056,10 @@
 							break;
 						}
 						case 'complete': {
+							// ADR-018 S2 — update the context gauge from the server snapshot.
+							if (ev.usage && typeof ev.usage === 'object') {
+								contextUsage = ev.usage as WindowUsage;
+							}
 							// Terminal: finalize the current bubble's streaming state.
 							if (bubbleId) {
 								// ADR-015 S2 — reposition the answer bubble AFTER all tool
@@ -1077,6 +1462,63 @@
 			</button>
 		</div>
 
+		<!-- ADR-017 S2 + S3 — Orchestrator-engine controls (New chat + Chats picker) -->
+		{#if engine === 'orchestrator'}
+			<!-- "New chat" button — clears server history + local transcript -->
+			<button
+				onclick={() => void newOrchestratorChat()}
+				class="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] text-hub-muted hover:bg-hub-card hover:text-hub-text transition-colors cursor-pointer flex-shrink-0"
+				title="Start a new conversation (clears stored history for this scope)"
+				disabled={sending}
+			>
+				<svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+					<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+				</svg>
+				New chat
+			</button>
+
+			<!-- "Chats" picker — cross-scope history (S3) -->
+			<button
+				bind:this={chatsBtnEl}
+				onclick={toggleChats}
+				class="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] text-hub-muted hover:bg-hub-card hover:text-hub-text transition-colors cursor-pointer flex-shrink-0"
+				title="Browse past conversations across all scopes"
+			>
+				<svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+					<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+				</svg>
+				Chats
+				<svg class="w-2.5 h-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+			</button>
+
+			<!-- ADR-018 S2 — Context gauge: turn count + byte usage.
+			     Hidden until the first complete event so there is nothing to show
+			     on a fresh session.  Idle window shown on hover only.
+			     The tightest axis (turns or bytes) drives the coloured bar. -->
+			{#if contextUsage}
+				{@const turnPct  = contextUsage.turns / contextUsage.turnCap}
+				{@const bytesPct = contextUsage.bytes / contextUsage.byteCap}
+				{@const pct      = Math.max(turnPct, bytesPct)}
+				{@const gaugeCol = pct > 0.85 ? 'text-hub-danger' : pct > 0.60 ? 'text-hub-warning' : 'text-hub-dim'}
+				{@const barCol   = pct > 0.85 ? 'bg-hub-danger'   : pct > 0.60 ? 'bg-hub-warning'   : 'bg-hub-cta/50'}
+				<div
+					class="flex flex-col gap-0.5 flex-shrink-0 cursor-default"
+					title="Context window · {contextUsage.turns}/{contextUsage.turnCap} turns · {(contextUsage.bytes / 1024).toFixed(1)} KB / 2 KB · idle {Math.round(contextUsage.idleMs / 60_000)}m / 240m"
+					aria-label="Context window usage"
+				>
+					<span class="text-[10px] font-mono {gaugeCol} whitespace-nowrap leading-none">
+						{contextUsage.turns}/{contextUsage.turnCap} · {(contextUsage.bytes / 1024).toFixed(1)} KB / 2 KB
+					</span>
+					<div class="w-full h-0.5 rounded-full bg-hub-border/40 overflow-hidden">
+						<div
+							class="{barCol} h-0.5 rounded-full transition-all duration-300"
+							style="width: {Math.min(100, Math.round(pct * 100))}%"
+						></div>
+					</div>
+				</div>
+			{/if}
+		{/if}
+
 		<!-- Spacer -->
 		<div class="flex-1"></div>
 
@@ -1102,6 +1544,9 @@
 				{:else}
 					<span>shell</span>
 				{/if}
+			{:else if historyLoading}
+				<span class="inline-block w-1.5 h-1.5 rounded-full bg-hub-muted animate-pulse"></span>
+				<span class="text-hub-muted">loading</span>
 			{:else if sending}
 				<span class="inline-block w-1.5 h-1.5 rounded-full bg-hub-cta animate-pulse"></span>
 				<span class="text-hub-cta">working</span>
@@ -1110,6 +1555,42 @@
 			{/if}
 		</div>
 	</header>
+
+	<!-- ADR-017 S3 — Conversations picker dropdown (orchestrator engine) -->
+	{#if showChats}
+		<!-- Click-away backdrop -->
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div class="fixed inset-0 z-40" onclick={() => (showChats = false)}></div>
+		<!-- Fixed + bottom-anchored: opens UPWARD so it isn't clipped by the bottom-docked drawer. -->
+		<div
+			class="fixed w-80 max-h-72 overflow-y-auto bg-hub-card border border-hub-border rounded-lg shadow-2xl z-50"
+			style={chatsDdDown ? `left: ${chatsDdLeft}px; top: ${chatsDdTop}px;` : `left: ${chatsDdLeft}px; bottom: ${chatsDdBottom}px;`}
+		>
+			<div class="px-3 py-1.5 border-b border-hub-border/50 text-[10px] text-hub-dim uppercase tracking-wider">Past conversations</div>
+			{#if chatsLoading}
+				<div class="px-3 py-4 text-center text-[11px] text-hub-dim">Loading…</div>
+			{:else if chatList.length === 0}
+				<div class="px-3 py-4 text-center text-[11px] text-hub-dim">No past conversations yet</div>
+			{:else}
+				{#each chatList as c (c.conversationKey)}
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
+					<div
+						onclick={() => pickConversation(c)}
+						class="flex flex-col gap-0.5 px-3 py-2 hover:bg-hub-surface/60 cursor-pointer border-b border-hub-border/20 last:border-0 transition-colors"
+					>
+						<!-- Scope label + time -->
+						<div class="flex items-center gap-2">
+							<span class="text-[10px] px-1.5 py-0.5 rounded-full bg-hub-border/50 text-hub-muted font-mono truncate max-w-[120px]">{c.label}</span>
+							<span class="text-[10px] text-hub-dim ml-auto flex-shrink-0">{relativeTime(new Date(c.lastTs).toISOString())}</span>
+							<span class="text-[10px] text-hub-dim flex-shrink-0">{c.turnCount} turns</span>
+						</div>
+						<!-- Snippet (last message text) -->
+						<p class="text-[11px] text-hub-text/80 leading-snug line-clamp-2">{c.snippet}</p>
+					</div>
+				{/each}
+			{/if}
+		</div>
+	{/if}
 
 	<!-- ── Body (only rendered when open) ───────────────────────────────────── -->
 	{#if open}
@@ -1128,7 +1609,13 @@
 					class="flex-1 min-h-0 overflow-y-auto px-3 py-2 space-y-2 scroll-smooth"
 					bind:this={scrollEl}
 				>
-					{#if messages.length === 0}
+					{#if historyLoading}
+						<!-- ADR-017 S1 — subtle loading state while restoring transcript -->
+						<div class="flex items-center justify-center gap-1.5 py-4 text-[11px] text-hub-dim">
+							<span class="inline-block w-1.5 h-1.5 rounded-full bg-hub-muted animate-pulse"></span>
+							<span>Restoring conversation…</span>
+						</div>
+					{:else if messages.length === 0}
 						<p class="text-[11px] text-hub-dim italic py-4 text-center">
 							Ask anything about {chipLabel}…
 						</p>
@@ -1280,25 +1767,108 @@
 					{/if}
 				</div>
 
-				<!-- Input row (Orchestrator only) -->
-				<div class="flex-shrink-0 flex items-center gap-2 px-3 py-2 border-t border-hub-border/50">
-					<textarea
-						class="flex-1 min-h-[32px] max-h-[80px] resize-none rounded-md bg-hub-card border border-hub-border px-2.5 py-1.5 text-[12px] text-hub-text placeholder:text-hub-dim focus:outline-none focus:border-hub-cta/50 transition-colors leading-snug"
-						placeholder="Message…"
-						rows="1"
-						bind:value={input}
-						onkeydown={handleKeydown}
-						disabled={sending}
-						aria-label="Chat message input"
-					></textarea>
-					<button
-						class="flex-shrink-0 px-3 py-1.5 rounded-md bg-hub-cta text-hub-bg text-[12px] font-medium hover:bg-hub-cta/90 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-						onclick={() => void send()}
-						disabled={sending || !input.trim()}
-						aria-label="Send message"
-					>
-						{sending ? '…' : '↑'}
-					</button>
+				<!-- Input area (Orchestrator only) — ADR-019: mic button + chips -->
+				<div class="flex-shrink-0 flex flex-col border-t border-hub-border/50">
+					<!-- Input row -->
+					<div class="flex items-center gap-2 px-3 py-2">
+						<textarea
+							class="flex-1 min-h-[32px] max-h-[80px] resize-none rounded-md bg-hub-card border border-hub-border px-2.5 py-1.5 text-[12px] text-hub-text placeholder:text-hub-dim focus:outline-none focus:border-hub-cta/50 transition-colors leading-snug"
+							placeholder="Message…"
+							rows="1"
+							bind:value={input}
+							onkeydown={handleKeydown}
+							disabled={sending}
+							aria-label="Chat message input"
+						></textarea>
+
+						<!-- 🎤 Mic button (ADR-019) — S2/S3 dual-tier voice input -->
+						<button
+							class={[
+								'flex-shrink-0 flex items-center justify-center w-7 h-7 rounded-md transition-colors cursor-pointer',
+								micState === 'recording'
+									? 'bg-red-500/20 text-red-400 border border-red-500/40'
+									: micState === 'transcribing'
+									? 'bg-hub-card text-hub-cta border border-hub-border animate-pulse'
+									: micState === 'error'
+									? 'bg-hub-card text-hub-danger border border-hub-danger/40 hover:bg-hub-danger/10'
+									: 'bg-hub-card text-hub-dim border border-hub-border hover:text-hub-text hover:border-hub-cta/50',
+							].join(' ')}
+							onclick={() => void toggleMic()}
+							disabled={sending || micState === 'transcribing'}
+							aria-label={micState === 'recording' ? 'Stop recording' : 'Start voice input'}
+							title={
+								micState === 'recording'
+									? `Stop recording (${micElapsed}s)`
+									: micState === 'transcribing'
+									? 'Transcribing…'
+									: micState === 'error'
+									? 'Voice input error — click to retry'
+									: 'Voice input'
+							}
+						>
+							{#if micState === 'recording'}
+								<!-- Stop icon + elapsed seconds -->
+								<span class="flex items-center gap-0.5">
+									<svg class="w-3 h-3 flex-shrink-0" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+										<rect x="5" y="5" width="14" height="14" rx="2"/>
+									</svg>
+									{#if micElapsed > 0}
+										<span class="text-[10px] font-mono leading-none tabular-nums">{micElapsed}</span>
+									{/if}
+								</span>
+							{:else if micState === 'transcribing'}
+								<!-- Spinner -->
+								<svg class="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
+									<path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+								</svg>
+							{:else}
+								<!-- Microphone icon -->
+								<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+									<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+									<path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+									<line x1="12" y1="19" x2="12" y2="23"/>
+									<line x1="8" y1="23" x2="16" y2="23"/>
+								</svg>
+							{/if}
+						</button>
+
+						<button
+							class="flex-shrink-0 px-3 py-1.5 rounded-md bg-hub-cta text-hub-bg text-[12px] font-medium hover:bg-hub-cta/90 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+							onclick={() => void send()}
+							disabled={sending || !input.trim()}
+							aria-label="Send message"
+						>
+							{sending ? '…' : '↑'}
+						</button>
+					</div>
+
+					<!-- Voice feedback chips (only shown when relevant) -->
+					{#if micState === 'recording'}
+						<div class="flex items-center gap-1.5 px-3 pb-1.5 text-[11px] text-red-400">
+							<span class="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse flex-shrink-0"></span>
+							<span>Recording… speak now, then click the stop button</span>
+						</div>
+					{:else if micError}
+						<!-- Error chip with optional "enable mic in settings" link for permission errors -->
+						<div class="flex items-center gap-1.5 px-3 pb-1.5 text-[11px] text-hub-danger">
+							<svg class="w-3 h-3 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+								<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+							</svg>
+							<span class="flex-1">{micError}</span>
+							<button
+								class="text-hub-dim hover:text-hub-text underline cursor-pointer"
+								onclick={() => { micError = ''; micState = 'idle'; }}
+								aria-label="Dismiss voice error"
+							>dismiss</button>
+						</div>
+					{:else if micHint}
+						<div class="flex items-center gap-1.5 px-3 pb-1.5 text-[11px] text-hub-muted">
+							<svg class="w-3 h-3 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+								<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+							</svg>
+							<span>{micHint}</span>
+						</div>
+					{/if}
 				</div>
 
 			{:else if engine === 'pty'}

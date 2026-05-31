@@ -39,13 +39,32 @@ async function git(args: string[], cwd: string): Promise<{ stdout: string; stder
 
 // ── Worktree lifecycle ───────────────────────────────────────────
 
-export async function createWorktree(
+/** ADR-022 — Worktree validation for branch names (allows `/` separators).
+ *  Stricter than git's actual rules but matches what we generate. */
+const BRANCH_RE = /^[\w/.-]+$/;
+function validateBranch(b: string): void {
+	if (!BRANCH_RE.test(b) || b.length > 200) {
+		throw new Error(`Invalid branch name: ${b}`);
+	}
+}
+
+/** ADR-022 — Parameterized core of worktree provisioning.
+ *  Takes the worktree subdirectory name + the branch name explicitly so
+ *  callers can choose either the run-keyed convention
+ *  (`<runId>-<taskId>` / `orchestration/<runId>/<taskId>`) or the
+ *  ADR-keyed convention (`<adrKey>` / `claude-soul/<adrKey>`).
+ *
+ *  Idempotent: if the worktree already exists on the right branch (the
+ *  common case for any 2nd+ dispatch against the same ADR), no-op.
+ *  Throws if the worktree exists on a DIFFERENT branch (operator manually
+ *  checked out something else) — refuse to silently overwrite. */
+export async function createWorktreeAt(
 	projectPath: string,
-	runId: string,
-	taskId: string,
+	worktreeDirName: string,
+	branch: string,
 ): Promise<{ worktreePath: string; branch: string }> {
-	validateId(runId);
-	validateId(taskId);
+	validateId(worktreeDirName);
+	validateBranch(branch);
 
 	const worktreeDir = join(projectPath, '.worktrees');
 	await mkdir(worktreeDir, { recursive: true });
@@ -59,8 +78,7 @@ export async function createWorktree(
 		}
 	} catch { /* best effort */ }
 
-	const worktreePath = join(worktreeDir, `${runId}-${taskId}`);
-	const branch = `orchestration/${runId}/${taskId}`;
+	const worktreePath = join(worktreeDir, worktreeDirName);
 
 	return withGitMutex(async () => {
 		// Ensure main branch has at least one commit (worktrees need a base)
@@ -77,17 +95,54 @@ export async function createWorktree(
 			await git(['rev-parse', '--verify', branch], projectPath);
 			// Branch exists — check if worktree already exists too
 			if (existsSync(worktreePath)) {
+				// ADR-022 — verify the existing worktree is actually on this branch.
+				// `git worktree list --porcelain` includes a `branch refs/heads/<name>`
+				// line per worktree.  If a different branch is checked out, refuse.
+				const { stdout } = await git(['worktree', 'list', '--porcelain'], projectPath);
+				let currentWtPath = '';
+				let onBranch = false;
+				for (const line of stdout.split('\n')) {
+					if (line.startsWith('worktree ')) {
+						currentWtPath = line.slice('worktree '.length).trim();
+					} else if (line.startsWith('branch refs/heads/') && currentWtPath === worktreePath) {
+						const wtBranch = line.slice('branch refs/heads/'.length).trim();
+						if (wtBranch === branch) onBranch = true;
+					}
+				}
+				if (!onBranch) {
+					throw new Error(
+						`worktree at ${worktreePath} exists on a different branch — refusing to overwrite`,
+					);
+				}
 				return { worktreePath, branch };
 			}
 			// Branch exists but worktree doesn't — create worktree on existing branch
 			await git(['worktree', 'add', '--lock', worktreePath, branch], projectPath);
-		} catch {
+		} catch (err) {
+			// If the error is our own "different branch" refusal, re-throw it.
+			if ((err as Error).message?.includes('refusing to overwrite')) throw err;
 			// Branch doesn't exist — create new worktree with new branch from HEAD
 			await git(['worktree', 'add', '--lock', '-b', branch, worktreePath, 'HEAD'], projectPath);
 		}
 
 		return { worktreePath, branch };
 	});
+}
+
+/** Legacy per-run worktree convention. Composes `createWorktreeAt` with
+ *  the `<runId>-<taskId>` / `orchestration/<runId>/<taskId>` shape. */
+export async function createWorktree(
+	projectPath: string,
+	runId: string,
+	taskId: string,
+): Promise<{ worktreePath: string; branch: string }> {
+	validateId(runId);
+	validateId(taskId);
+	return createWorktreeAt(
+		projectPath,
+		`${runId}-${taskId}`,
+		`orchestration/${runId}/${taskId}`,
+	);
 }
 
 export async function removeWorktree(worktreePath: string, force = false): Promise<void> {

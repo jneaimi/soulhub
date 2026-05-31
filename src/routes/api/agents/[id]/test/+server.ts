@@ -22,6 +22,8 @@ import { abortsOnClientDisconnect } from '$lib/agents/dispatch/detach.js';
 import { getAgent } from '$lib/agents/store.js';
 import { getVaultEngine } from '$lib/vault/index.js';
 import { deriveWorkType } from '$lib/agents/dispatch/derive-work-type.js';
+import { resolveProjectRepo } from '$lib/agents/dispatch/resolve-project-repo.js';
+import { lintAdr } from '$lib/vault/adr-lint.js';
 
 export const POST: RequestHandler = async ({ params, request, url }) => {
 	const id = params.id;
@@ -74,21 +76,55 @@ export const POST: RequestHandler = async ({ params, request, url }) => {
 	const mode: DispatchMode =
 		modeParam === 'production' ? 'production' : 'test';
 
-	// ADR-014 D2 + ADR-015 — fail-closed server guard.
-	// Production coding dispatches MUST go to a repo-bound agent (ADR-010).
-	// A repo-less agent runs with no worktree and no deliverable gate — every
-	// safety layer is bypassed at once. Refuse loudly instead of running silently.
-	// workTypeParam is now derived server-side (ADR-015): the vault note's
-	// work_type is authoritative, so omitting work_type from the body no longer
-	// bypasses this guard. This closes the gap for `soul` CLI, direct API calls,
-	// re-dispatch buttons on resumed sessions, etc.
-	if (mode === 'production' && workTypeParam === 'coding' && !agent.repo) {
+	// ADR-014 D2 + ADR-015 + ADR-030 — fail-closed server guard, aligned with the
+	// dispatcher's effective-repo resolution.
+	// Production coding dispatches MUST land in a worktree — either the agent's
+	// static `repo:` (ADR-010) or the project's `repo:` frontmatter on its index
+	// note (ADR-030). A run with neither has no worktree and no deliverable gate;
+	// every safety layer would be bypassed at once. Refuse loudly.
+	// Mirrors `effectiveRepo = projectRepo ?? agent.repo` in dispatch/index.ts:151
+	// — the guard must match the dispatcher's resolution or it cuts off the
+	// project-bound `implementer` carve-out (ADR-011 D2). Pre-2026-05-30 the
+	// guard only inspected `agent.repo`, blocking every dispatch to the generic
+	// `implementer` even when the project's index supplied a perfectly good repo.
+	const projectRepo = resolveProjectRepo(subjectPath, (p) => getVaultEngine()?.getNote(p));
+	const effectiveRepo = projectRepo ?? agent.repo;
+
+	if (mode === 'production' && workTypeParam === 'coding' && !effectiveRepo) {
 		throw error(
 			422,
-			`Refusing to dispatch coding work to '${id}': it has no repo binding, so the run ` +
-				`would have no worktree isolation (ADR-010). Set \`assignee\` to a repo-bound ` +
-				`implementer or bind the project's repo.`,
+			`Refusing to dispatch coding work to '${id}': it has no repo binding (neither the ` +
+				`agent's static \`repo:\` nor the project's index \`repo:\`), so the run would have ` +
+				`no worktree isolation (ADR-010 + ADR-030). Set \`assignee\` to a repo-bound ` +
+				`implementer, or add \`repo: ~/dev/<slug>\` to the project's index.md.`,
 		);
+	}
+
+	// ADR-044 P2 — lint pre-flight on the subject ADR. The chokepoint at the
+	// latest possible interception point — catches dispatches that came in via
+	// the UI's "Continue with Pn" button or direct API calls that skipped the
+	// CLI propose/accept gates. Production mode only; test runs are cheap
+	// probes that shouldn't be blocked by lint.
+	if (mode === 'production' && subjectPath) {
+		const noteData = getVaultEngine()?.getNote(subjectPath);
+		if (noteData) {
+			const adrFindings = lintAdr({
+				path: noteData.path,
+				meta: (noteData.meta ?? {}) as Record<string, unknown>,
+				content: noteData.content ?? '',
+			});
+			const high = adrFindings.filter((f) => f.severity === 'high');
+			if (high.length > 0) {
+				const hint = high.map((f) => `  ✗ [${f.rule}] ${f.message}`).join('\n');
+				throw error(
+					409,
+					`Dispatch refused — ADR has ${high.length} high-severity lint finding${high.length === 1 ? '' : 's'}:\n` +
+						hint +
+						`\n\nRun \`soul adr lint ${subjectPath}\` and fix the findings, ` +
+						`or have the operator pass a manual override via the CLI.`,
+				);
+			}
+		}
 	}
 
 	const ac = new AbortController();

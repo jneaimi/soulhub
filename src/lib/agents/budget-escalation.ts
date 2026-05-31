@@ -30,7 +30,13 @@ import { makePendingStore } from '../channels/telegram/pending-callbacks.js';
 import { sendText } from '../channels/telegram/outbound.js';
 import type { InlineKeyboardMarkup } from '../channels/telegram/types.js';
 import { config as soulHubConfig } from '../config.js';
-import { setRunStatus } from './runs.js';
+import { setRunStatus, cumulativeAdrSpend } from './runs.js';
+import { resolveAdrBudget } from './dispatch/resolve-adr-budget.js';
+import { getVaultEngine } from '../vault/index.js';
+import { locateTranscript } from '../sessions/run-record.js';
+import { streamEvents } from '../sessions/parser.js';
+import { extractRecentTurns, type RecentTurn } from '../sessions/recent-turns.js';
+import { classifyVelocity, type VelocityNote } from './budget-velocity.js';
 
 /** Fixed bump amounts offered in the Telegram keyboard (ADR-006 — the operator
  *  picked "fixed-bump buttons"). Each raises the corresponding HARD ceiling. */
@@ -62,6 +68,17 @@ export interface BudgetApprovalRow {
 	chatJid: string;
 	messageId: number;
 	createdAt: number;
+	/** Bug fix 2026-05-29 — preserve the vault artifact path across the pause
+	 *  so resume can reach the per-ADR worktree (ADR-022) and ADR-022 D3 can
+	 *  see the resumed run as in-flight. Without this, the resumed PTY ran in
+	 *  `cwd=vault` with no worktree, and concurrent dispatches against the
+	 *  same ADR sailed through D3 (witnessed in run 0f885fb0 → df910cef race
+	 *  against `projects/projects-graph/adr-025-...`). */
+	subjectPath?: string;
+	/** Bug fix 2026-05-29 — preserve the resolved repo so resume picks the
+	 *  same worktree even when the project's `repo:` binding shifts after the
+	 *  pause. Null for legacy non-repo agents. */
+	repo?: string;
 }
 
 const pendingApprovals = makePendingStore<BudgetApprovalRow>('budget-approval', APPROVAL_TTL_MS);
@@ -115,7 +132,17 @@ function dashboardOrchestrationUrl(): string | null {
 	return `${base}/orchestration`;
 }
 
-function buildApprovalKeyboard(id: string): InlineKeyboardMarkup {
+/** Deep-link into the workbench's approval surface for this specific run (D3).
+ *  Same SOUL_HUB_PUBLIC_URL guard as `dashboardOrchestrationUrl` — returns
+ *  null on loopback-only installs, in which case the "🔍 Investigate" button
+ *  is omitted from the keyboard. */
+function runApproveUrl(runId: string): string | null {
+	const base = process.env.SOUL_HUB_PUBLIC_URL?.replace(/\/$/, '');
+	if (!base || !/^https?:\/\//.test(base)) return null;
+	return `${base}/orchestration/runs/${encodeURIComponent(runId)}/approve`;
+}
+
+function buildApprovalKeyboard(id: string, runId: string): InlineKeyboardMarkup {
 	const rows: InlineKeyboardMarkup['inline_keyboard'] = [
 		[
 			{ text: '➕ $2', callback_data: `bgt-u2:${id}` },
@@ -126,6 +153,10 @@ function buildApprovalKeyboard(id: string): InlineKeyboardMarkup {
 			{ text: '🛑 Stop', callback_data: `bgt-stop:${id}` },
 		],
 	];
+	const investigateUrl = runApproveUrl(runId);
+	if (investigateUrl) {
+		rows.push([{ text: '🔍 Investigate in workbench', url: investigateUrl }]);
+	}
 	const url = dashboardOrchestrationUrl();
 	if (url) rows.push([{ text: '⚙️ More options', url }]);
 	return { inline_keyboard: rows };
@@ -145,20 +176,98 @@ export interface EscalateInput {
 	reason: 'max_usd' | 'max_turns';
 	spentUsd: number;
 	turns: number;
+	/** Bug fix 2026-05-29 — capture the run's subjectPath at pause time so the
+	 *  resume path can wire it back into `dispatchAgent` (otherwise resumed
+	 *  rows have subject_path=NULL and ADR-022 D3 misses concurrent dispatches). */
+	subjectPath?: string;
+	/** Same: preserve the resolved repo so resume reuses the per-ADR worktree. */
+	repo?: string;
 }
 
-function formatApprovalMessage(input: EscalateInput): string {
+/** ADR-cumulative spend suffix for budget Telegram messages (2026-05-30).
+ *  Returns a single italic line like `_ADR cumulative: $8.06 / $25 cap_` when
+ *  the run's subject path resolves to an ADR with `dispatch_budget_usd:` set,
+ *  or `_ADR cumulative: $8.06_` when no cap is set, or `''` when there's no
+ *  subject path or vault is offline. Reading the cap is best-effort; failure
+ *  just yields the cumulative-only form. Keeps callers branch-free. */
+function formatAdrBudgetSuffix(subjectPath: string | undefined | null): string {
+	if (!subjectPath) return '';
+	let cumulative = 0;
+	try {
+		cumulative = cumulativeAdrSpend(subjectPath);
+	} catch {
+		return '';
+	}
+	if (cumulative <= 0) return '';
+	let cap: number | undefined;
+	try {
+		const engine = getVaultEngine();
+		if (engine) cap = resolveAdrBudget(subjectPath, (p) => engine.getNote(p));
+	} catch {
+		/* ignore — render cumulative-only */
+	}
+	const capStr =
+		cap !== undefined
+			? ` / $${cap.toFixed(0)} cap (${((cumulative / cap) * 100).toFixed(0)}%)`
+			: '';
+	return `\n_ADR cumulative: $${cumulative.toFixed(2)}${capStr}_`;
+}
+
+/** Render a recent-turn excerpt as Telegram-safe markdown. The role labels
+ *  are bolded; body text is fenced as a code block so any stray `*`/`_` in
+ *  the agent's output doesn't trip MarkdownV2 parsing. */
+function formatTranscriptExcerpt(turns: RecentTurn[]): string {
+	if (turns.length === 0) return '';
+	const blocks = turns.map((t) => {
+		const label = t.role === 'user' ? '👤 you' : '🤖 agent';
+		return `*${label}*\n\`\`\`\n${t.text}\n\`\`\``;
+	});
+	return ['', '*— last turns —*', ...blocks].join('\n');
+}
+
+/** Build the full approval-message body. Pure; transcript + velocity are
+ *  passed in so the I/O lives at the caller (escalateBudgetApproval). */
+export function formatApprovalMessage(
+	input: EscalateInput,
+	extras: { transcript?: RecentTurn[]; velocity?: VelocityNote } = {},
+): string {
 	const hit =
 		input.reason === 'max_usd'
 			? `spent *$${input.spentUsd.toFixed(2)}* (ceiling $${input.ceilingUsd})`
 			: `ran *${input.turns} turns* (ceiling ${input.ceilingTurns})`;
-	return [
+	const lines: string[] = [
 		`⏸ *${input.agentId}* hit its budget ceiling and paused — not finished.`,
 		'',
-		`It ${hit}. Grant more to resume (\`claude --resume\`), or stop and keep the partial result.`,
+		`It ${hit}. Grant more to resume, tap *Stop* to keep the partial result, or *Investigate* to open the workbench.`,
+	];
+	if (extras.velocity) {
+		lines.push('', `_${extras.velocity.text}_`);
+	}
+	if (extras.transcript && extras.transcript.length > 0) {
+		lines.push(formatTranscriptExcerpt(extras.transcript));
+	}
+	lines.push(
 		'',
-		`_run \`${input.runId}\` · ${input.turns} turns · $${input.spentUsd.toFixed(2)}_`,
-	].join('\n');
+		`_run \`${input.runId}\` · ${input.turns} turns · $${input.spentUsd.toFixed(2)}_${formatAdrBudgetSuffix(input.subjectPath)}`,
+	);
+	return lines.join('\n');
+}
+
+/** Best-effort transcript loader for the Smart Telegram (O3 D2) excerpt.
+ *  Soft-fails: a missing transcript / parse error just yields an empty array,
+ *  so the message degrades to the legacy "header + velocity" shape. */
+async function loadTranscriptForApproval(sessionUuid: string): Promise<RecentTurn[]> {
+	try {
+		const path = locateTranscript(sessionUuid);
+		if (!path) return [];
+		const events = [];
+		for await (const e of streamEvents(path)) {
+			events.push(e);
+		}
+		return extractRecentTurns(events, { limit: 3, perTurnMaxChars: 600 });
+	} catch {
+		return [];
+	}
 }
 
 /** Persist + send the budget-approval escalation. Best-effort: returns the
@@ -171,15 +280,46 @@ export async function escalateBudgetApproval(
 	const delivery = soulHubConfig.channels?.telegram?.delivery;
 	if (!delivery) return { ok: false, error: 'no-telegram-delivery-config' };
 
-	const id = budgetApprovalIdFor(input.runId, input.sessionUuid);
-	const result = await sendText(chatId, formatApprovalMessage(input), delivery, {
-		replyMarkup: buildApprovalKeyboard(id),
+	// O3 D2 — smart-dynamic enrichment: transcript excerpt + velocity note.
+	// Both are best-effort; failures degrade the message gracefully (header
+	// only) rather than blocking the escalation.
+	const transcript = await loadTranscriptForApproval(input.sessionUuid);
+	const velocity = classifyVelocity({
+		spentUsd: input.spentUsd,
+		ceilingUsd: input.ceilingUsd,
+		turns: input.turns,
+		ceilingTurns: input.ceilingTurns,
 	});
+
+	const id = budgetApprovalIdFor(input.runId, input.sessionUuid);
+	const result = await sendText(
+		chatId,
+		formatApprovalMessage(input, { transcript, velocity }),
+		delivery,
+		{
+			replyMarkup: buildApprovalKeyboard(id, input.runId),
+		},
+	);
 	if (!result.ok || result.messageIds.length === 0) {
 		return { ok: false, error: result.error ?? 'send-failed' };
 	}
 
-	pendingApprovals.set(id, {
+	pendingApprovals.set(id, buildApprovalRow(input, String(chatId), result.messageIds[0]));
+	return { ok: true };
+}
+
+/** Pure mapping from `EscalateInput` to the persisted `BudgetApprovalRow`.
+ *  Extracted from `escalateBudgetApproval` so the field-preservation contract
+ *  (especially `subjectPath` + `repo`, fixed 2026-05-29) is unit-testable
+ *  without the Telegram + config side-effects.  Production callers should keep
+ *  using `escalateBudgetApproval`; this is the inner shape-only mapping. */
+export function buildApprovalRow(
+	input: EscalateInput,
+	chatJid: string,
+	messageId: number,
+	now: number = Date.now(),
+): BudgetApprovalRow {
+	return {
 		runId: input.runId,
 		agentId: input.agentId,
 		sessionUuid: input.sessionUuid,
@@ -189,11 +329,15 @@ export async function escalateBudgetApproval(
 		reason: input.reason,
 		spentUsd: input.spentUsd,
 		turns: input.turns,
-		chatJid: String(chatId),
-		messageId: result.messageIds[0],
-		createdAt: Date.now(),
-	});
-	return { ok: true };
+		chatJid,
+		messageId,
+		createdAt: now,
+		// Bug fix 2026-05-29 — forward the captured artifact context so resume
+		// can wire it back into dispatchAgent. Undefined for legacy non-artifact
+		// runs (orchestrator background jobs, ad-hoc tests) — same legacy path.
+		subjectPath: input.subjectPath,
+		repo: input.repo,
+	};
 }
 
 /** Resume a paused run with a raised ceiling. Fire-and-forget — the dispatch
@@ -216,6 +360,15 @@ export function resumeWithRaisedBudget(
 				resumeSessionId: row.sessionUuid,
 				pausableOnCeiling: true,
 				budget_override: { ceiling_usd: ceilingUsd, ceiling_turns: ceilingTurns },
+				// Bug fix 2026-05-29 — forward the captured subjectPath so the
+				// resumed dispatcher (a) writes the start row's subject_path
+				// (closing the ADR-022 D3 leak that let duplicate dispatches
+				// through), (b) resolves effectiveRepo via the project binding,
+				// and (c) routes worktree provisioning to ADR-022's per-ADR
+				// `claude-soul/<adrKey>` path instead of running in cwd=vault.
+				// Without this the resumed PTY was a zombie — alive but blind
+				// to prior commits. Witnessed in run 0f885fb0 (2026-05-29).
+				subjectPath: row.subjectPath,
 			});
 			// Drain to completion; the finish hook in index.ts handles re-escalation
 			// or the terminal record.
@@ -256,6 +409,10 @@ export interface VelocityWarningInput {
 	reason: 'max_usd' | 'max_turns';
 	spentUsd: number;
 	turns: number;
+	/** 2026-05-30 — forwarded so the message can render ADR cumulative spend
+	 *  (`cumulativeAdrSpend` + `resolveAdrBudget`). Undefined for non-artifact
+	 *  runs; the message just drops the cumulative line. */
+	subjectPath?: string;
 }
 
 function formatVelocityMessage(input: VelocityWarningInput): string {
@@ -264,11 +421,11 @@ function formatVelocityMessage(input: VelocityWarningInput): string {
 			? `*$${input.spentUsd.toFixed(2)}* of its $${input.ceilingUsd} ceiling`
 			: `*${input.turns}* of its ${input.ceilingTurns}-turn ceiling`;
 	return [
-		`⚡ *${input.agentId}* is burning fast — at ${at}, ~1 turn from the wall.`,
+		`⚡ *${input.agentId}* is burning fast — at ${at}, projecting to hit the wall in a few turns.`,
 		'',
 		`Pre-approve now to raise the ceiling *in-flight* — the run keeps going with no restart. Ignore it and it'll pause at the ceiling instead (you can grant or stop then).`,
 		'',
-		`_run \`${input.runId}\` · ${input.turns} turns · $${input.spentUsd.toFixed(2)}_`,
+		`_run \`${input.runId}\` · ${input.turns} turns · $${input.spentUsd.toFixed(2)}_${formatAdrBudgetSuffix(input.subjectPath)}`,
 	].join('\n');
 }
 

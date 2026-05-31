@@ -13,7 +13,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { safeId } from './worktree-provision.js';
+import { branchForRun } from './run-branch.js';
 import type { DispatchMode } from './types.js';
 import type { RunStatus } from '../runs.js';
 
@@ -68,7 +68,10 @@ export function gateStatusForDeliverable(input: DeliverableGateInput): RunStatus
 	if (!repo) return rawStatus; // non-worktree agent (analyst, research, clerical)
 	if (!subjectPath) return rawStatus; // no review-lane subject (chat dispatch)
 	if (handback) return rawStatus; // deliverable A — a parseable hand-back
-	const branch = `orchestration/run-${startedAt}/${safeId(subjectPath)}`;
+	// ADR-022 single-source-of-truth — was reconstructing legacy orchestration/run-X/Y,
+	// so ADR-022-era runs (branch=claude-soul/<adrKey>) failed the commit check
+	// and got falsely downgraded to completed-no-artifact.
+	const branch = branchForRun({ handback, subjectPath, startedAt });
 	const check = input.branchHasCommitsFn ?? branchHasCommits;
 	if (check(branch, repo)) return rawStatus; // deliverable B — committed branch
 	return 'completed-no-artifact';

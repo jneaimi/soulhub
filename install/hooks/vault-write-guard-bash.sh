@@ -129,21 +129,18 @@ vault content must go through the API so it gets frontmatter
 validation, zone rules, rate-limiting, audit log, dedup, and atomic
 commit.
 
-→ Use the /vault-write skill instead:
+→ Use the soul CLI (the sanctioned AI write path):
 
-   ~/.claude/skills/vault-write/scripts/vault-write.sh \\
-     --zone "<zone>" \\
-     --filename "<filename.md>" \\
-     --meta-json '{"type":"...","created":"YYYY-MM-DD","tags":[...]}' \\
-     --content "<body>"
+   soul note create --zone "<zone>" --filename "<filename.md>" --type "<type>" --meta-json '{"created":"YYYY-MM-DD","tags":[...]}' --content "<body>"
 
-For an update:
-   vault-write.sh --update "<zone>/<filename.md>" \\
-     --meta-json '{...}' --content "..."
+   soul note update "<zone>/<filename.md>" --meta-json '{...}' --content "..."
 
-Or call the API directly:
-   POST http://localhost:2400/api/vault/notes
-   PUT  http://localhost:2400/api/vault/notes/<path>
+For ADRs in projects/<slug>/: soul adr propose|accept|ship|park|reject ...
+Run 'soul note create --help'; see the /vault-write skill for authoring rules.
+
+Fallback only if no soul verb fits — the /vault-write skill wrapper:
+   ~/.claude/skills/vault-write/scripts/vault-write.sh --zone … --filename … --meta-json … --content …
+Or the API directly: POST http://localhost:2400/api/vault/notes (PUT /<path> to update).
 
 Exempt subdirs (hook passes these through): ~/vault/.vault/, .git/,
 .gitnexus/, .obsidian/. If your write targets one of those, re-check

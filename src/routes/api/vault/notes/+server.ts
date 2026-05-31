@@ -2,6 +2,7 @@ import type { RequestHandler } from './$types';
 import { json } from '@sveltejs/kit';
 import { getVaultEngine } from '$lib/vault/index.js';
 import type { SearchQuery } from '$lib/vault/types.js';
+import { lintAdr, validatePhaseRoutingShape } from '$lib/vault/adr-lint.js';
 
 /** GET /api/vault/notes — List/search notes */
 export const GET: RequestHandler = async ({ url }) => {
@@ -87,11 +88,50 @@ export const POST: RequestHandler = async ({ request }) => {
 	// + git commit show the TOOL rather than the note's declared author.
 	// Unknown fields ignored; non-string fields filtered.
 	let createOpts: { actor?: string; actorContext?: string } | undefined;
+	let skipLintReason: string | undefined;
 	if (opts && typeof opts === 'object' && !Array.isArray(opts)) {
 		const o = opts as Record<string, unknown>;
 		const actor = typeof o.actor === 'string' ? o.actor : undefined;
 		const actorContext = typeof o.actorContext === 'string' ? o.actorContext : undefined;
 		if (actor || actorContext) createOpts = { actor, actorContext };
+		// ADR-044 P2-followup — vault chokepoint lint pre-flight escape.
+		// Mirrors the CLI `--skip-lint "<reason>"` shape; non-empty string
+		// = bypass with audit-log entry; missing/empty = lint enforced.
+		if (typeof o.skipLint === 'string' && o.skipLint.trim().length > 0) {
+			skipLintReason = o.skipLint.trim();
+		}
+	}
+
+	// ADR-044 P2-followup — fail-closed lint pre-flight on type=decision notes.
+	// Catches AI-authored ADRs that bypass the CLI (direct vault-write skill,
+	// direct API, vim+watcher).  Same R5/R9/R11 rules; same opt-out via
+	// `opts.skipLint`.  Non-decision notes flow through unchanged.
+	const metaObj = meta as Record<string, unknown>;
+	const noteType = String(metaObj.type ?? '').toLowerCase();
+	const filenameStr = filename as string;
+	const isAdr = noteType === 'decision' && /^adr-\d+/.test(filenameStr);
+	if (isAdr && !skipLintReason) {
+		const candidatePath = `${zone}/${filenameStr}`;
+		const shapeFindings = validatePhaseRoutingShape(metaObj);
+		const ruleFindings = lintAdr({
+			path: candidatePath,
+			meta: metaObj,
+			content: content as string,
+		});
+		const allFindings = [...shapeFindings, ...ruleFindings];
+		const high = allFindings.filter((f) => f.severity === 'high');
+		if (high.length > 0) {
+			return json({
+				success: false,
+				error: 'lint-failed',
+				findings: allFindings,
+				highSeverityCount: high.length,
+				hint:
+					`Vault chokepoint refused: ${high.length} high-severity lint finding${high.length === 1 ? '' : 's'} on ${candidatePath}. ` +
+					`Fix the body / meta or pass opts.skipLint: "<reason>" to override (audited). ` +
+					`Findings: ${high.map((f) => `[${f.rule}] ${f.message.slice(0, 120)}`).join(' | ')}`,
+			}, { status: 422 });
+		}
 	}
 
 	try {

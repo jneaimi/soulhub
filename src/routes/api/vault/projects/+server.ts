@@ -107,6 +107,12 @@ interface ProjectRollup {
 	 *  tag-derived UI. Tags on individual notes within the project are NOT
 	 *  aggregated here — too noisy. */
 	tags: string[];
+	/** ADR-030 / ADR-011 — optional git repo path bound to this project via
+	 *  `repo:` frontmatter on the root `index.md`. When present, the dispatcher
+	 *  uses this repo as `effectiveRepo` for worktree provisioning (ADR-030),
+	 *  and the routing layer exposes the `implementer` AI button (ADR-011 D2).
+	 *  Absent for projects with no codebase binding. */
+	repo?: string;
 	/** projects-graph ADR-006 — outgoing producer→consumer edges declared
 	 *  on this project's root `index.md`. Mix of bare wikilink strings and
 	 *  rich-form `{target, destination?, falsifier?, falsifier_date?}`
@@ -385,6 +391,8 @@ export const GET: RequestHandler = async ({ url }) => {
 		let producesFor: ProducerEdge[] | undefined;
 		// projects-graph ADR-013 — tags from the project root index.md only.
 		let projectTags: string[] = [];
+		// ADR-030 / ADR-011 — project-bound repo (from `repo:` on index.md).
+		let projectRepo: string | undefined;
 		// projects-graph ADR-012 — description for list-view cards.
 		let projectDescription = '';
 		const upcomingFalsifiers: ProjectRollup['upcomingFalsifiers'] = [];
@@ -412,6 +420,12 @@ export const GET: RequestHandler = async ({ url }) => {
 				projectIndexContent = full.content;
 				// projects-graph ADR-013 — capture root index tags for the cluster pill.
 				projectTags = asStringArray(full.meta.tags);
+				// ADR-030 / ADR-011 — capture `repo:` frontmatter for the routing layer
+				// (implementer carve-out) and dispatcher effectiveRepo derivation.
+				const rawRepo = full.meta.repo;
+				if (typeof rawRepo === 'string' && rawRepo.trim()) {
+					projectRepo = rawRepo.trim();
+				}
 				// projects-graph ADR-012 — description: prefer explicit
 				// frontmatter, fall back to first body paragraph (140-char cap).
 				const rawDesc = full.meta.description;
@@ -626,6 +640,7 @@ export const GET: RequestHandler = async ({ url }) => {
 			projectFalsifierDate,
 			tags: projectTags,
 			description: projectDescription,
+			...(projectRepo ? { repo: projectRepo } : {}),
 			...(producesFor ? { producesFor } : {}),
 			...((() => {
 				const incoming = consumesFromMap.get(slug);

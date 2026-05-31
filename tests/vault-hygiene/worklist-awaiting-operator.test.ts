@@ -33,6 +33,7 @@ describe('computeLaneAndProgress — awaitingOperator', () => {
 			sessionId: 'sess-abc123',
 			branch: 'orchestration/run-1716000000000/adr-001-foo',
 			agentId: 'soul-hub-implementer',
+			runId: 'run-test-001',
 		};
 
 		const result = computeLaneAndProgress(
@@ -60,6 +61,7 @@ describe('computeLaneAndProgress — awaitingOperator', () => {
 			sessionId: 'sess-def456',
 			branch: 'orchestration/run-1716000001000/adr-002-bar',
 			agentId: 'developer',
+			runId: 'run-test-002',
 		};
 
 		const result = computeLaneAndProgress(
@@ -88,6 +90,7 @@ describe('computeLaneAndProgress — awaitingOperator', () => {
 			sessionId: 'sess-ghi789',
 			branch: 'orchestration/run-1716000002000/adr-003-baz',
 			agentId: 'deployer',
+			runId: 'run-test-003',
 		};
 
 		const result = computeLaneAndProgress(

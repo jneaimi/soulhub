@@ -38,12 +38,12 @@
  *      { kind: 'tool-result',     toolName, ok }
  *
  *    Terminal (exactly one per turn):
- *      { kind: 'complete', output: V2Output }
+ *      { kind: 'complete', output: V2Output, usage: WindowUsage }
  *      { kind: 'error',    message: string  }
  */
 
 import { decideV2 } from '../../orchestrator-v2/index.js';
-import { loadHistory, saveTurn } from '../../vault-chat/history.js';
+import { loadHistory, saveTurn, snapshotWindowUsage } from '../../vault-chat/history.js';
 import { startPresence } from '../_shared/presence.js';
 import { webPresenceAdapter } from './presence-adapter.js';
 import { isFocusQuery } from '../_shared/placeholder.js';
@@ -227,9 +227,13 @@ export async function dispatchWebTurn(opts: WebTurnOpts): Promise<void> {
 				write({ kind: 'navigate', url: out.url });
 			}
 
+			// ADR-018 S1 — post-turn window snapshot; computed after both turns are
+			// saved so the gauge reflects what the NEXT turn will see.
+			const usage = snapshotWindowUsage(conversationKey);
+
 			// Terminal event — the browser renders the full structured output
 			// (drawer builds buttons for proposals, image previews, etc.).
-			write({ kind: 'complete', output: out });
+			write({ kind: 'complete', output: out, usage });
 			return;
 		}
 
@@ -243,7 +247,9 @@ export async function dispatchWebTurn(opts: WebTurnOpts): Promise<void> {
 		const finalized = await presence.finalize(fallbackText);
 		if (!finalized) write({ kind: 'bubble-update', ...(assignedBubbleId && { messageId: assignedBubbleId }), text: fallbackText });
 		saveTurn(conversationKey, 'assistant', fallbackText, turnNow + 1);
-		write({ kind: 'complete', output: { kind: 'text', text: fallbackText } });
+		// ADR-018 S1 — window snapshot for the gauge (fallback path).
+		const fallbackUsage = snapshotWindowUsage(conversationKey);
+		write({ kind: 'complete', output: { kind: 'text', text: fallbackText }, usage: fallbackUsage });
 	} finally {
 		presence.stop();
 	}

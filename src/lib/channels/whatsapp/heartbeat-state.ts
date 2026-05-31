@@ -555,6 +555,45 @@ function migrate(db: Database.Database): void {
 		`);
 		db.pragma('user_version = 23');
 	}
+
+	if (version < 24) {
+		// soul-hub-agents ADR-020 P1 — phase-tagged runs.  Conventional values
+		// (descriptive, not validated): 'initial' | 'P1' | 'P2' | 'finish' |
+		// 'falsifier' | 'iterate-N' — the operator/dispatcher sets it.  null =
+		// pre-migration runs, treated as 'initial' at read time.  The drawer's
+		// per-ADR run-history strip groups by phase + sums cumulative cost,
+		// which is the foundation for ADR-020 P2 (resume) and P3 (cumulative
+		// budget gate) to compose on top.
+		db.exec(`ALTER TABLE agent_runs ADD COLUMN phase TEXT;`);
+		db.pragma('user_version = 24');
+	}
+
+	if (version < 25) {
+		// soul-hub-agents ADR-020 P4 — mid-run path-scope enforcement.
+		// `scope_json` snapshots the ADR's `scope: { allowed_paths, forbidden_paths }`
+		// at dispatch start so the dispatch-scope-guard.sh PreToolUse hook can
+		// look it up by claude_session_id and refuse out-of-scope writes.  null =
+		// no enforcement (backward-compat for legacy runs + ADRs without
+		// `scope:`).  `dispatch_scope_blocks` records every blocked attempt so
+		// the operator gets an audit trail of the agent's blocked tool calls.
+		db.exec(`ALTER TABLE agent_runs ADD COLUMN scope_json TEXT;`);
+		db.exec(`
+			CREATE TABLE dispatch_scope_blocks (
+				id                INTEGER PRIMARY KEY AUTOINCREMENT,
+				run_id            TEXT    NOT NULL,
+				claude_session_id TEXT,
+				tool_name         TEXT    NOT NULL,
+				target_path       TEXT    NOT NULL,
+				reason            TEXT    NOT NULL,
+				blocked_at        INTEGER NOT NULL
+			);
+			CREATE INDEX idx_dispatch_scope_blocks_session
+				ON dispatch_scope_blocks(claude_session_id);
+			CREATE INDEX idx_dispatch_scope_blocks_run
+				ON dispatch_scope_blocks(run_id);
+		`);
+		db.pragma('user_version = 25');
+	}
 }
 
 /** Heartbeat run statuses logged to `proactive_log`. */

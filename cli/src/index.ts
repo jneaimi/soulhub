@@ -13,6 +13,7 @@ import * as note from './verbs/note.ts';
 import * as naseej from './verbs/naseej.ts';
 import * as inbox from './verbs/inbox.ts';
 import * as contracts from './verbs/contracts.ts';
+import * as run from './verbs/run.ts';
 import { catalogIndex } from './verbs/catalog.ts';
 import { doctor } from './verbs/doctor.ts';
 import { logs } from './verbs/logs.ts';
@@ -74,6 +75,10 @@ WRITE VERBS (each supports --dry-run)
   soul note move     SRC-PATH DST-ZONE [--rename NEW-FILENAME] [--dry-run]   (link-safe: rewrites inbound wikilinks)
   soul note rename   SRC-PATH NEW-FILENAME [--dry-run]
   soul note move-batch (--moves-json '[{src,targetZone?,newFilename?}]' | --moves-file PATH) [--dry-run]
+  soul note delete   PATH [--dry-run]   (archives to ~/vault/archive/...; permanent removal still needs rm)
+
+READ VERBS
+  soul run list      [--status X] [--subject-path Y] [--agent-id Z] [--limit N] [--json]   (recent agent_runs across all agents)
   soul project create --slug S [--parent P] [--title T] [--meta-json JSON]
   soul project label-shape SLUG --shape SHAPE
   soul project label-falsifier SLUG --on YYYY-MM-DD [--text TEXT]
@@ -82,7 +87,8 @@ WRITE VERBS (each supports --dry-run)
   soul vault reindex
   ${USAGE_ADR_PROPOSE}
   soul adr accept    PATH
-  soul adr ship      PATH
+  soul adr ship      PATH [--force-final]
+  soul adr merge-partial PATH --phase PHASE_ID [--dry-run]
   soul adr park      PATH --review-after YYYY-MM-DD
   soul adr move      SRC-PATH --project SLUG [--rename NEW-FILENAME] [--dry-run]   (link-safe relocate into a project)
   soul adr reject    PATH --reason "..."
@@ -144,9 +150,11 @@ const USAGE: Record<string, string> = {
   'adr list': 'soul adr list   --project SLUG [--status STATUS]',
   'adr propose': USAGE_ADR_PROPOSE,
   'adr accept': 'soul adr accept    PATH',
-  'adr ship': 'soul adr ship      PATH',
+  'adr ship': 'soul adr ship      PATH [--force-final]   (warns if phases exist with unshipped entries; --force-final skips warning)',
+  'adr merge-partial': 'soul adr merge-partial PATH --phase PHASE_ID [--dry-run]   (partial ship: merge branch + update shipped_phases; auto-promotes on last phase)',
   'adr park': 'soul adr park      PATH --review-after YYYY-MM-DD',
   'adr reject': 'soul adr reject    PATH --reason "..."',
+  'adr lint': 'soul adr lint     [PATH | --project SLUG | --all] [--json]   (R5/R9/R11 — refuses propose+accept+dispatch on high-severity)',
   'adr move': 'soul adr move      SRC-PATH --project SLUG [--rename FILE] [--dry-run]',
   'recipe list': 'soul recipe list [--project P] [-q QUERY]',
   'recipe get': 'soul recipe get SLUG',
@@ -178,6 +186,8 @@ const USAGE: Record<string, string> = {
   'note move': 'soul note move     SRC-PATH DST-ZONE [--rename NEW-FILENAME] [--dry-run]',
   'note rename': 'soul note rename   SRC-PATH NEW-FILENAME [--dry-run]',
   'note move-batch': `soul note move-batch (--moves-json '[{src,targetZone?,newFilename?}]' | --moves-file PATH) [--dry-run]`,
+  'note delete': 'soul note delete   PATH [--dry-run]',
+  'run list': 'soul run list      [--status X] [--subject-path Y] [--agent-id Z] [--limit N] [--json]',
   'contracts touching': 'soul contracts touching PATH        (governance ADR-002 — what contracts a change touches)',
   'contracts check': 'soul contracts check                (registry self-falsifier: resolution + cache freshness)',
   doctor: 'soul doctor',
@@ -204,7 +214,7 @@ interface Dispatch { [noun: string]: { [verb: string]: Verb }; }
 const dispatch: Dispatch = {
   vault:     { search: vault.search, get: vault.get, recent: vault.recent, hygiene: vault.hygiene, reindex: vault.reindex, writes: vault.writes, unresolved: vault.unresolved },
   project:   { list: project.list, get: project.get, graph: project.graph, edges: project.edges, create: project.create, 'label-shape': project.labelShape, 'label-falsifier': project.labelFalsifier, 'next-actions': project.nextActions, worklist: project.worklist, similar: project.similar, 'propose-adr': project.proposeAdr, 'ship-slice': project.shipSlice },
-  adr:       { list: adr.list, propose: adr.propose, accept: adr.accept, ship: adr.ship, park: adr.park, reject: adr.reject, move: adr.move },
+  adr:       { list: adr.list, propose: adr.propose, accept: adr.accept, ship: adr.ship, 'merge-partial': adr.mergePartial, park: adr.park, reject: adr.reject, move: adr.move, lint: adr.lint },
   recipe:    { list: naseej.recipeList, get: naseej.recipeGet, run: naseej.recipeRun, cancel: naseej.recipeCancel },
   component: { list: naseej.componentList, get: naseej.componentGet },
   naseej:    { audit: naseej.naseejAudit },
@@ -213,7 +223,8 @@ const dispatch: Dispatch = {
   scheduler: { tasks: scheduler.tasks, 'run-now': scheduler.runNow },
   inbox:     { queued: inbox.queued, accounts: inbox.accounts, status: inbox.status, 'digest-telegram': inbox.digestTelegram },
   intent:    { metrics: intent.metrics },
-  note:      { create: note.create, update: note.update, move: note.move, rename: note.rename, 'move-batch': note.moveBatch },
+  note:      { create: note.create, update: note.update, move: note.move, rename: note.rename, 'move-batch': note.moveBatch, delete: note.deleteNote },
+  run:       { list: run.list },
   contracts: { touching: contracts.touching, check: contracts.check },
 };
 
@@ -309,6 +320,8 @@ function buildArgs(tail: string[]): Record<string, string | undefined> {
       stage:    { type: 'string' },
       agent:    { type: 'string' },
       'actor-prefix': { type: 'string' },
+      'subject-path': { type: 'string' },
+      'agent-id':     { type: 'string' },
       account:  { type: 'string' },
       category: { type: 'string' },
       runtime:  { type: 'string' },
@@ -338,6 +351,10 @@ function buildArgs(tail: string[]): Record<string, string | undefined> {
       tier:        { type: 'string' },
       problem:     { type: 'string' },
       adr:         { type: 'string' },
+      phase:       { type: 'string' },
+      'force-final': { type: 'boolean' },
+      all:         { type: 'boolean' },
+      'skip-lint': { type: 'string' },
       slice:       { type: 'string' },
       commit:      { type: 'string' },
       notes:       { type: 'string' },

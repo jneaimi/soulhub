@@ -109,6 +109,10 @@
 		parentProject: string | null;
 		/** projects-graph ADR-013 — root index.md tag list, drives cluster pill. */
 		tags: string[];
+		/** ADR-030 / ADR-011 — optional project-bound repo path from `repo:` on
+		 *  root index.md. Present when the project has a codebase binding; absent
+		 *  for vault-only projects. Drives the implementer AI-button carve-out. */
+		repo?: string;
 		decisions?: DecisionRow[];
 		/** projects-graph ADR-004 — descendant slugs reachable via parent_project. */
 		descendantSlugs?: string[];
@@ -246,6 +250,16 @@
 	let worklistLoading = $state(false);
 	let worklistError = $state('');
 	let worklistLoaded = $state(false);
+
+	// projects-graph ADR-025 D3 — repo scaffold / bind UI state.
+	// Shows a compact repo-binding panel on the project detail page so the
+	// operator can scaffold ~/dev/<slug> (git init) or bind an existing path.
+	// The panel only appears when the project has no `repo:` binding yet.
+	let scaffoldingRepo = $state(false);
+	let scaffoldRepoError = $state('');
+	let scaffoldRepoSuccess = $state('');
+	let showBindForm = $state(false);
+	let bindPathInput = $state('');
 
 	// projects-graph ADR-026 — silent mode: bypass the one-shot guard, don't
 	// toggle the loading spinner, and don't clear existing data on error (avoids
@@ -664,6 +678,72 @@
 		}
 	}
 
+	/** ADR-025 D3 — scaffold `~/dev/<slug>` with `git init`, then bind it
+	 *  as the project's `repo:` field. On success, reactively updates detail.repo
+	 *  so the DecisionActions AI button appears without a full page reload. */
+	async function scaffoldRepo() {
+		if (scaffoldingRepo || !detail) return;
+		scaffoldingRepo = true;
+		scaffoldRepoError = '';
+		scaffoldRepoSuccess = '';
+		try {
+			const res = await fetch(
+				`/api/vault/projects/${encodeURIComponent(slug)}/scaffold-repo`,
+				{
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({}),
+				},
+			);
+			const data = (await res.json()) as { success?: boolean; repo?: string; error?: string };
+			if (!res.ok || data.success === false) {
+				scaffoldRepoError = data.error ?? `HTTP ${res.status}`;
+				return;
+			}
+			// Optimistic update — the AI-dispatch button appears immediately.
+			detail = { ...detail, repo: data.repo ?? `~/dev/${slug}` };
+			scaffoldRepoSuccess = `Scaffolded + bound: ${data.repo}`;
+		} catch (e) {
+			scaffoldRepoError = e instanceof Error ? e.message : 'Scaffold failed';
+		} finally {
+			scaffoldingRepo = false;
+		}
+	}
+
+	/** ADR-025 D3 — bind an existing git repo at `bindPathInput` to the project.
+	 *  Skips the directory creation / git-init step; validates the path exists
+	 *  server-side before writing the `repo:` field. */
+	async function bindRepo() {
+		const path = bindPathInput.trim();
+		if (scaffoldingRepo || !detail || !path) return;
+		scaffoldingRepo = true;
+		scaffoldRepoError = '';
+		scaffoldRepoSuccess = '';
+		try {
+			const res = await fetch(
+				`/api/vault/projects/${encodeURIComponent(slug)}/scaffold-repo`,
+				{
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ customPath: path }),
+				},
+			);
+			const data = (await res.json()) as { success?: boolean; repo?: string; error?: string };
+			if (!res.ok || data.success === false) {
+				scaffoldRepoError = data.error ?? `HTTP ${res.status}`;
+				return;
+			}
+			detail = { ...detail, repo: data.repo ?? path };
+			scaffoldRepoSuccess = `Bound: ${data.repo}`;
+			showBindForm = false;
+			bindPathInput = '';
+		} catch (e) {
+			scaffoldRepoError = e instanceof Error ? e.message : 'Bind failed';
+		} finally {
+			scaffoldingRepo = false;
+		}
+	}
+
 	function handleTransition(info: { path: string; action: 'accept' | 'reject' | 'park' | 'ship'; newStatus: string }) {
 		// Reload to refresh both the per-decision row AND the rollup counts.
 		// Cheap on a single-project endpoint.
@@ -919,6 +999,79 @@
 					</div>
 				</div>
 
+				<!-- projects-graph ADR-025 D3 — Repo binding panel.
+				     Shows the bound repo when present (green chip) or a compact
+				     scaffold / bind form when absent. The "bind a repo first"
+				     hint in DecisionActions links here so the operator can
+				     unblock the AI-dispatch button without leaving the page. -->
+				{#if detail.repo}
+					<div class="mb-4 flex items-center gap-2 text-xs text-hub-dim">
+						<span class="text-hub-cta font-medium">⎇ repo</span>
+						<code class="px-2 py-0.5 rounded bg-hub-card font-mono text-hub-text border border-hub-border">{detail.repo}</code>
+						<span class="text-hub-dim" title="Bound repo — AI coding dispatch uses this worktree">bound ✓</span>
+					</div>
+				{:else}
+					<!-- No repo bound — offer scaffold (~/dev/<slug>) or bind (custom path). -->
+					<div class="mb-4 p-3 rounded-lg border border-hub-warning/30 bg-hub-warning/5">
+						<div class="flex items-center justify-between gap-3 flex-wrap mb-2">
+							<div>
+								<p class="text-xs text-hub-warning font-medium">No repo bound</p>
+								<p class="text-[11px] text-hub-dim mt-0.5">
+									Bind a codebase to enable AI coding dispatch for this project.
+								</p>
+							</div>
+							<div class="flex items-center gap-1.5 flex-wrap">
+								<button
+									onclick={scaffoldRepo}
+									disabled={scaffoldingRepo}
+									title="Create ~/dev/{slug} with git init and bind it to this project"
+									class="px-2.5 py-1 rounded text-[11px] font-medium bg-hub-cta text-hub-bg hover:bg-hub-cta/90 transition-colors cursor-pointer disabled:opacity-50"
+								>
+									{scaffoldingRepo ? '…' : `Scaffold ~/dev/${slug}`}
+								</button>
+								<button
+									onclick={() => { showBindForm = !showBindForm; scaffoldRepoError = ''; }}
+									disabled={scaffoldingRepo}
+									class="px-2.5 py-1 rounded text-[11px] font-medium bg-hub-card text-hub-dim hover:text-hub-text border border-hub-border transition-colors cursor-pointer disabled:opacity-50"
+								>
+									Bind existing path
+								</button>
+							</div>
+						</div>
+						{#if showBindForm}
+							<div class="mt-2 flex items-center gap-2">
+								<input
+									bind:value={bindPathInput}
+									type="text"
+									placeholder="~/dev/my-app"
+									onkeydown={(e) => { if (e.key === 'Enter') bindRepo(); if (e.key === 'Escape') { showBindForm = false; bindPathInput = ''; } }}
+									disabled={scaffoldingRepo}
+									class="flex-1 min-w-0 px-2 py-1 rounded bg-hub-bg border border-hub-border text-hub-text text-[11px] placeholder:text-hub-dim focus:outline-none focus:border-hub-cta/50 transition-colors font-mono"
+								/>
+								<button
+									onclick={bindRepo}
+									disabled={scaffoldingRepo || !bindPathInput.trim()}
+									class="px-2.5 py-1 rounded text-[11px] font-medium bg-hub-cta text-hub-bg hover:bg-hub-cta/90 transition-colors cursor-pointer disabled:opacity-50"
+								>
+									{scaffoldingRepo ? '…' : 'Bind'}
+								</button>
+								<button
+									onclick={() => { showBindForm = false; bindPathInput = ''; scaffoldRepoError = ''; }}
+									class="px-2.5 py-1 rounded text-[11px] text-hub-dim hover:text-hub-text transition-colors cursor-pointer"
+								>
+									Cancel
+								</button>
+							</div>
+						{/if}
+						{#if scaffoldRepoError}
+							<p class="mt-2 text-[11px] text-hub-danger">{scaffoldRepoError}</p>
+						{/if}
+						{#if scaffoldRepoSuccess}
+							<p class="mt-2 text-[11px] text-hub-cta">{scaffoldRepoSuccess}</p>
+						{/if}
+					</div>
+				{/if}
+
 				<!-- projects-graph ADR-004 — parent-rollup aggregate grid.
 				     Renders only when the project has descendants. Mirrors the
 				     per-project grid above but sums across self + all
@@ -1141,6 +1294,7 @@
 											loading={worklistLoading}
 											error={worklistError}
 											onSelect={(p) => (drawerPath = p)}
+											projectHasRepo={!!detail?.repo}
 										/>
 									{:else}
 										<ProjectTreeGantt
@@ -1311,6 +1465,7 @@
 											tags={d.tags}
 											{agentIds}
 											{agentRepos}
+											subjectHasProjectRepo={!!detail?.repo}
 											onDispatch={(p) => { drawerPath = p; drawerAutoDispatch = true; }}
 										/>
 									</div>

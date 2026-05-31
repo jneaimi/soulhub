@@ -75,9 +75,10 @@ Verbs available (read + write shipped 2026-05-18, ADR-001 + ADR-002 in `[[soul-h
 
 | Surface | Read | Write |
 |---|---|---|
-| Vault notes | `soul vault search/get/recent` | `soul note create/update` |
+| Vault notes | `soul vault search/get/recent` | `soul note create/update/delete` |
 | Projects | `soul project list/get` | `soul project create` |
-| ADRs | `soul adr list` | `soul adr propose/accept/ship/park/reject` |
+| ADRs | `soul adr list` | `soul adr propose/accept/ship/park/reject` (propose auto-prefixes `adr-NNN-`; accept resolves assignee via routing matrix when unset) |
+| Agent runs | `soul run list [--status X] [--subject-path Y] [--agent-id Z] [--limit N]` | (none — runs are written by the dispatcher) |
 | CRM | `soul crm find/followups` | (none yet — use orchestrator tools) |
 | Scheduler | `soul scheduler tasks` | (none yet — edit `~/.soul-hub/settings.json` + `POST /api/settings {}` to reconcile) |
 | Intent log | `soul intent metrics` | (read-only) |

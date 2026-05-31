@@ -21,6 +21,10 @@ export interface AwaitingOperatorPayload {
 	sessionId: string;
 	branch: string;
 	agentId: string;
+	/** ADR-019 P2 — agent run ID; used by the "Bump budget + continue" affordance
+	 *  to call POST /api/agents/runs/[runId]/bump-continue without a client-side
+	 *  session lookup. */
+	runId: string;
 }
 
 /** ADR-026 D3 — payload for a finished, un-merged coding dispatch awaiting

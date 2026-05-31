@@ -1,8 +1,8 @@
 import { apiGet, baseUrl, ApiError } from '../api.ts';
 import { emit, type OutputOpts } from '../output.ts';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, lstatSync, readlinkSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 
 interface CatalogIndexFreshness {
   exists: boolean;
@@ -27,12 +27,20 @@ interface InboxHealth {
   stale_count: number;
 }
 
+interface ClaudeConfigHealth {
+  configRoot: string;            // resolved path of ~/.claude (target of the symlink, or itself)
+  unexpectedDead: Array<{ path: string; target: string }>;
+  allowlistedDead: number;       // count — informational, not a finding
+  allowlistMissing: boolean;     // .symlink-allowlist file absent on disk
+}
+
 interface DoctorReport {
   ok: boolean;
   baseUrl: string;
   api: { reachable: boolean; status?: number | string };
   cli: { version: string; path: string };
   hooks: { writeGuard: boolean; bashGuard: boolean; soulCliGuard: boolean; vaultWriteSkill: boolean };
+  claudeConfig: ClaudeConfigHealth | { probed: false; reason: string };
   catalogIndex: CatalogIndexFreshness | { probed: false; reason: string };
   inbox: InboxHealth | { probed: false; reason: string };
   notes: string[];
@@ -61,6 +69,64 @@ function pkgVersion(): string {
   return '?';
 }
 
+// Recursive symlink walker for claudeConfigCheck. Skips heavyweight + irrelevant
+// dirs (.git, node_modules, .venv, __pycache__) so a single doctor invocation
+// stays sub-second even on a deep config tree.
+const WALK_SKIP = new Set(['.git', 'node_modules', '.venv', '__pycache__']);
+function walkForDeadSymlinks(root: string, current: string, out: Array<{ path: string; target: string }>): void {
+  let entries;
+  try {
+    // `encoding: 'utf8'` picks the string-flavored Dirent overload so
+    // `entry.name` is a string (default is Buffer, which won't accept string ops).
+    entries = readdirSync(current, { withFileTypes: true, encoding: 'utf8' });
+  } catch {
+    return;                                // unreadable dir — skip silently
+  }
+  for (const entry of entries) {
+    if (WALK_SKIP.has(entry.name)) continue;
+    const full = join(current, entry.name);
+    let stat;
+    try { stat = lstatSync(full); } catch { continue; }
+    if (stat.isSymbolicLink()) {
+      // `existsSync` follows the symlink — returns false on dead targets.
+      if (!existsSync(full)) {
+        let target = '';
+        try { target = readlinkSync(full); } catch {}
+        out.push({ path: relative(root, full), target });
+      }
+    } else if (stat.isDirectory()) {
+      walkForDeadSymlinks(root, full, out);
+    }
+  }
+}
+
+// Mirror of the pre-push gate's .symlink-allowlist reader. Each non-empty,
+// non-comment line is a repo-relative path that the operator has declared
+// expected-dead-on-this-machine (e.g. aspirational ~/.agents/skills/X).
+function loadSymlinkAllowlist(configRoot: string): { entries: Set<string>; missing: boolean } {
+  const allowlistPath = join(configRoot, '.symlink-allowlist');
+  if (!existsSync(allowlistPath)) return { entries: new Set(), missing: true };
+  const entries = new Set<string>();
+  for (const raw of readFileSync(allowlistPath, 'utf8').split('\n')) {
+    const line = raw.replace(/#.*$/, '').trim();
+    if (line) entries.add(line);
+  }
+  return { entries, missing: false };
+}
+
+// Resolve ~/.claude to its real path. The expected layout is ~/.claude →
+// ~/claude-config, but defensive callers can pass any directory as override
+// (kept simple — no env-var support until someone asks).
+function resolveClaudeConfigRoot(): string | null {
+  const candidate = join(homedir(), '.claude');
+  if (!existsSync(candidate)) return null;
+  try {
+    return realpathSync(candidate);
+  } catch {
+    return null;
+  }
+}
+
 export async function doctor(_args: Record<string, string | undefined>, opts: OutputOpts) {
   const report: DoctorReport = {
     ok: true,
@@ -73,10 +139,39 @@ export async function doctor(_args: Record<string, string | undefined>, opts: Ou
       soulCliGuard: existsSync(join(homedir(), '.claude/hooks/soul-cli-guard.sh')),
       vaultWriteSkill: existsSync(join(homedir(), '.claude/skills/vault-write/SKILL.md')),
     },
+    claudeConfig: { probed: false, reason: 'not probed' },
     catalogIndex: { probed: false, reason: 'not probed' },
     inbox: { probed: false, reason: 'not probed' },
     notes: [],
   };
+
+  // Claude-config dead-symlink scan — out-of-band counterpart to the
+  // ~/claude-config pre-push gate (.githooks/pre-push). Catches dead
+  // links between commits so you don't only discover them on push.
+  // Note-only: never flips report.ok (the pre-push gate is enforcement).
+  const configRoot = resolveClaudeConfigRoot();
+  if (configRoot === null) {
+    report.claudeConfig = { probed: false, reason: '~/.claude not found' };
+  } else {
+    const { entries: allowlist, missing: allowlistMissing } = loadSymlinkAllowlist(configRoot);
+    const allDead: Array<{ path: string; target: string }> = [];
+    walkForDeadSymlinks(configRoot, configRoot, allDead);
+    const unexpectedDead: typeof allDead = [];
+    let allowlistedDead = 0;
+    for (const d of allDead) {
+      if (allowlist.has(d.path)) allowlistedDead++;
+      else unexpectedDead.push(d);
+    }
+    report.claudeConfig = { configRoot, unexpectedDead, allowlistedDead, allowlistMissing };
+    if (allowlistMissing && allDead.length > 0) {
+      report.notes.push(
+        `claude-config: .symlink-allowlist missing (${allDead.length} dead symlink(s) will all surface as unexpected on next push).`,
+      );
+    }
+    for (const d of unexpectedDead) {
+      report.notes.push(`claude-config: dead symlink ${d.path} → ${d.target} (target missing).`);
+    }
+  }
 
   try {
     await apiGet('/api/system/health');
@@ -164,6 +259,24 @@ export async function doctor(_args: Record<string, string | undefined>, opts: Ou
     lines.push(`  vault-write-guard-bash.sh  ${r.hooks.bashGuard ? '✓' : '✗'}`);
     lines.push(`  soul-cli-guard.sh          ${r.hooks.soulCliGuard ? '✓' : '✗'}  (mode: ${process.env.SOUL_CLI_GUARD_MODE ?? 'warn'})`);
     lines.push(`  /vault-write skill         ${r.hooks.vaultWriteSkill ? '✓' : '✗'}`);
+    lines.push(`Claude-config:`);
+    if ('probed' in r.claudeConfig && r.claudeConfig.probed === false) {
+      lines.push(`  symlink integrity          —  (${r.claudeConfig.reason})`);
+    } else {
+      const cc = r.claudeConfig as ClaudeConfigHealth;
+      const allowNote = cc.allowlistMissing ? ', no allowlist' : `, ${cc.allowlistedDead} allowlisted`;
+      if (cc.unexpectedDead.length === 0) {
+        lines.push(`  symlink integrity          ✓  (${cc.configRoot}${allowNote})`);
+      } else {
+        lines.push(`  symlink integrity          ⚠  ${cc.unexpectedDead.length} unexpected dead link(s)${allowNote}`);
+        for (const d of cc.unexpectedDead.slice(0, 5)) {
+          lines.push(`    ${d.path} → ${d.target}`);
+        }
+        if (cc.unexpectedDead.length > 5) {
+          lines.push(`    … and ${cc.unexpectedDead.length - 5} more (see JSON / .symlink-allowlist).`);
+        }
+      }
+    }
     lines.push(`Catalog-index:`);
     if ('probed' in r.catalogIndex && r.catalogIndex.probed === false) {
       lines.push(`  freshness                  ✗  (${r.catalogIndex.reason})`);

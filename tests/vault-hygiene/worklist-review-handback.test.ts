@@ -285,6 +285,7 @@ describe('computeLaneAndProgress — reviewHandoff', () => {
 			sessionId: 'sess-abc',
 			branch: 'orchestration/run-999/my-task',
 			agentId: 'soul-hub-implementer',
+			runId: 'run-test-review',
 		};
 
 		const result = computeLaneAndProgress(

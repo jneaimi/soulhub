@@ -57,6 +57,7 @@ import { resolveScope } from '$lib/chat/scope/resolve.js';
 import type { ScopeReader, CrmContactScopeShape, CrmInteractionScopeItem } from '$lib/chat/scope/types.js';
 import { getContact, listInteractions } from '$lib/crm/index.js';
 import { dispatchWebTurn } from '$lib/channels/web/dispatch.js';
+import { conversationKeyForScope } from '$lib/chat/conversation-key.js';
 
 // ── Scope reader adapter ─────────────────────────────────────────────────────
 
@@ -132,35 +133,6 @@ function buildScopeReader(): ScopeReader {
 			}
 		},
 	};
-}
-
-// ── Conversation key ──────────────────────────────────────────────────────────
-
-/**
- * Derive a stable `conversationKey` from the scope kind + params.
- * Always prefixed with `web:` so it can never collide with WhatsApp E.164
- * numbers (`+971…`) or Telegram keys (`tg:…`).
- *
- * ADR-006: extended with vault-note and crm-contact keys so each note/contact
- * gets its own isolated conversation history.
- */
-function conversationKeyForScope(
-	kind: string,
-	params: Record<string, string>,
-): string {
-	if (kind === 'project' && params.slug) {
-		return `web:project:${params.slug}`;
-	}
-	if (kind === 'vault-note' && params.notePath) {
-		return `web:vault-note:${params.notePath}`;
-	}
-	if (kind === 'crm-contact' && params.contactId) {
-		return `web:crm:${params.contactId}`;
-	}
-	if (kind === 'inbox-thread') {
-		return 'web:inbox';
-	}
-	return 'web:global';
 }
 
 // ── SSE helpers ───────────────────────────────────────────────────────────────

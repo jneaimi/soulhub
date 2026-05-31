@@ -38,7 +38,9 @@ import { claudeCliFlagDispatcher } from './claude-cli-flag.js';
 import { loadAgentRunRecord } from '$lib/sessions/run-record.js';
 import { createRunTail, type RunTail } from '$lib/sessions/run-tail.js';
 import { getLiveGrant, clearLiveGrant } from '../budget-grants.js';
-import { parseAskOperator } from './ask-operator.js';
+import { parseAskOperator, extractAskOperatorFromTranscript } from './ask-operator.js';
+import { locateTranscript } from '$lib/sessions/run-record.js';
+import { projectsAtCeiling } from './velocity-projection.js';
 
 export { parseAskOperator } from './ask-operator.js';
 
@@ -166,7 +168,13 @@ export const claudePtyDispatcher: BackendDispatcher = {
 			session = spawnSession({
 				prompt: initialPrompt,
 				agentId: agent.id, // Claude Code loads system_prompt from ~/.claude/agents/<id>.md
-				cwd: config.resolved.vaultDir,
+				// R5 fix (2026-05-30) — use the provisioned worktree cwd when set
+				// (artifact dispatches), fall back to vaultDir otherwise. Before
+				// this fix, ALL dispatches launched the PTY in vault and relied on
+				// the agent to self-`cd` via the worktreeDirective in the prompt;
+				// failure mode was silent (run 524: 22 min, $0 of new work, all
+				// tool calls failed because relative paths didn't resolve).
+				cwd: opts.cwd ?? config.resolved.vaultDir,
 				shell: false,
 				model,
 				// ADR-006 Phase 2 — resume reuses the session via `--resume <id>`
@@ -195,7 +203,17 @@ export const claudePtyDispatcher: BackendDispatcher = {
 			return finish(runId, agent, started, 'error', '', msg, { claude_session_id: sessionUuid });
 		}
 
-		yield { type: 'started', backend: 'claude-pty', model, runId, ts: started };
+		yield {
+			type: 'started',
+			backend: 'claude-pty',
+			model,
+			runId,
+			ts: started,
+			// ADR-020 P4 — surface the session UUID at start (not just finish)
+			// so the dispatcher can persist it on the running row, giving
+			// dispatch-scope-guard.sh a stable join key for the PreToolUse hook.
+			claudeSessionId: sessionUuid,
+		};
 		if (goalActive) {
 			console.log(
 				`[agents/claude-pty] goal-mode active for ${agent.id}: "${goalCondition!.slice(0, 80)}${goalCondition!.length > 80 ? '…' : ''}"`,
@@ -204,9 +222,15 @@ export const claudePtyDispatcher: BackendDispatcher = {
 
 		// ADR-004 D1 — begin tailing this run's transcript live (the
 		// `--session-id` set on spawn makes it locatable immediately).
+		// R5 fix — Claude saves the transcript under ~/.claude/projects/
+		// <encoded-cwd>/<session>.jsonl, where encoded-cwd is the cwd at PTY
+		// launch. The tail MUST use the same cwd or it reads nothing and the
+		// live cost/turns chips stay zero (silent regression).
 		let runTail: RunTail | undefined;
 		if (transcriptTail) {
-			runTail = createRunTail(sessionUuid, { cwd: config.resolved.vaultDir });
+			runTail = createRunTail(sessionUuid, {
+				cwd: opts.cwd ?? config.resolved.vaultDir,
+			});
 			console.log(
 				`[agents/claude-pty] transcript tail active for ${agent.id}` +
 					`${liveTail ? ' (live termination + budget)' : ' (cost/turns only — goal-mode)'}`,
@@ -229,10 +253,16 @@ export const claudePtyDispatcher: BackendDispatcher = {
 		let goalAchieved = false;
 		let goalMetricsRaw: string | undefined;
 		let goalGraceTimer: ReturnType<typeof setTimeout> | undefined;
-		// ADR-026 P2 — ask-operator detection. Set when parseAskOperator
-		// finds the sentinel in the accumulator. Non-null → session is
-		// killed immediately (agent is blocked waiting for input).
+		// ADR-026 P2 — ask-operator detection. Set when the transcript scan
+		// finds the sentinel in an assistant text block. Non-null → session
+		// is killed immediately (agent is blocked waiting for input).
+		// ADR-019 P1 — detection moved from raw PTY scan (onOutput) to the
+		// 200ms poll loop, reading the JSONL transcript instead of stripped
+		// scrollback.  This eliminates the tool-use self-trigger trap.
 		let operatorQuestion: string | null = null;
+		// ADR-019 P1 — cached transcript path; avoids repeated filesystem scans
+		// in the poll loop. Set to non-null once locateTranscript finds the file.
+		let resolvedTranscriptPath: string | null = null;
 
 		const onOutput = (data: string) => {
 			lastActivity = Date.now();
@@ -256,22 +286,10 @@ export const claudePtyDispatcher: BackendDispatcher = {
 					}, GOAL_GRACE_MS);
 				}
 			}
-			// ADR-026 P2 — ask-operator detection. Scan the ANSI-stripped
-			// accumulator so the marker survives chunk-straddle and cursor
-			// moves. No grace delay — the agent is blocked; kill immediately.
-			// `taskPayload` is passed as the prompt-echo guard: the injected
-			// task is echoed into the PTY, so a sentinel that's part of the
-			// instructions must NOT self-trigger (found live 2026-05-26).
-			if (pausable && !operatorQuestion) {
-				const q = parseAskOperator(stripAnsi(combined), taskPayload);
-				if (q !== null) {
-					operatorQuestion = q;
-					console.log(
-						`[agents/claude-pty] ask-operator from ${agent.id}: "${q.slice(0, 120)}${q.length > 120 ? '…' : ''}" — killing session`,
-					);
-					killSession(session.id);
-				}
-			}
+			// ADR-019 P1 — ask-operator detection was moved OUT of onOutput and
+			// into the poll loop below.  It now reads the JSONL transcript so
+			// tool_use payloads (e.g. an Edit writing the ASK_OPERATOR protocol
+			// docs) can't self-trigger the sentinel.  No action here.
 		};
 		const onExit = (code: number) => {
 			exited = true;
@@ -376,28 +394,42 @@ export const claudePtyDispatcher: BackendDispatcher = {
 						lastProgTurns = snap.turns;
 						yield { type: 'progress' as const, runId, costUsd: sc, numTurns: snap.turns, ts: Date.now() };
 					}
-					// ADR-026 follow-up — live termination + budget kills are liveTail-only
-					// (non-goal). Goal-mode tails for cost/turns (progress yield above) but
-					// keeps its `Goal achieved` termination; transcriptDone/ceilings must
-					// NOT change goal-mode behavior, so everything below stays gated.
-					if (liveTail) {
-					if (snap.done) {
-						transcriptDone = true;
-						killSession(session.id);
-						break;
-					}
+					// ADR-021 — budget enforcement is decoupled from `liveTail`.  Goal-mode
+					// agents (non-empty `goal_condition`) previously skipped ALL of the
+					// checks below because `liveTail = !goalActive` (line 153), leaving
+					// them with no cost/turns backstop.  The hard ceilings, soft-cap
+					// auto-extend log, live-grant adoption, and velocity warning now fire
+					// whenever `runTail` is available — independent of goal-mode.  Only
+					// the transcript-driven termination (`snap.done`) remains liveTail-only
+					// (moved to the tail of this block) because it would otherwise terminate
+					// goal-mode runs before the `Goal achieved` marker fires.  The finish
+					// cascade still checks `goalAchieved` BEFORE `budgetExceeded`, so a
+					// goal-mode run that converges before the ceiling still reports
+					// `goal_achieved`, not `awaiting-budget-approval`.
+
 					// ADR-006 Phase 3 — adopt any operator live grant (pre-approval from
 					// a velocity warning) BEFORE the ceiling checks, so the run never
-					// trips a ceiling the operator already raised. Re-arm the warning so
-					// a later approach to the NEW ceiling can warn again.
+					// trips a ceiling the operator already raised. Re-arm the warning
+					// ONLY when BOTH axes project clear post-grant (Commit C, 2026-05-30).
+					// A partial grant (operator raised cost but not turns, or vice-versa)
+					// leaves the unaddressed axis still in warning territory, and an
+					// unconditional re-arm would re-fire the warning on the next tick —
+					// duplicate Telegram + run re-paused. Hit live on ADR-025 dispatch.
 					const grant = getLiveGrant(sessionUuid);
 					if (grant) {
 						if (grant.ceilingUsd > ceilingUsd) ceilingUsd = grant.ceilingUsd;
 						if (grant.ceilingTurns > ceilingTurns) ceilingTurns = grant.ceilingTurns;
 						clearLiveGrant(sessionUuid);
-						velocityWarned = false;
+						const post = projectsAtCeiling(
+							{ costUsd: snap.costUsd, turns: snap.turns },
+							ceilingUsd,
+							ceilingTurns,
+						);
+						if (!post.willHitCost && !post.willHitTurns) {
+							velocityWarned = false;
+						}
 						console.log(
-							`[agents/claude-pty] ${agent.id} adopted live budget grant — ceiling now $${ceilingUsd}/${ceilingTurns}t`,
+							`[agents/claude-pty] ${agent.id} adopted live budget grant — ceiling now $${ceilingUsd}/${ceilingTurns}t (velocity ${velocityWarned ? 'still-warned' : 're-armed'})`,
 						);
 					}
 
@@ -438,14 +470,11 @@ export const claudePtyDispatcher: BackendDispatcher = {
 					// pause/resume cycle). Pausable runs only; needs ≥2 turns for a stable
 					// rate. index.ts turns the event into a Telegram message.
 					if (pausable && !velocityWarned && snap.turns >= 2) {
-						const costPerTurn =
-							snap.costUsd !== null && snap.turns > 0 ? snap.costUsd / snap.turns : 0;
-						const willHitCost =
-							snap.costUsd !== null &&
-							costPerTurn > 0 &&
-							snap.costUsd < ceilingUsd &&
-							snap.costUsd + costPerTurn >= ceilingUsd;
-						const willHitTurns = snap.turns < ceilingTurns && snap.turns + 1 >= ceilingTurns;
+						const { willHitCost, willHitTurns } = projectsAtCeiling(
+							{ costUsd: snap.costUsd, turns: snap.turns },
+							ceilingUsd,
+							ceilingTurns,
+						);
 						if (willHitCost || willHitTurns) {
 							velocityWarned = true;
 							yield {
@@ -461,7 +490,39 @@ export const claudePtyDispatcher: BackendDispatcher = {
 							};
 						}
 					}
-					} // ADR-026 follow-up — end liveTail-only termination/budget
+
+					// ADR-021 — transcript-driven termination stays liveTail-only.
+					// Goal-mode keeps its `Goal achieved` marker as the convergence
+					// signal; `snap.done` would otherwise terminate goal-mode runs
+					// prematurely.
+					if (liveTail && snap.done) {
+						transcriptDone = true;
+						killSession(session.id);
+						break;
+					}
+				}
+				// ADR-019 P1 — transcript-based ask-operator detection.
+				// Replaces the raw PTY accumulator scan from ADR-026 P2 (which
+				// fired on tool_use echoes, causing the self-trigger trap).
+				// The JSONL transcript distinguishes assistant text blocks from
+				// tool_use input payloads, so a marker inside an Edit/Write
+				// `new_string` field is silently skipped.  The transcript path
+				// is resolved once and cached; the read is bounded to the
+				// debounce window (≤200ms per cycle, file is append-only).
+				if (pausable && !operatorQuestion) {
+					if (!resolvedTranscriptPath) {
+						resolvedTranscriptPath = locateTranscript(sessionUuid, config.resolved.vaultDir);
+					}
+					if (resolvedTranscriptPath) {
+						const q = extractAskOperatorFromTranscript(resolvedTranscriptPath, taskPayload);
+						if (q !== null) {
+							operatorQuestion = q;
+							console.log(
+								`[agents/claude-pty] ask-operator (transcript) from ${agent.id}: "${q.slice(0, 120)}${q.length > 120 ? '…' : ''}" — killing session`,
+							);
+							killSession(session.id);
+						}
+					}
 				}
 				if (promptInjected && idle >= stallMs) {
 					stalled = true;
@@ -505,7 +566,13 @@ export const claudePtyDispatcher: BackendDispatcher = {
 			let transcriptCostUsd: number | undefined;
 			try {
 				const record = await loadAgentRunRecord(sessionUuid, {
-					cwd: config.resolved.vaultDir,
+					// R5 fix — match the cwd we launched the PTY with. Claude saves
+					// each session's transcript under ~/.claude/projects/<encoded-cwd>/
+					// so a worktree-launched session's transcript lives at the
+					// worktree-encoded path, not the vault-encoded path. Lookup MUST
+					// agree with launch or the record returns null and we fall back
+					// to scraped scrollback (loses cost/turns + clean finalOutput).
+					cwd: opts.cwd ?? config.resolved.vaultDir,
 					timeoutMs: 3000,
 					parentAgentId: agent.id, // ADR-008 — detect self-delegation
 				});

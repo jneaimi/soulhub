@@ -104,8 +104,11 @@ export const claudeStreamJsonDispatcher: BackendDispatcher = {
 		const onAbort = () => ac.abort();
 		opts.signal?.addEventListener('abort', onAbort);
 
+		// R5 fix (2026-05-30) — use the provisioned worktree cwd when set.
+		// Sibling of the claude-pty + cli-flag fixes; stream-json backend had
+		// the same silent leak.
 		const proc = spawn(claudeBinary, args, {
-			cwd: config.resolved.vaultDir,
+			cwd: opts.cwd ?? config.resolved.vaultDir,
 			env,
 			signal: ac.signal,
 			stdio: ['pipe', 'pipe', 'pipe'],

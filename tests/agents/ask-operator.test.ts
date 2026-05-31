@@ -1,4 +1,5 @@
 /** ADR-026 P2 — ask-operator sentinel + persistence unit tests.
+ *  ADR-019 P1 — extractAskOperatorFromTranscript transcript-based detection tests.
  *
  *  Covers:
  *    1. parseAskOperator — happy path: clean marker and ANSI-escaped / chunk-
@@ -8,6 +9,9 @@
  *    3. Persistence round-trip: an `awaiting-operator-input` run inserted with
  *       `OPERATOR_QUESTION: <q>` in error_message is retrieved by
  *       `listAwaitingOperatorInput` and carries the question.
+ *    4. extractAskOperatorFromTranscript — happy path: marker in content[].text
+ *       is detected; marker ONLY in tool_use input returns null; both present
+ *       returns question from text; null/missing path returns null.
  *
  *  Run with:
  *    node --import ./tests/agents/register.mjs --test --experimental-strip-types \
@@ -15,6 +19,9 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { writeFileSync, unlinkSync, mkdtempSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 // ── Section 1: parseAskOperator — happy paths ──────────────────────────────
 
@@ -205,7 +212,8 @@ describe('listAwaitingOperatorInput — persistence round-trip', () => {
 				error_message   TEXT,
 				claude_session_id TEXT,
 				subject_path    TEXT,
-				handback        TEXT
+				handback        TEXT,
+				repo            TEXT
 			)
 		`);
 
@@ -273,7 +281,8 @@ describe('listAwaitingOperatorInput — persistence round-trip', () => {
 				status          TEXT    NOT NULL,
 				cost_usd        REAL    NOT NULL DEFAULT 0,
 				num_turns       INTEGER NOT NULL DEFAULT 0,
-				error_message   TEXT
+				error_message   TEXT,
+				repo            TEXT
 			)
 		`);
 
@@ -309,5 +318,172 @@ describe('listAwaitingOperatorInput — persistence round-trip', () => {
 		assert.equal(alive.status, 'awaiting-operator-input', 'fresh row should remain unchanged');
 
 		testDb.close();
+	});
+});
+
+// ── Section 4: extractAskOperatorFromTranscript (ADR-019 P1) ──────────────
+
+/** Build a minimal JSONL assistant event with the given content blocks. */
+function makeAssistantLine(contentBlocks: Array<{ type: string; [k: string]: unknown }>): string {
+	return JSON.stringify({
+		type: 'assistant',
+		requestId: 'req-test',
+		message: {
+			role: 'assistant',
+			model: 'claude-opus-4-5',
+			content: contentBlocks,
+		},
+	});
+}
+
+/** Build a minimal JSONL assistant event with a single tool_use block. */
+function makeToolUseLine(toolName: string, inputFields: Record<string, unknown>): string {
+	return JSON.stringify({
+		type: 'assistant',
+		requestId: 'req-tool',
+		message: {
+			role: 'assistant',
+			content: [
+				{ type: 'tool_use', id: 'tu-1', name: toolName, input: inputFields },
+			],
+		},
+	});
+}
+
+describe('extractAskOperatorFromTranscript — ADR-019 P1', () => {
+	const tmpDir = mkdtempSync(join(tmpdir(), 'ask-op-test-'));
+
+	test('null path returns null without error', async () => {
+		const { extractAskOperatorFromTranscript } = await import(
+			'../../src/lib/agents/dispatch/ask-operator.ts'
+		);
+		assert.equal(extractAskOperatorFromTranscript(null), null);
+	});
+
+	test('non-existent file path returns null without throwing', async () => {
+		const { extractAskOperatorFromTranscript } = await import(
+			'../../src/lib/agents/dispatch/ask-operator.ts'
+		);
+		assert.equal(
+			extractAskOperatorFromTranscript('/tmp/__does_not_exist_adr019__.jsonl'),
+			null,
+		);
+	});
+
+	test('marker in content[].type=text returns the question', async () => {
+		const { extractAskOperatorFromTranscript } = await import(
+			'../../src/lib/agents/dispatch/ask-operator.ts'
+		);
+		const marker = '<<<ASK_OPERATOR>>>{"question":"What database should I target?"}<<<END_ASK_OPERATOR>>>';
+		const jsonl = makeAssistantLine([{ type: 'text', text: `Preamble.\n${marker}\nMore text.` }]);
+		const path = join(tmpDir, 'text-only.jsonl');
+		writeFileSync(path, jsonl + '\n');
+		try {
+			assert.equal(
+				extractAskOperatorFromTranscript(path),
+				'What database should I target?',
+			);
+		} finally {
+			unlinkSync(path);
+		}
+	});
+
+	test('marker ONLY in tool_use input returns null (self-trigger fix)', async () => {
+		// This is the exact failure mode that ADR-019 fixes: the agent is editing
+		// seed-roster.ts and the Edit tool's new_string contains the sentinel.
+		const { extractAskOperatorFromTranscript } = await import(
+			'../../src/lib/agents/dispatch/ask-operator.ts'
+		);
+		const sentinelInEdit = '<<<ASK_OPERATOR>>>{"question":"<one concise question>"}<<<END_ASK_OPERATOR>>>';
+		const jsonl = makeToolUseLine('Edit', {
+			path: 'src/lib/agents/seed-roster.ts',
+			old_string: '// old',
+			new_string: `# Asking the Operator\n\n${sentinelInEdit}`,
+		});
+		const path = join(tmpDir, 'tool-use-only.jsonl');
+		writeFileSync(path, jsonl + '\n');
+		try {
+			// Must return null — tool_use bodies are never operator-facing communication.
+			assert.equal(extractAskOperatorFromTranscript(path), null);
+		} finally {
+			unlinkSync(path);
+		}
+	});
+
+	test('marker in BOTH text and tool_use — text wins, tool_use ignored', async () => {
+		const { extractAskOperatorFromTranscript } = await import(
+			'../../src/lib/agents/dispatch/ask-operator.ts'
+		);
+		const realQuestion = 'Should I use PostgreSQL or SQLite for this?';
+		const toolUseMarker = '<<<ASK_OPERATOR>>>{"question":"<one concise question>"}<<<END_ASK_OPERATOR>>>';
+		const textMarker = `<<<ASK_OPERATOR>>>{"question":"${realQuestion}"}<<<END_ASK_OPERATOR>>>`;
+
+		// Two events: first a tool_use with the sentinel, then an assistant text
+		// block with the real question. (Newest-first scan returns the text block.)
+		const toolLine = makeToolUseLine('Write', { file: 'docs.md', content: toolUseMarker });
+		const textLine = makeAssistantLine([
+			{ type: 'text', text: `I need to ask you something.\n${textMarker}` },
+		]);
+		const path = join(tmpDir, 'both.jsonl');
+		writeFileSync(path, [toolLine, textLine].join('\n') + '\n');
+		try {
+			assert.equal(extractAskOperatorFromTranscript(path), realQuestion);
+		} finally {
+			unlinkSync(path);
+		}
+	});
+
+	test('echo guard: marker in text that is a substring of taskPayload returns null', async () => {
+		const { extractAskOperatorFromTranscript } = await import(
+			'../../src/lib/agents/dispatch/ask-operator.ts'
+		);
+		// The task itself contains the literal marker as instructional text.
+		// When echoed into the PTY transcript as a text block, it must NOT fire.
+		const task =
+			'When blocked, emit <<<ASK_OPERATOR>>>{"question":"<your one concise question>"}<<<END_ASK_OPERATOR>>> and stop.';
+		const echoedText = `[Pasted text #1]\n${task}`;
+		const jsonl = makeAssistantLine([{ type: 'text', text: echoedText }]);
+		const path = join(tmpDir, 'echo-guard.jsonl');
+		writeFileSync(path, jsonl + '\n');
+		try {
+			assert.equal(extractAskOperatorFromTranscript(path, task), null);
+		} finally {
+			unlinkSync(path);
+		}
+	});
+
+	test('newest-first scan: last assistant text event wins', async () => {
+		const { extractAskOperatorFromTranscript } = await import(
+			'../../src/lib/agents/dispatch/ask-operator.ts'
+		);
+		const oldQ = 'Old question?';
+		const newQ = 'Newer, more specific question?';
+		const line1 = makeAssistantLine([
+			{ type: 'text', text: `<<<ASK_OPERATOR>>>{"question":"${oldQ}"}<<<END_ASK_OPERATOR>>>` },
+		]);
+		const line2 = makeAssistantLine([
+			{ type: 'text', text: `<<<ASK_OPERATOR>>>{"question":"${newQ}"}<<<END_ASK_OPERATOR>>>` },
+		]);
+		const path = join(tmpDir, 'newest-first.jsonl');
+		// line2 appended after line1 → is "newer"
+		writeFileSync(path, [line1, line2].join('\n') + '\n');
+		try {
+			assert.equal(extractAskOperatorFromTranscript(path), newQ);
+		} finally {
+			unlinkSync(path);
+		}
+	});
+
+	test('empty transcript returns null', async () => {
+		const { extractAskOperatorFromTranscript } = await import(
+			'../../src/lib/agents/dispatch/ask-operator.ts'
+		);
+		const path = join(tmpDir, 'empty.jsonl');
+		writeFileSync(path, '');
+		try {
+			assert.equal(extractAskOperatorFromTranscript(path), null);
+		} finally {
+			unlinkSync(path);
+		}
 	});
 });

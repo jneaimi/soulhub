@@ -41,6 +41,11 @@
 		 *  When provided, coding candidates without a repo are skipped so the AI
 		 *  button is hidden rather than showing a dispatch that would fail. */
 		agentRepos?: Map<string, string | undefined>;
+		/** ADR-011 D2 — true when the artifact's project has a `repo:` binding
+		 *  on its `index.md`. Opens the carve-out for `implementer` specifically:
+		 *  a project-bound repo satisfies ADR-014's isolation requirement for the
+		 *  general implementer. Default false (safe: no AI button for unbound projects). */
+		subjectHasProjectRepo?: boolean;
 		/** Called after a successful accept+dispatch confirm.
 		 *  The page opens the AdrDrawer for `path` with autoDispatch=true,
 		 *  reusing the drawer's existing stream + code-review card. */
@@ -56,6 +61,7 @@
 		tags = [],
 		agentIds = new Set<string>(),
 		agentRepos,
+		subjectHasProjectRepo = false,
 		onDispatch,
 	}: Props = $props();
 
@@ -72,10 +78,18 @@
 
 	/** D5 — resolved agent + showAiButton flag. Recomputed when roster or
 	 *  metadata changes (agentIds is a Set, so reassignment triggers reactivity).
-	 *  ADR-014 D1 — agentRepos passed so repo-less coding agents are hidden. */
-	const actionModel = $derived(decisionActionModel(work_type, assignee, tags, agentIds, agentRepos));
+	 *  ADR-014 D1 — agentRepos passed so repo-less coding agents are hidden.
+	 *  ADR-011 D2 — subjectHasProjectRepo opens the implementer carve-out. */
+	const actionModel = $derived(decisionActionModel(work_type, assignee, tags, agentIds, agentRepos, subjectHasProjectRepo));
 	const resolvedAgent = $derived(actionModel.resolvedAgent);
 	const showAiButton = $derived(actionModel.showAiButton);
+	/** ADR-025 D2 — the specialist agent expected but not in the live roster.
+	 *  Null when nothing is expected or when the roster is populated correctly.
+	 *  Drives the "no `<agent>` installed" hint so users know why AI is absent. */
+	const missingSpecialist = $derived(actionModel.missingSpecialist);
+	/** ADR-025 D3 — true when coding work is blocked only because the project
+	 *  has no repo binding. Surface a "Bind / scaffold a repo" affordance. */
+	const needsScaffold = $derived(actionModel.needsScaffold);
 	const confirmMessage = $derived(resolvedAgent ? buildConfirmMessage(resolvedAgent) : '');
 
 	async function transition(action: Action, body: Record<string, unknown> = {}) {
@@ -155,6 +169,29 @@
 		>
 			{acting === 'accept' ? '…' : 'Accept'}
 		</button>
+		<!-- ADR-025 D2 — "no `<agent>` installed" hint when a non-coding specialist
+		     is expected but absent from the live roster. Shown inline beside the
+		     Accept button so the operator understands why the AI action is missing. -->
+		{#if missingSpecialist}
+			<span
+				class="{padding} rounded {textSize} text-hub-dim italic"
+				title="Install {missingSpecialist} agent in Lane A (~/.claude/agents/{missingSpecialist}.md) to enable AI dispatch for this work type"
+			>
+				no {missingSpecialist} installed
+			</span>
+		{/if}
+		<!-- ADR-025 D3 — "no repo bound" hint for coding work without a project
+		     repo. Directs the operator to bind or scaffold a repo on the project's
+		     index.md so the implementer carve-out opens and AI dispatch becomes
+		     available. Links to the project detail page (which hosts the bind UI). -->
+		{#if needsScaffold}
+			<span
+				class="{padding} rounded {textSize} text-hub-warning italic"
+				title="This project has no repo binding — add `repo: ~/dev/<slug>` to the project's index.md to enable coding AI dispatch. Visit the project page to scaffold or bind a repo."
+			>
+				bind a repo first
+			</span>
+		{/if}
 	{/if}
 	<button
 		onclick={() => { mode = mode === 'reject' ? null : 'reject'; }}

@@ -69,10 +69,27 @@ export interface DispatchOptions {
 	 *  rather than provisioning a new one. Must be set alongside
 	 *  `resume_session_id`; absent → fresh worktree provisioned as usual. */
 	resume_branch?: string;
+	/** R5 fix (2026-05-30) — explicit cwd for the PTY child / oneshot spawn.
+	 *  Set to the provisioned worktree path so the agent starts IN the
+	 *  worktree instead of cwd=vault + relying on a `cd` directive in the
+	 *  prompt. Without this, run 524 sat in /Users/jneaimi/vault for 22 min
+	 *  doing nothing: relative paths didn't resolve, the PreToolUse scope
+	 *  guard saw the wrong working dir, and any self-`cd` the agent forgot
+	 *  meant zero commits on the worktree branch. Undefined → backend falls
+	 *  back to its historical default (vaultDir for claude-pty), preserving
+	 *  behavior for non-artifact dispatches that have no worktree. */
+	cwd?: string;
 }
 
 export type DispatchEvent =
-	| { type: 'started'; backend: string; model?: string; runId: string; ts: number }
+	/** ADR-020 P4 — `claudeSessionId` carries the spawned session's UUID so
+	 *  the dispatcher can persist it to `agent_runs.claude_session_id` at
+	 *  start time (not just at finish), giving the dispatch-scope-guard.sh
+	 *  PreToolUse hook a stable join key for the running row. Optional for
+	 *  backward-compat: backends that don't expose session-id-at-start (e.g.
+	 *  claude-cli-flag, which learns it from the JSON envelope at the end)
+	 *  omit it. */
+	| { type: 'started'; backend: string; model?: string; runId: string; ts: number; claudeSessionId?: string }
 	| { type: 'output'; data: string; ts: number }
 	| { type: 'tool_call'; name: string; ts: number }
 	| { type: 'step'; n: number; finishReason?: string; ts: number }

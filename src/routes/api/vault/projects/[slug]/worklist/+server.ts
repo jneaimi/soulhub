@@ -37,7 +37,7 @@ import type {
 	ReviewHandoffPayload,
 	NoArtifactPayload,
 } from '$lib/projects/worklist-lane.js';
-import { safeId } from '$lib/agents/dispatch/worktree-provision.js';
+import { branchForRun, RUN_BRANCH_GLOBS } from '$lib/agents/dispatch/run-branch.js';
 import { parseHandback, handbackGatesGreen } from '$lib/agents/handback.js';
 import type { VaultMeta } from '$lib/vault/types.js';
 
@@ -161,12 +161,22 @@ export const GET: RequestHandler = async ({ params }) => {
 			if (!row.subjectPath) continue;
 			const question = (row.errorMessage ?? '').replace(/^OPERATOR_QUESTION:\s*/, '');
 			const sessionId = row.claudeSessionId ?? '';
-			const branch = `orchestration/run-${row.startedAt}/${safeId(row.subjectPath)}`;
+			// ADR-022 (2026-05-29): route through `branchForRun` so the
+			// awaiting-lane shows the actual branch the run committed to
+			// (handback.branch when present), falling back to
+			// `claude-soul/<adrKey>` for post-ADR-022 rows and the legacy
+			// `orchestration/run-X/Y` for pre-ADR-022 rows. The hand-built
+			// reconstruction here was the same regression that broke the
+			// review lane (lines 206 below).
+			const branch = branchForRun(row);
 			awaitingBySubject.set(row.subjectPath, {
 				question,
 				sessionId,
 				branch,
 				agentId: row.agentId,
+				// ADR-019 P2 — surface the run ID so the UI can call
+				// POST /api/agents/runs/[runId]/bump-continue directly.
+				runId: row.runId,
 			});
 		}
 	} catch {
@@ -180,12 +190,16 @@ export const GET: RequestHandler = async ({ params }) => {
 	try {
 		const reviewableRuns = listReviewableRuns();
 
-		// ONE git branch list call for all orchestration/* branches.
+		// ADR-022 (2026-05-29): list BOTH the new `claude-soul/*` convention
+		// AND the legacy `orchestration/*` so live-branch detection works
+		// during the migration window. Once no legacy rows remain in
+		// `agent_runs` (or the operator chooses to drop the fallback),
+		// `RUN_BRANCH_GLOBS` can be shortened.
 		let liveBranches = new Set<string>();
 		try {
 			const { stdout } = await execFileAsync(
 				'git',
-				['branch', '--list', 'orchestration/*', '--format=%(refname:short)'],
+				['branch', '--list', ...RUN_BRANCH_GLOBS, '--format=%(refname:short)'],
 				{ cwd: process.cwd() },
 			);
 			liveBranches = new Set(
@@ -195,21 +209,29 @@ export const GET: RequestHandler = async ({ params }) => {
 					.filter(Boolean),
 			);
 		} catch {
-			// git unavailable or no orchestration branches — treat all runs as discarded
+			// git unavailable or no matching branches — treat all runs as discarded
 		}
 
 		reviewBySubject = new Map();
 		for (const [subjectPath, run] of reviewableRuns) {
-			const branch = `orchestration/run-${run.startedAt}/${safeId(subjectPath)}`;
+			// ADR-022 (2026-05-29) — `branchForRun` is the single source of
+			// truth for resolving a run's branch (handback-first, then
+			// `claude-soul/<adrKey>`, then legacy `orchestration/run-X/Y`).
+			// This replaces the in-line reconstruction that filtered out
+			// every post-ADR-022 run from the review lane (run #522 against
+			// ADR-025 was the witness — `goal_achieved` but invisible in UI).
+			// `ReviewableRun` doesn't carry subject_path (it's the map key),
+			// so we pass it through alongside the row.
+			const branch = branchForRun({ ...run, subjectPath });
 			// Only surface if the branch still exists (un-merged) in the repo.
-			if (!liveBranches.has(branch)) continue;
+			if (!branch || !liveBranches.has(branch)) continue;
 
 			// ADR-026 D3 — prefer the full untruncated `handback` column; fall
 			// back to `resultExcerpt` for runs predating this migration (null
 			// handback) so existing rows still render something rather than blank.
 			const hb = parseHandback(run.handback ?? run.resultExcerpt);
 			reviewBySubject.set(subjectPath, {
-				branch: hb?.branch ?? branch,
+				branch,
 				summary: hb?.summary ?? '',
 				followUps: hb?.follow_ups ?? [],
 				gatesGreen: hb ? handbackGatesGreen(hb) : false,

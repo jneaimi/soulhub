@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { apiPost, apiPut } from '../api.ts';
+import { apiPost, apiPut, apiDelete } from '../api.ts';
 import { emit, fail, exitIfApiFailure, type OutputOpts } from '../output.ts';
 import { resolveContent } from '../content-input.ts';
 
@@ -144,6 +144,35 @@ export async function rename(args: Record<string, string | undefined>, opts: Out
     dryRun: !!args['dry-run'],
   });
   emitRelocate(data, opts);
+  exitIfApiFailure(data);
+}
+
+/** soul note delete <path> [--dry-run]
+ *
+ *  Archive a vault note (the server-side delete is "archive to archive/", not
+ *  permanent destruction).  Convenient for cleaning up CLI typos / mistaken
+ *  proposes — e.g. an ADR slug landed without the `adr-NNN-` prefix and was
+ *  rejected by `soul adr list`.  Permanent removal still requires direct
+ *  `rm` on the archived file in `~/vault/archive/...`. */
+export async function deleteNote(args: Record<string, string | undefined>, opts: OutputOpts) {
+  const path = args._;
+  if (!path) fail('note delete: usage: soul note delete <path> [--dry-run]');
+  if (args['dry-run']) {
+    emit(
+      { dryRun: true, method: 'DELETE', path: `/api/vault/notes/${path}` },
+      opts,
+      (d: { method: string; path: string }) => `DRY RUN — ${d.method} ${d.path}`,
+    );
+    return;
+  }
+  const data = await apiDelete<{ success?: boolean; error?: string; archivedTo?: string }>(
+    `/api/vault/notes/${path}`,
+  );
+  emit(data, opts, (d) =>
+    d.success === false
+      ? `✗ ${d.error ?? 'delete failed'}`
+      : `✓ archived ${path}${d.archivedTo ? ` → ${d.archivedTo}` : ''}`,
+  );
   exitIfApiFailure(data);
 }
 

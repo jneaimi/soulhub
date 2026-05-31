@@ -19,7 +19,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { createWorktree } from '../../orchestration/worktree.js';
+import { createWorktree, createWorktreeAt } from '../../orchestration/worktree.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -150,6 +150,53 @@ export async function provisionResumeWorktree(
 	}
 
 	return { worktreePath, branch: safeBranchName, repoPath };
+}
+
+/** ADR-022 — Per-ADR worktree provisioning.
+ *
+ *  Derives a stable ADR key from `subjectPath` (the vault artifact path,
+ *  e.g. `projects/soul-hub-agents/adr-011-general-implementer-agent.md`)
+ *  via the existing `safeId` helper.  The worktree lives at
+ *  `<repo>/.worktrees/<adr-key>` on branch `claude-soul/<adr-key>`.
+ *
+ *  Idempotent — every dispatch against the same ADR reuses the same
+ *  worktree, so subsequent dispatches see the previous run's commits at
+ *  HEAD without operator intervention.  Three dispatches against ADR-011
+ *  → one worktree, one feature branch, one cleanup at ship time.
+ *
+ *  Caller (`dispatch/index.ts`) selects this helper for any dispatch with
+ *  a `subjectPath` set.  Non-ADR dispatches (orchestrator background
+ *  jobs, ad-hoc CLI tests with no subject path) still use the per-run
+ *  `provisionAgentWorktree`.  Explicit-resume dispatches
+ *  (bump-continue, manual re-dispatch with `opts.resumeBranch`) still
+ *  use `provisionResumeWorktree`. */
+export async function provisionAdrWorktree(
+	repo: string,
+	subjectPath: string,
+): Promise<AgentWorktree> {
+	const repoPath = expandHome(repo);
+	if (!existsSync(join(repoPath, '.git'))) {
+		throw new Error(`agent repo is not a git repository: ${repoPath}`);
+	}
+	const adrKey = safeId(subjectPath);
+	const { worktreePath, branch } = await createWorktreeAt(
+		repoPath,
+		adrKey,
+		`claude-soul/${adrKey}`,
+	);
+
+	// Copy-on-write node_modules — same best-effort as provisionAgentWorktree.
+	// Skipped if the worktree already has it (idempotent for the 2nd+ dispatch).
+	const src = join(repoPath, 'node_modules');
+	const dst = join(worktreePath, 'node_modules');
+	if (existsSync(src) && !existsSync(dst)) {
+		try {
+			await execFileAsync('cp', ['-Rc', src, dst], { maxBuffer: 64 * 1024 * 1024 });
+		} catch (err) {
+			console.warn(`[agents/worktree] node_modules CoW link failed: ${(err as Error).message}`);
+		}
+	}
+	return { worktreePath, branch, repoPath };
 }
 
 /** The directive prepended to a repo-scoped agent's task so it works in the

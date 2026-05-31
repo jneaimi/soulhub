@@ -27,7 +27,8 @@ import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join, delimiter } from 'node:path';
 import { promisify } from 'node:util';
-import { expandHome, safeId } from './worktree-provision.js';
+import { expandHome } from './worktree-provision.js';
+import { branchForRun, worktreeForRun } from './run-branch.js';
 import { isBenignDriftPath } from '../benign-drift.js';
 
 const execFileAsync = promisify(execFile);
@@ -124,9 +125,12 @@ export interface DeriveGatesInput {
 export async function deriveHandbackFromBranch(input: DeriveGatesInput): Promise<string | null> {
 	const repo = expandHome(input.repo);
 	const base = input.base ?? 'main';
-	const taskId = safeId(input.subjectPath);
-	const branch = `orchestration/run-${input.startedAt}/${taskId}`;
-	const worktreeDir = join(repo, '.worktrees', `run-${input.startedAt}-${taskId}`);
+	// ADR-022 single-source-of-truth: branchForRun / worktreeForRun consolidate
+	// the three-tier fallback (handback.branch → claude-soul/<adrKey> → legacy
+	// orchestration/run-X/Y) so ADR-022-era runs find their actual branch + dir.
+	const runRef = { subjectPath: input.subjectPath, startedAt: input.startedAt };
+	const branch = branchForRun(runRef);
+	const worktreeDir = worktreeForRun(runRef, repo);
 
 	// No worktree on disk → can't re-run gates (branch merged/discarded/cleaned).
 	if (!existsSync(worktreeDir)) return null;

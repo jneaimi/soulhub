@@ -136,6 +136,27 @@ try {
 	console.error('[fetch-page] Failed to initialize:', err);
 }
 
+// ADR-011 follow-up — install built-in agent SEEDs on boot so a fresh install
+// (or a Soul Hub update that adds a new SEED, e.g. `implementer`) lands the
+// `~/.claude/agents/*.md` files automatically.  `installSeedRoster` is
+// idempotent + skip-if-exists, so existing operator-customized files are
+// never clobbered.  Default `overwrite: false` preserves all customizations;
+// `provenance: builtin` files that diverged from the current SEED stay as-is
+// (the operator chose them).  Manual re-seed remains available via
+// `POST /api/agents/seed { "overwrite": true }` if the operator wants to
+// refresh built-in files.
+try {
+	const { installSeedRoster } = await import('$lib/agents/seed-roster.js');
+	const result = installSeedRoster({ overwrite: false });
+	if (result.installed.length > 0) {
+		console.log(
+			`[agents/seed] installed ${result.installed.length} new SEED(s) on boot: ${result.installed.join(', ')}`,
+		);
+	}
+} catch (err) {
+	console.error('[agents/seed] Failed to install SEED roster on boot:', err);
+}
+
 // Start agents lane watcher (Phase 2 — bumps store version on file change)
 try {
 	initAgentsWatcher();

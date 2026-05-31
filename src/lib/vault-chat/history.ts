@@ -181,3 +181,80 @@ export const HISTORY_POLICY = {
 	maxTotalBytes: MAX_TOTAL_BYTES,
 	resetCommands: [...RESET_COMMANDS],
 } as const;
+
+// ── ADR-018 — Context gauge ───────────────────────────────────────────────────
+
+/** Window-usage snapshot emitted on every `complete` SSE event.
+ *  Gives the operator a turn-count + byte-count view of the conversation
+ *  window that the NEXT turn will see. */
+export interface WindowUsage {
+	/** Number of turns currently retained in the window. */
+	turns: number;
+	/** Maximum turns the window can hold (TURN_LIMIT). */
+	turnCap: number;
+	/** Total content bytes of the retained turns. */
+	bytes: number;
+	/** Maximum bytes the window can hold (MAX_TOTAL_BYTES). */
+	byteCap: number;
+	/** Age of the oldest retained turn from `now` (ms). 0 when window is empty. */
+	idleMs: number;
+	/** Maximum idle-window span before turns fall out (IDLE_GAP_MS). */
+	idleCap: number;
+}
+
+/**
+ * Compute the current window usage for `conversationKey` using the same
+ * three-axis policy as `loadHistory` (turn cap, byte cap, idle window).
+ *
+ * Call this AFTER saving both turns for the current exchange so the snapshot
+ * reflects what the NEXT turn will see.  Runs one DB read — no extra storage,
+ * no background jobs.
+ *
+ * ADR-018 S1 — exported so `dispatchWebTurn` can attach the snapshot to the
+ * terminal `complete` SSE event without re-implementing the trim policy.
+ */
+export function snapshotWindowUsage(conversationKey: string, now = Date.now()): WindowUsage {
+	const empty: WindowUsage = {
+		turns: 0, turnCap: TURN_LIMIT,
+		bytes: 0, byteCap: MAX_TOTAL_BYTES,
+		idleMs: 0, idleCap: IDLE_GAP_MS,
+	};
+	if (!conversationKey) return empty;
+
+	const cutoff = now - IDLE_GAP_MS;
+	const rows = db()
+		.prepare<[string, number, number]>(
+			`SELECT role, content, ts FROM chat_history
+			 WHERE conversation_key = ? AND ts >= ?
+			 ORDER BY ts DESC
+			 LIMIT ?`,
+		)
+		.all(conversationKey, cutoff, TURN_LIMIT) as HistoryRow[];
+
+	// Apply byte cap: same iteration as loadHistory — newest rows survive first.
+	// The `break` fires BEFORE pushing the row that would overflow, so we must
+	// re-derive keptBytes from the kept slice rather than relying on the running
+	// counter (which may include the rejected row's bytes).
+	let runningBytes = 0;
+	const kept: HistoryRow[] = [];
+	for (const row of rows) {
+		runningBytes += row.content.length;
+		if (runningBytes > MAX_TOTAL_BYTES && kept.length > 0) break;
+		kept.push(row);
+	}
+
+	if (kept.length === 0) return empty;
+
+	const keptBytes = kept.reduce((a, r) => a + r.content.length, 0);
+	// kept[] is newest-first (ORDER BY ts DESC); last element is the oldest kept turn.
+	const oldestTs = kept[kept.length - 1].ts;
+
+	return {
+		turns:   kept.length,
+		turnCap: TURN_LIMIT,
+		bytes:   keptBytes,
+		byteCap: MAX_TOTAL_BYTES,
+		idleMs:  now - oldestTs,
+		idleCap: IDLE_GAP_MS,
+	};
+}

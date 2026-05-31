@@ -19,11 +19,37 @@ import { rewriteBody, rewriteMeta, stripMd } from './relocate.js';
 import type { MoveSpec, RelocateResult } from './relocate.js';
 import { VaultCommitter } from './committer.js';
 import { emitReindex } from './events.js';
+// ADR-042 D1 — phases validator + active-phase helper. Imported from phases.ts
+// (a dependency-free module) so the unit test doesn't bootstrap the full engine.
+// Re-exported here so callers that import from `$lib/vault/index.js` get the same function.
+export { validatePhasedAdrFields, activePhase } from './phases.js';
+import { validatePhasedAdrFields } from './phases.js';
 
 let engine: VaultEngine | null = null;
 
 function truncate(s: string, max: number): string {
 	return s.length <= max ? s : s.slice(0, max - 1) + '…';
+}
+
+/** ADR-046 chokepoint hardening — gray-matter delegates frontmatter
+ *  serialization to js-yaml.dump(), which throws "unacceptable kind of an
+ *  object to dump [object Undefined]" on any property whose value is literally
+ *  `undefined`. In YAML semantics an absent key and a key with `undefined`
+ *  value are informationally equivalent, so strip undefined properties before
+ *  stringifying. Covers callers that build meta with `field || undefined` or
+ *  `optional?: T` shapes (session-bridge, stub scaffolder, callers that pass
+ *  optional SessionMeta fields straight through) so the engine never throws
+ *  on shape drift the caller couldn't have known to anticipate.
+ *
+ *  Shallow on purpose: every observed failure has been a top-level undefined
+ *  from a coalesce expression at the call site. Nested undefined is not a
+ *  shape any existing caller produces; widen this if that ever changes. */
+function stripUndefined<T extends Record<string, unknown>>(meta: T): T {
+	const out: Record<string, unknown> = {};
+	for (const [k, v] of Object.entries(meta)) {
+		if (v !== undefined) out[k] = v;
+	}
+	return out as T;
 }
 
 /** projects-graph ADR-001 — match the project ROOT `index.md` (e.g.
@@ -174,6 +200,46 @@ function validateStatusScope(meta: VaultMeta, zone: VaultZone): string | null {
 		return `status "${raw}" not in canonical set (allowed: ${zone.allowedStatuses.join(', ')})`;
 	}
 	return null;
+}
+
+/** projects-graph ADR-040 — validate `proactive_prep_enabled:` on project
+ *  root `index.md`. The field is an opt-in boolean gate for the
+ *  proactive-prep scheduler handler (`vault-scout-unblock` action layer).
+ *  Only real JSON booleans (`true` / `false`) are accepted — a string like
+ *  `"yes"` or `"true"` is refused so callers cannot silently coerce.
+ *  Absent / undefined passes silently; the field is optional (default false).
+ *  Returns null on pass; a refusal message when the value is non-boolean. */
+function validateProactivePrepEnabled(
+	notePath: string,
+	meta: VaultMeta,
+): string | null {
+	if (!isProjectRootIndex(notePath)) return null;
+	const raw: unknown = meta.proactive_prep_enabled;
+	if (raw === undefined || raw === null) return null;
+	if (typeof raw !== 'boolean') {
+		return (
+			`proactive_prep_enabled must be a boolean (true or false), ` +
+			`got ${typeof raw} "${raw}". ` +
+			`See projects/CLAUDE.md "Allowed Proactive-Prep Enable Field" (projects-graph ADR-040).`
+		);
+	}
+	return null;
+}
+
+/** Zone-path patterns whose writes skip the content-similarity dedup check.
+ *  Session-output zones (`projects/<slug>/sessions/`) are exempt because
+ *  every brief is a fresh SME interview output; two SMEs answering the
+ *  same scenario will produce lexically-similar briefs by design.
+ *
+ *  Keep the list narrow — anything that *generates* content from a fresh
+ *  source (interview, ingest, transcript) belongs here; anything that
+ *  *summarises* or *learns* (knowledge zones) keeps the gate. */
+const DEDUP_EXEMPT_PATTERNS: RegExp[] = [
+	/^projects\/[^/]+\/sessions(\/|$)/,
+];
+
+function isDedupExempt(zone: string): boolean {
+	return DEDUP_EXEMPT_PATTERNS.some((re) => re.test(zone));
 }
 
 export class VaultEngine {
@@ -668,6 +734,22 @@ export class VaultEngine {
 			return { success: false, error: createRelErr };
 		}
 
+		// projects-graph ADR-040 — boolean-type enforcement for
+		// `proactive_prep_enabled` on project-root index.md. Refuses
+		// string coercions ("yes", "true") at write-time so the scheduler
+		// handler never receives an unexpected truthy string.
+		const createPrepErr = validateProactivePrepEnabled(join(req.zone, req.filename), req.meta);
+		if (createPrepErr) {
+			return { success: false, error: createPrepErr, field: 'proactive_prep_enabled' };
+		}
+
+		// ADR-042 D1 — phases / shipped_phases invariant enforcement on `type: decision`
+		// notes. Zero-impact on single-shot ADRs (no `phases:` field).
+		const createPhasesErr = validatePhasedAdrFields(req.meta);
+		if (createPhasesErr) {
+			return { success: false, error: createPhasesErr, field: 'phases' };
+		}
+
 		// Validate naming pattern
 		if (zone.namingPattern) {
 			const re = new RegExp(zone.namingPattern);
@@ -715,7 +797,15 @@ export class VaultEngine {
 		// Content dedup check (agent writes only). Same gate semantics as
 		// rate-limit — keyed on source_agent, but the audit-log entry
 		// uses auditAgent for actor traceability.
-		if (req.meta.source_agent) {
+		//
+		// Zones matching DEDUP_EXEMPT_PATTERNS skip this check. Session-output
+		// zones (`projects/*/sessions/`) are exempt because each note is a
+		// fresh-from-the-wild output (an SME interview); two different SMEs
+		// answering the same scenario will produce lexically-similar briefs
+		// by design, and the dedup check turns that into silent data loss.
+		// Knowledge zones (`knowledge/*`) keep the check — agents shouldn't
+		// spam near-duplicate learnings.
+		if (req.meta.source_agent && !isDedupExempt(req.zone)) {
 			const titleFromContent = req.content.split('\n').find(l => l.startsWith('# '))?.replace('# ', '') || req.filename.replace('.md', '');
 			const dupCheck = this.checkDuplicate(req.zone, req.content, titleFromContent);
 			if (dupCheck.isDuplicate) {
@@ -782,7 +872,7 @@ export class VaultEngine {
 			req.meta.tags = tags;
 		}
 
-		const content = matter.stringify(req.content, req.meta);
+		const content = matter.stringify(req.content, stripUndefined(req.meta));
 		if (Buffer.byteLength(content) > MAX_NOTE_SIZE) {
 			return { success: false, error: `Note exceeds maximum size of ${MAX_NOTE_SIZE} bytes` };
 		}
@@ -1035,6 +1125,22 @@ export class VaultEngine {
 			return { success: false, error: updateRelErr };
 		}
 
+		// projects-graph ADR-040 — boolean-type enforcement on update too.
+		// Catches a caller updating the field from a boolean to a string.
+		const updatePrepErr = validateProactivePrepEnabled(path, mergedMeta);
+		if (updatePrepErr) {
+			return { success: false, error: updatePrepErr, field: 'proactive_prep_enabled' };
+		}
+
+		// ADR-042 D1 — phases / shipped_phases invariant enforcement on update too.
+		// Post-merge meta means a body-only update on a valid phased ADR passes
+		// through unchanged. Catches a caller introducing a shipped_phases element
+		// that isn't in phases (e.g. a typo in the phase ID).
+		const updatePhasesErr = validatePhasedAdrFields(mergedMeta);
+		if (updatePhasesErr) {
+			return { success: false, error: updatePhasesErr, field: 'phases' };
+		}
+
 		// ADR-047 — same wikilink validation as createNote. Always re-validates
 		// against the post-merge body, even when the caller only sent meta —
 		// frontmatter changes (aliases, strict_links) can shift link semantics.
@@ -1086,7 +1192,7 @@ export class VaultEngine {
 			mergedMeta.tags = mergedMeta.tags.filter((t: string) => t !== 'has-link-warnings');
 		}
 
-		const content = matter.stringify(newContent, mergedMeta);
+		const content = matter.stringify(newContent, stripUndefined(mergedMeta));
 		if (Buffer.byteLength(content) > MAX_NOTE_SIZE) {
 			return { success: false, error: `Note exceeds maximum size of ${MAX_NOTE_SIZE} bytes` };
 		}
@@ -1662,7 +1768,7 @@ export class VaultEngine {
 			if (parentMeta.project) stubMeta.project = parentMeta.project as string;
 
 			const body = `# ${title}\n\n> Stub placeholder. Created via \`scaffold_stubs\` from [[${sourcePath.replace(/\.md$/, '')}]].\n> Fill in when ready, or delete if the parent link no longer needs a target.\n`;
-			const content = matter.stringify(body, stubMeta);
+			const content = matter.stringify(body, stripUndefined(stubMeta));
 
 			this.watcher.suppress(stubPath);
 			try {

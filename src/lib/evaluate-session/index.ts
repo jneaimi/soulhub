@@ -29,7 +29,29 @@ const BRIEF_MARKER = '<<<BRIEF>>>';
  *  are short, low-volume, and operator-driven; no persistence needed yet. */
 const histories = new Map<string, ChatMessage[]>();
 
-interface Brief {
+/** ADR-008 P2 — in-memory pending preview map, keyed by transcript stem.
+ *  Populated by the post-call webhook after the analyst returns; consumed
+ *  by GET /api/evaluate-session/preview. Per-session, ephemeral; rebuilt
+ *  on each post-call. */
+export const pendingPreview = new Map<string, Brief>();
+
+/** ADR-004 P2 / ADR-006 P1 — companion map to pendingPreview, holding the
+ *  verbatim SME transcript turns from the webhook payload. Lets the action
+ *  endpoint re-run the verbatim-anchor gate on amend without depending on
+ *  the persisted transcript file (which can be absent or shape-shifted by
+ *  zone governance). Keyed by the same stem; cleared on accept / back-to-
+ *  draft alongside pendingPreview. */
+export interface PersistedTurn { role: 'agent' | 'user'; message: string; }
+export const pendingTranscript = new Map<string, PersistedTurn[]>();
+
+/** Companion map remembering the on-disk path of the brief note that the
+ *  post-call webhook wrote, keyed by session stem. Lets the SME accept /
+ *  back-to-draft / amend handlers re-write the same note via updateNote
+ *  instead of bouncing off createNote's already-exists guard. Cleared by
+ *  the terminal handlers alongside pendingPreview + pendingTranscript. */
+export const pendingBriefPath = new Map<string, string>();
+
+export interface Brief {
 	title?: string;
 	problem_statement?: string;
 	roi_baseline?: string;
@@ -41,6 +63,15 @@ interface Brief {
 	pull_out_trigger?: string;
 	verdict?: string;
 	verdict_reason?: string;
+	/** ADR-004 P2 — analyst gate failures attached when looksConcrete /
+	 *  verbatim-anchor / banned-lexicon gates flag the brief. Drives the
+	 *  preview UI's "back-to-draft because X" surfacing. */
+	gate_failures?: Array<{
+		rule: string;
+		severity: 'high' | 'medium';
+		field?: string;
+		message: string;
+	}>;
 }
 
 export interface EvaluateTurnResult {
@@ -128,7 +159,7 @@ function buildBriefMarkdown(date: string, sessionKey: string, brief: Brief): str
 	].join('\n');
 }
 
-async function writeBrief(sessionKey: string, brief: Brief): Promise<string | null> {
+export async function writeBrief(sessionKey: string, brief: Brief): Promise<string | null> {
 	const engine = getVaultEngine();
 	if (!engine) return null;
 	const now = new Date();
@@ -143,34 +174,62 @@ async function writeBrief(sessionKey: string, brief: Brief): Promise<string | nu
 	const filename = `${date}-${safeKey}-${hhmm}.md`;
 	const verdictTag = (brief.verdict ?? '').trim() === 'candidate' ? 'candidate' : 'back-to-draft';
 
+	// SME stamp fields land in frontmatter when the action handler stamps the
+	// brief on accept / back-to-draft, so a future reader of the disk note can
+	// tell at a glance the verdict was operator-confirmed and how many amends
+	// the SME applied. Read via assertion to keep the public Brief surface clean.
+	const stamp = brief as Brief & {
+		sme_confirmed?: boolean;
+		sme_confirmed_at?: string;
+		sme_amendments_count?: number;
+	};
+
+	const meta: Record<string, unknown> = {
+		type: 'output',
+		status: 'proposed',
+		created: date,
+		project: PROJECT,
+		tags: [
+			'coffee-ops-sandiego',
+			'sme-led-ai-adoption',
+			'evaluate-session',
+			'use-case-brief',
+			verdictTag,
+		],
+		relates_to: '[[coffee-ops-sandiego/2026-05-26-evaluate-scenario]]',
+		source_agent: 'evaluate-session-app',
+		source_context: `Evaluate session brief for "${sessionKey}" (${date})`,
+	};
+	if (typeof stamp.sme_confirmed === 'boolean') meta.sme_confirmed = stamp.sme_confirmed;
+	if (typeof stamp.sme_confirmed_at === 'string') meta.sme_confirmed_at = stamp.sme_confirmed_at;
+	if (typeof stamp.sme_amendments_count === 'number') meta.sme_amendments_count = stamp.sme_amendments_count;
+
+	const content = buildBriefMarkdown(date, sessionKey, brief);
+	const audit = { actor: 'evaluate-session-app', actorContext: `session:${sessionKey}` };
+
+	// Update-or-create: the post-call webhook writes the analyst's initial
+	// brief, then the SME action handler (accept / amend / back-to-draft)
+	// re-writes the same note with stamp fields. Without the cache, the
+	// second write hits createNote's already-exists guard and silently
+	// returns null, leaving stale frontmatter on disk.
+	const cachedPath = pendingBriefPath.get(sessionKey);
+	if (cachedPath) {
+		const upd = await engine.updateNote(cachedPath, { meta: meta as VaultMeta, content }, audit);
+		if ('success' in upd && upd.success === false) return null;
+		return cachedPath;
+	}
+
 	const req: CreateNoteRequest = {
 		zone: BRIEF_ZONE,
 		filename,
-		meta: {
-			type: 'output',
-			status: 'proposed',
-			created: date,
-			project: PROJECT,
-			tags: [
-				'coffee-ops-sandiego',
-				'sme-led-ai-adoption',
-				'evaluate-session',
-				'use-case-brief',
-				verdictTag,
-			],
-			relates_to: '[[coffee-ops-sandiego/2026-05-26-evaluate-scenario]]',
-			source_agent: 'evaluate-session-app',
-			source_context: `Evaluate session brief for "${sessionKey}" (${date})`,
-		} as VaultMeta,
-		content: buildBriefMarkdown(date, sessionKey, brief),
+		meta: meta as VaultMeta,
+		content,
 	};
-
-	const res = await engine.createNote(req, {
-		actor: 'evaluate-session-app',
-		actorContext: `session:${sessionKey}`,
-	});
+	const res = await engine.createNote(req, audit);
 	if ('success' in res && res.success === false) return null;
-	return ('path' in res && typeof res.path === 'string' ? res.path : `${BRIEF_ZONE}/${filename}`);
+	const path = 'path' in res && typeof res.path === 'string' ? res.path : `${BRIEF_ZONE}/${filename}`;
+	pendingBriefPath.set(sessionKey, path);
+	return path;
 }
 
 /** Run one conversational turn of the Evaluate session. */

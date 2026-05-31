@@ -27,6 +27,7 @@ function repoMap(entries: [string, string | undefined][]): Map<string, string | 
 
 const FULL_ROSTER = roster(
 	'soul-hub-implementer',
+	'implementer',
 	'developer',
 	'researcher',
 	'author',
@@ -34,6 +35,7 @@ const FULL_ROSTER = roster(
 	'media-generator',
 );
 const ROSTER_NO_IMPLEMENTER = roster(
+	'implementer',
 	'developer',
 	'researcher',
 	'author',
@@ -41,10 +43,12 @@ const ROSTER_NO_IMPLEMENTER = roster(
 	'media-generator',
 );
 
-/** developer has a repo — the "configured correctly" scenario. */
+/** developer has a repo — the "configured correctly" scenario.
+ *  ADR-011 — implementer is repo-less by design, so it carries `undefined`. */
 const REPOS_DEV_HAS_REPO = repoMap([
 	['developer', '~/dev/my-app'],
 	['soul-hub-implementer', '~/dev/soul-hub'],
+	['implementer', undefined],
 	['researcher', undefined],
 	['author', undefined],
 	['designer', undefined],
@@ -55,6 +59,7 @@ const REPOS_DEV_HAS_REPO = repoMap([
 const REPOS_DEV_NO_REPO = repoMap([
 	['developer', undefined],
 	['soul-hub-implementer', '~/dev/soul-hub'],
+	['implementer', undefined],
 	['researcher', undefined],
 	['author', undefined],
 ]);
@@ -63,6 +68,7 @@ const REPOS_DEV_NO_REPO = repoMap([
 const REPOS_ALL_EMPTY = repoMap([
 	['developer', undefined],
 	['soul-hub-implementer', undefined],
+	['implementer', undefined],
 	['researcher', undefined],
 	['author', undefined],
 ]);
@@ -72,7 +78,9 @@ const REPOS_ALL_EMPTY = repoMap([
 // ---------------------------------------------------------------------------
 
 describe('ADR-014 D1 — floor agent repo guard', () => {
-	test('coding + floor developer HAS repo → returns developer (guard passes)', () => {
+	test('coding + floor implementer (no repo) + REPOS_DEV_HAS_REPO + no subjectHasProjectRepo → null (D1 guard fires on implementer)', () => {
+		// ADR-011 — floor is now `implementer` (no static repo). Without
+		// subjectHasProjectRepo the carve-out doesn't open → fail-closed.
 		const result = resolveAgentForWork(
 			'coding',
 			null,
@@ -80,12 +88,24 @@ describe('ADR-014 D1 — floor agent repo guard', () => {
 			null,
 			REPOS_DEV_HAS_REPO,
 		);
-		assert.equal(result, 'developer');
+		assert.equal(result, null);
 	});
 
-	test('coding + floor developer has NO repo → returns null (D1 guard fires)', () => {
-		// This is exactly the run #482 incident: coding work dispatched to developer
-		// whose repo is null → D1 must return null, hiding the Dispatch button.
+	test('coding + floor implementer (no repo) + subjectHasProjectRepo=true → returns implementer (ADR-011 D2 carve-out)', () => {
+		// ADR-011 D2 — repo-less implementer + bound project = legitimate dispatch.
+		const result = resolveAgentForWork(
+			'coding',
+			null,
+			ROSTER_NO_IMPLEMENTER,
+			null,
+			REPOS_DEV_HAS_REPO,
+			true,
+		);
+		assert.equal(result, 'implementer');
+	});
+
+	test('coding + floor implementer + REPOS_DEV_NO_REPO + no subjectHasProjectRepo → null (D1 guard fires)', () => {
+		// implementer is repo-less and the carve-out doesn't open → null.
 		const result = resolveAgentForWork(
 			'coding',
 			null,
@@ -96,7 +116,7 @@ describe('ADR-014 D1 — floor agent repo guard', () => {
 		assert.equal(result, null);
 	});
 
-	test('coding + soul-hub cluster + implementer has repo → returns soul-hub-implementer', () => {
+	test('coding + soul-hub cluster + soul-hub-implementer has repo → returns soul-hub-implementer', () => {
 		const result = resolveAgentForWork(
 			'coding',
 			null,
@@ -107,30 +127,22 @@ describe('ADR-014 D1 — floor agent repo guard', () => {
 		assert.equal(result, 'soul-hub-implementer');
 	});
 
-	test('coding + soul-hub cluster + implementer has NO repo → falls to floor', () => {
-		// soul-hub-implementer is misconfigured (no repo); falls to developer.
-		// developer DOES have a repo here → returns developer.
-		const result = resolveAgentForWork(
-			'coding',
-			null,
-			FULL_ROSTER,
-			'soul-hub',
-			REPOS_DEV_HAS_REPO, // developer has repo; implementer not in this map → hasRepo returns false
-		);
-		// Actually REPOS_DEV_HAS_REPO has soul-hub-implementer with a repo.
-		// Let's build a map where implementer has no repo but developer does.
+	test('coding + soul-hub cluster + soul-hub-implementer has NO repo → falls to floor implementer (no repo) → null without subjectHasProjectRepo', () => {
+		// soul-hub-implementer is misconfigured (no repo); falls through to floor implementer.
+		// implementer is also repo-less by design → without subjectHasProjectRepo, null.
 		const reposImplementerNoRepo = repoMap([
 			['developer', '~/dev/my-app'],
 			['soul-hub-implementer', undefined],
+			['implementer', undefined],
 		]);
-		const result2 = resolveAgentForWork(
+		const result = resolveAgentForWork(
 			'coding',
 			null,
 			FULL_ROSTER,
 			'soul-hub',
 			reposImplementerNoRepo,
 		);
-		assert.equal(result2, 'developer');
+		assert.equal(result, null);
 	});
 
 	test('coding + soul-hub cluster + both implementer and developer have NO repo → null', () => {
@@ -250,8 +262,10 @@ describe('ADR-014 D1 — non-coding work_types not affected by repoMap', () => {
 // ---------------------------------------------------------------------------
 
 describe('ADR-014 D1 — backward compatibility: repoMap absent → pre-ADR-014 behaviour', () => {
-	test('coding + no cluster + no repoMap → developer (existing behaviour)', () => {
-		assert.equal(resolveAgentForWork('coding', null, ROSTER_NO_IMPLEMENTER, null), 'developer');
+	test('coding + no cluster + no repoMap → implementer (post-ADR-011 floor, backward-compat path)', () => {
+		// ADR-011 — WORK_TYPE_AGENT.coding = 'implementer'. Without a repoMap,
+		// hasRepo returns true (no enforcement) → floor resolves to implementer.
+		assert.equal(resolveAgentForWork('coding', null, ROSTER_NO_IMPLEMENTER, null), 'implementer');
 	});
 
 	test('coding + soul-hub cluster + no repoMap → soul-hub-implementer (existing behaviour)', () => {

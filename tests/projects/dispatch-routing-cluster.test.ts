@@ -27,18 +27,29 @@ function roster(...ids: string[]): Set<string> {
 	return new Set(ids.map((id) => id.toLowerCase()));
 }
 
-/** Full roster that includes soul-hub-implementer. */
+/** Full roster including soul-hub-implementer and the general implementer
+ *  (ADR-011 — the repo-agnostic coding floor) plus weaver (ADR-025 D2). */
 const FULL_ROSTER = roster(
 	'soul-hub-implementer',
+	'implementer',
+	'developer',
+	'researcher',
+	'author',
+	'designer',
+	'media-generator',
+	'weaver',        // ADR-025 D2 — arabic work_type specialist
+);
+
+/** Roster WITHOUT soul-hub-implementer (not installed), but WITH the general
+ *  implementer (ADR-011 floor — the post-b9077ec default). */
+const ROSTER_NO_IMPLEMENTER = roster(
+	'implementer',
 	'developer',
 	'researcher',
 	'author',
 	'designer',
 	'media-generator',
 );
-
-/** Roster WITHOUT soul-hub-implementer (not installed). */
-const ROSTER_NO_IMPLEMENTER = roster('developer', 'researcher', 'author', 'designer', 'media-generator');
 
 // ---------------------------------------------------------------------------
 // clusterFromTags
@@ -88,30 +99,32 @@ describe('resolveAgentForWork — D2 cluster routing', () => {
 		assert.equal(result, 'soul-hub-implementer');
 	});
 
-	test('coding + soul-hub cluster but implementer NOT in roster → developer', () => {
+	test('coding + soul-hub cluster but soul-hub-implementer NOT in roster → implementer (floor, post-ADR-011)', () => {
+		// ADR-011 — WORK_TYPE_AGENT.coding floor switched from 'developer' to 'implementer'.
+		// With no repoMap, hasRepo returns true (backward-compat), so the floor resolves.
 		const result = resolveAgentForWork('coding', null, ROSTER_NO_IMPLEMENTER, 'soul-hub');
-		assert.equal(result, 'developer');
+		assert.equal(result, 'implementer');
 	});
 
-	test('coding + non-soul-hub cluster → developer (not soul-hub-implementer)', () => {
+	test('coding + non-soul-hub cluster → implementer (floor, post-ADR-011)', () => {
 		const result = resolveAgentForWork('coding', null, FULL_ROSTER, 'my-app');
-		assert.equal(result, 'developer');
+		assert.equal(result, 'implementer');
 	});
 
-	test('coding + no cluster (null) → developer (existing behaviour unchanged)', () => {
+	test('coding + no cluster (null) → implementer (floor, post-ADR-011)', () => {
 		const result = resolveAgentForWork('coding', null, FULL_ROSTER, null);
-		assert.equal(result, 'developer');
+		assert.equal(result, 'implementer');
 	});
 
-	test('coding + no cluster (undefined, 4th arg absent) → developer (backwards-compat)', () => {
+	test('coding + no cluster (undefined, 4th arg absent) → implementer (floor, post-ADR-011)', () => {
 		const result = resolveAgentForWork('coding', null, FULL_ROSTER);
-		assert.equal(result, 'developer');
+		assert.equal(result, 'implementer');
 	});
 
-	test('coding + soul-hub cluster → soul-hub-implementer (empty-string cluster is falsy, not soul-hub)', () => {
-		// empty string is NOT 'soul-hub'
+	test('coding + empty-string cluster (falsy, not soul-hub) → implementer (floor, post-ADR-011)', () => {
+		// empty string is NOT 'soul-hub' — falls through to the floor.
 		const result = resolveAgentForWork('coding', null, FULL_ROSTER, '');
-		assert.equal(result, 'developer');
+		assert.equal(result, 'implementer');
 	});
 });
 
@@ -171,6 +184,39 @@ describe('resolveAgentForWork — non-coding work_types unchanged', () => {
 
 	test('manual → null (human-owned, no cluster effect)', () => {
 		assert.equal(resolveAgentForWork('manual', null, FULL_ROSTER, 'soul-hub'), null);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// resolveAgentForWork — ADR-025 D2: arabic work_type → weaver
+// ---------------------------------------------------------------------------
+
+describe('resolveAgentForWork — arabic → weaver (ADR-025 D2)', () => {
+	const rosterWithWeaver = roster(
+		'soul-hub-implementer',
+		'implementer',
+		'researcher',
+		'author',
+		'designer',
+		'media-generator',
+		'weaver',
+	);
+
+	test('arabic → weaver when weaver in roster', () => {
+		assert.equal(resolveAgentForWork('arabic', null, rosterWithWeaver, null), 'weaver');
+	});
+
+	test('arabic → weaver unaffected by soul-hub cluster (non-coding route)', () => {
+		assert.equal(resolveAgentForWork('arabic', null, rosterWithWeaver, 'soul-hub'), 'weaver');
+	});
+
+	test('arabic → null when weaver NOT in roster (specialist absent)', () => {
+		const rosterNoWeaver = roster('researcher', 'author', 'designer', 'implementer');
+		assert.equal(resolveAgentForWork('arabic', null, rosterNoWeaver, null), null);
+	});
+
+	test('arabic: explicit assignee in roster beats weaver mapping', () => {
+		assert.equal(resolveAgentForWork('arabic', 'researcher', rosterWithWeaver, null), 'researcher');
 	});
 });
 

@@ -81,7 +81,11 @@ export const claudeCliFlagDispatcher: BackendDispatcher = {
 		delete env.npm_config_prefix;
 		env.CLAUDE_CODE_DISABLE_HOOKS = '1';
 
-		const cwd = config.resolved.vaultDir;
+		// R5 fix (2026-05-30) — use the provisioned worktree cwd when set.
+		// Mirror of the claude-pty backend fix; cli-flag oneshots had the same
+		// silent leak (cwd=vault → relative paths broken, no commits to the
+		// worktree branch). Falls back to vaultDir for non-artifact dispatches.
+		const cwd = opts.cwd ?? config.resolved.vaultDir;
 		const ac = new AbortController();
 		const onAbort = () => ac.abort();
 		opts.signal?.addEventListener('abort', onAbort);

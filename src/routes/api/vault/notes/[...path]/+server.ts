@@ -2,6 +2,7 @@ import type { RequestHandler } from './$types';
 import { json } from '@sveltejs/kit';
 import { getVaultEngine } from '$lib/vault/index.js';
 import { renderMarkdown, isRtl } from '$lib/vault/renderer.js';
+import { lintAdr, validatePhaseRoutingShape } from '$lib/vault/adr-lint.js';
 
 /** Reject path traversal and invalid note paths */
 function validateVaultPath(path: string): boolean {
@@ -114,13 +115,59 @@ export const PUT: RequestHandler = async ({ params, request }) => {
 		return json({ error: 'Invalid JSON body' }, { status: 400 });
 	}
 
-	const { meta, content } = body as Record<string, unknown>;
+	const { meta, content, opts } = body as Record<string, unknown>;
 
 	if (meta !== undefined && (typeof meta !== 'object' || Array.isArray(meta) || meta === null)) {
 		return json({ error: 'meta must be an object' }, { status: 400 });
 	}
 	if (content !== undefined && typeof content !== 'string') {
 		return json({ error: 'content must be a string' }, { status: 400 });
+	}
+
+	// ADR-044 P2-followup — lint pre-flight on type=decision updates too.
+	// Without this, an operator could create a clean ADR + then update it
+	// to a dirty state via PUT, bypassing the POST chokepoint.
+	let skipLintReason: string | undefined;
+	if (opts && typeof opts === 'object' && !Array.isArray(opts)) {
+		const o = opts as Record<string, unknown>;
+		if (typeof o.skipLint === 'string' && o.skipLint.trim().length > 0) {
+			skipLintReason = o.skipLint.trim();
+		}
+	}
+	if (!skipLintReason) {
+		const current = await engine.getNote(path);
+		// Project the post-update note: existing meta+content merged with the
+		// caller's partial update. Mirrors what engine.updateNote will persist.
+		const projectedMeta = meta !== undefined
+			? { ...(current?.meta ?? {}), ...(meta as Record<string, unknown>) }
+			: (current?.meta ?? {}) as Record<string, unknown>;
+		const projectedContent = content !== undefined
+			? (content as string)
+			: (current?.content ?? '');
+		const noteType = String(projectedMeta.type ?? '').toLowerCase();
+		const isAdr = noteType === 'decision' && /\/adr-\d+/.test(path);
+		if (isAdr) {
+			const shapeFindings = validatePhaseRoutingShape(projectedMeta);
+			const ruleFindings = lintAdr({
+				path,
+				meta: projectedMeta,
+				content: projectedContent,
+			});
+			const allFindings = [...shapeFindings, ...ruleFindings];
+			const high = allFindings.filter((f) => f.severity === 'high');
+			if (high.length > 0) {
+				return json({
+					success: false,
+					error: 'lint-failed',
+					findings: allFindings,
+					highSeverityCount: high.length,
+					hint:
+						`Vault chokepoint refused update: ${high.length} high-severity lint finding${high.length === 1 ? '' : 's'} on ${path}. ` +
+						`Fix or pass opts.skipLint: "<reason>" (audited). ` +
+						`Findings: ${high.map((f) => `[${f.rule}] ${f.message.slice(0, 120)}`).join(' | ')}`,
+				}, { status: 422 });
+			}
+		}
 	}
 
 	// Check for edit conflicts

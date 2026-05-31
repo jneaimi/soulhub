@@ -18,7 +18,8 @@ import { json, error } from '@sveltejs/kit';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { getReviewableRunForSubject } from '$lib/agents/runs.js';
-import { safeId, expandHome } from '$lib/agents/dispatch/worktree-provision.js';
+import { expandHome } from '$lib/agents/dispatch/worktree-provision.js';
+import { branchForRun } from '$lib/agents/dispatch/run-branch.js';
 import type { RequestHandler } from './$types';
 
 const execFileAsync = promisify(execFile);
@@ -30,10 +31,14 @@ export const GET: RequestHandler = async ({ url }) => {
 	const run = getReviewableRunForSubject(subject);
 	if (!run) return json({ available: false });
 
-	// Reconstruct the deterministic worktree branch (same formula as the
-	// dispatcher + worklist) and confirm it still exists. An absent branch =
-	// the run was merged or discarded → nothing left to review/ship.
-	const branch = `orchestration/run-${run.startedAt}/${safeId(subject)}`;
+	// ADR-022 (2026-05-29) — `branchForRun` is the single source of truth
+	// for resolving the branch (handback.branch first, then
+	// `claude-soul/<adrKey>`, then legacy `orchestration/run-X/Y`). The old
+	// in-line reconstruction was the same regression that broke the worklist
+	// review lane — it returned 404-equivalent (`available:false`) on every
+	// post-ADR-022 run because the reconstructed name no longer matched the
+	// actual branch on disk.
+	const branch = branchForRun({ ...run, subjectPath: subject });
 	// ADR-031 P1 — run the liveness check in the run's actual repo.  A null
 	// `repo` (legacy/soul-hub runs) falls through to process.cwd() — same
 	// behaviour as before this ADR.

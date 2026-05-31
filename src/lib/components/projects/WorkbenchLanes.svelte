@@ -15,6 +15,8 @@
 		sessionId: string;
 		branch: string;
 		agentId: string;
+		/** ADR-019 P2 — run ID for the bump-continue endpoint. */
+		runId: string;
 	};
 	type ReviewHandoff = {
 		branch: string;
@@ -57,11 +59,16 @@
 		loading = false,
 		error = '',
 		onSelect,
+		projectHasRepo = false,
 	}: {
 		lanes: Record<string, unknown[]> | null;
 		loading?: boolean;
 		error?: string;
 		onSelect: (path: string) => void;
+		/** ADR-011 D2 — true when the project this workbench is showing has a `repo:`
+		 *  binding on its index.md. Passed to resolveAgentForWork so the implementer
+		 *  carve-out opens for re-dispatch of no-artifact items. Default false. */
+		projectHasRepo?: boolean;
 	} = $props();
 
 	// Ordered lane metadata. `accent` is a left-border + dot color token.
@@ -91,6 +98,9 @@
 	let answerText = $state<Record<string, string>>({});
 	let sending = $state<Record<string, boolean>>({});
 	let sendError = $state<Record<string, string>>({});
+	// ADR-019 P2 — bump+continue affordance state.
+	let bumping = $state<Record<string, boolean>>({});
+	let bumpError = $state<Record<string, string>>({});
 
 	// ADR-013 — live roster for resolveAgentForWork. Loaded once on mount,
 	// mirrors AdrDrawer.loadAgentIds() so routing stays consistent.
@@ -133,6 +143,32 @@
 		// Leave sending=true: the 4s poller will replace this card with in_flight.
 	}
 
+	/** ADR-019 P2 — "Bump budget + continue" secondary action on operator-input
+	 *  pause cards.  Sends no answer text — instead calls the bump-continue
+	 *  endpoint which injects a structured continuation prompt and resumes the
+	 *  PTY session with +50% ceiling headroom.  Fire-and-forget: the 4s poller
+	 *  replaces the card with `in_flight` when the resumed run starts. */
+	async function bumpContinue(it: Item) {
+		if (!it.awaitingOperator?.runId) return;
+		bumping = { ...bumping, [it.id]: true };
+		bumpError = { ...bumpError, [it.id]: '' };
+		try {
+			const res = await fetch(
+				`/api/agents/runs/${encodeURIComponent(it.awaitingOperator.runId)}/bump-continue`,
+				{ method: 'POST', headers: { 'Content-Type': 'application/json' } },
+			);
+			if (!res.ok) {
+				const data = await res.json().catch(() => ({}));
+				throw new Error((data as { error?: string }).error ?? `HTTP ${res.status}`);
+			}
+			// Leave bumping=true: the 4s poller will replace this card with in_flight
+			// once the background dispatch registers its `running` row.
+		} catch (e) {
+			bumpError = { ...bumpError, [it.id]: e instanceof Error ? e.message : 'Failed to bump' };
+			bumping = { ...bumping, [it.id]: false };
+		}
+	}
+
 	// ADR-013 — load the live roster ONCE so resolveAgentForWork can validate
 	// assignee-as-agent and the work_type→agent map. Mirrors AdrDrawer.loadAgentIds().
 	// ADR-014 D1 — also captures repo so routing refuses repo-less coding agents.
@@ -172,7 +208,9 @@
 	 *  the in_flight card — identical to sendAnswer's fire-and-forget pattern. */
 	async function redispatch(it: Item) {
 		// ADR-014 D1 — pass agentRepos so repo-less coding candidates are refused.
-		const agentId = resolveAgentForWork(it.work_type, it.assignee, agentIds, null, agentRepos);
+		// ADR-011 D2 — pass projectHasRepo so the implementer carve-out opens for
+		// project-bound repos (all items in this workbench are for the same project).
+		const agentId = resolveAgentForWork(it.work_type, it.assignee, agentIds, null, agentRepos, projectHasRepo);
 		if (!agentId) {
 			redispatchError = {
 				...redispatchError,
@@ -360,21 +398,41 @@
 										class="mt-1.5 w-full text-[11px] rounded border border-hub-border bg-hub-card/60 text-hub-text px-2 py-1 resize-none focus:outline-none focus:border-hub-warning/60 disabled:opacity-50"
 										rows={3}
 										placeholder="Your answer…"
-										disabled={sending[it.id]}
+										disabled={sending[it.id] || bumping[it.id]}
 										value={answerText[it.id] ?? ''}
 										oninput={(e) => { answerText = { ...answerText, [it.id]: (e.currentTarget as HTMLTextAreaElement).value }; }}
 									></textarea>
 									{#if sendError[it.id]}
 										<p class="text-[10px] text-hub-danger mt-0.5">{sendError[it.id]}</p>
 									{/if}
-									<button
-										type="button"
-										class="mt-1 px-2 py-0.5 rounded text-[10px] font-medium bg-hub-warning/20 text-hub-warning hover:bg-hub-warning/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-										disabled={sending[it.id] || !(answerText[it.id] ?? '').trim()}
-										onclick={() => sendAnswer(it)}
-									>
-										{sending[it.id] ? 'Resuming…' : 'Send answer'}
-									</button>
+									<!-- Primary action: answer the question -->
+									<div class="flex items-center gap-2 mt-1 flex-wrap">
+										<button
+											type="button"
+											class="px-2 py-0.5 rounded text-[10px] font-medium bg-hub-warning/20 text-hub-warning hover:bg-hub-warning/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+											disabled={sending[it.id] || bumping[it.id] || !(answerText[it.id] ?? '').trim()}
+											onclick={() => sendAnswer(it)}
+										>
+											{sending[it.id] ? 'Resuming…' : 'Send answer'}
+										</button>
+										<!-- ADR-019 P2 — secondary action: bump budget + continue without an answer.
+										     Sends a structured continuation prompt that tells the agent to resume
+										     and re-ask if genuinely blocked.  The textarea remains the primary path. -->
+										{#if it.awaitingOperator.runId}
+											<button
+												type="button"
+												class="px-2 py-0.5 rounded text-[10px] font-medium bg-hub-dim/20 text-hub-dim hover:bg-hub-dim/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+												disabled={sending[it.id] || bumping[it.id]}
+												onclick={() => bumpContinue(it)}
+												title="Extend budget +50% and resume without answering — use when the pause was a false trigger or when you'd rather the agent figure it out"
+											>
+												{bumping[it.id] ? 'Resuming…' : 'Bump + continue'}
+											</button>
+										{/if}
+									</div>
+									{#if bumpError[it.id]}
+										<p class="text-[10px] text-hub-danger mt-0.5">{bumpError[it.id]}</p>
+									{/if}
 								</div>
 							{:else}
 								<button

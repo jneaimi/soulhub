@@ -75,23 +75,21 @@ All AI-authored vault content must go through the vault API so it
 gets frontmatter validation, zone rules, rate-limiting, audit log,
 dedup, and atomic commit.
 
-→ Use the /vault-write skill instead:
+→ Use the soul CLI (the sanctioned AI write path):
 
-   ~/.claude/skills/vault-write/scripts/vault-write.sh \\
-     --zone "<zone>" \\
-     --filename "<filename.md>" \\
-     --meta-json '{"type":"...","created":"YYYY-MM-DD","tags":[...]}' \\
-     --content "<body>"
+   soul note create --zone "<zone>" --filename "<filename.md>" --type "<type>" --meta-json '{"created":"YYYY-MM-DD","tags":[...]}' --content "<body>"
 
-For an update, use --update with the full vault-relative path:
+   soul note update "<zone>/<filename.md>" --meta-json '{...}' --content "..."
 
-   vault-write.sh --update "<zone>/<filename.md>" \\
-     --meta-json '{...}' --content "..."
+For ADRs in projects/<slug>/ use the lifecycle verbs instead:
+   soul adr propose|accept|ship|park|reject ...
 
-Or call the API directly:
+Run 'soul note create --help' for the shape, and see the /vault-write
+skill for the authoring rules (frontmatter, zones, wikilinks, ADR fields).
 
-   POST http://localhost:2400/api/vault/notes
-   PUT  http://localhost:2400/api/vault/notes/<path>
+Fallback only if no soul verb fits — the /vault-write skill wrapper:
+   ~/.claude/skills/vault-write/scripts/vault-write.sh --zone … --filename … --meta-json … --content …
+Or the API directly: POST http://localhost:2400/api/vault/notes (PUT /<path> to update).
 
 See ~/claude-config/rules/vault.md for the full rule.
 EOF

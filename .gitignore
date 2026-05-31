@@ -40,3 +40,9 @@ aiag.yaml
 # ADR-016 — build-time SHA stamp (gitignored to prevent perpetual working-tree drift)
 # Regenerated on prebuild / predev / npm run check via scripts/stamp-build-info.mjs
 src/lib/build-info.ts
+
+# Screenshots dropped in the repo root — Arc Search, macOS Cmd+Shift+3/4, etc.
+# Stops accidental commits from blocking ship-merge's clean-tree guard
+# (which refuses to merge if the working tree has anything modified/untracked).
+Screenshot*
+Screen Shot*
