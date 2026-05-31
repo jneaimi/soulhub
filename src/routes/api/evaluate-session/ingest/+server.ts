@@ -24,7 +24,7 @@ import type { PersistedTurn } from '$lib/evaluate-session/index.js';
 
 interface IngestBody {
 	conversation_id?: string;
-	transcript?: Array<{ role?: string; message?: string }>;
+	transcript?: Array<{ role?: string; message?: string; interrupted?: boolean }>;
 	project?: string;
 }
 
@@ -64,10 +64,14 @@ export const POST: RequestHandler = async ({ request }) => {
 	// drop anything that isn't a real agent/user turn with text.
 	const transcript: PersistedTurn[] = Array.isArray(body.transcript)
 		? body.transcript
-				.filter((t): t is { role: string; message: string } =>
+				.filter((t): t is { role: string; message: string; interrupted?: boolean } =>
 					!!t && (t.role === 'agent' || t.role === 'user') && typeof t.message === 'string' && t.message.trim().length > 0,
 				)
-				.map((t) => ({ role: t.role as 'agent' | 'user', message: t.message }))
+				.map((t) => ({
+					role: t.role as 'agent' | 'user',
+					message: t.message,
+					...(typeof t.interrupted === 'boolean' ? { interrupted: t.interrupted } : {}),
+				}))
 		: [];
 
 	if (transcript.length === 0) {

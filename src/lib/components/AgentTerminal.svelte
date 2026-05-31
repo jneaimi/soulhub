@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import { voicePrefs, initVoicePrefs, cycleVoiceLang, voiceLangLabel, voiceLangCode } from '$lib/voice/prefs.svelte';
 
 	interface Props {
 		prompt?: string;
@@ -209,11 +210,10 @@
 
 		try {
 			const { startRealtimeStt } = await import('$lib/voice/realtime-stt');
-			const htmlLang = (typeof document !== 'undefined' && document.documentElement.lang) || '';
 			let heard = 0;
 			voiceHint = 'connecting…';
 			_voiceHandle = await startRealtimeStt({
-				languageCode: htmlLang ? htmlLang.split('-')[0] : undefined,
+				languageCode: voiceLangCode(),
 				onOpen:           () => { voiceHint = 'connected…'; },
 				onSessionStarted: () => { voiceHint = 'listening — speak now'; },
 				onPartial: (t) => {
@@ -281,6 +281,7 @@
 
 	onMount(() => {
 		window.addEventListener('beforeunload', handleBeforeUnload);
+		initVoicePrefs(); // ADR-020 P3 — hydrate the stored dictation language
 		initTerminal();
 		return () => {
 			window.removeEventListener('beforeunload', handleBeforeUnload);
@@ -1107,6 +1108,12 @@
 					{:else}
 						<span class="text-hub-muted">Review &amp; edit, then inject into the terminal</span>
 					{/if}
+					<button
+						onclick={cycleVoiceLang}
+						class="ml-auto flex-shrink-0 px-1.5 py-0.5 rounded bg-hub-card border border-hub-border text-[10px] font-medium text-hub-dim hover:text-hub-text hover:border-hub-cta/50 transition-colors cursor-pointer"
+						title="Dictation language — {voicePrefs.lang === 'auto' ? 'auto-detect' : voicePrefs.lang === 'ar' ? 'Arabic' : 'English'} (tap to cycle)"
+						aria-label="Voice language: {voiceLangLabel()}"
+					>{voiceLangLabel()}</button>
 				</div>
 				<textarea
 					bind:value={voiceText}

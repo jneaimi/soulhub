@@ -48,6 +48,89 @@ export function resolveProjectSlug(engine: Engine, raw: unknown): string {
 	return slug;
 }
 
+/** ADR-012 — drop hallucinated / barge-in "user" turns before they reach the
+ *  analyst (research note 2026-06-01-elevenlabs-phantom-user-turns-fixes).
+ *  ElevenLabs' VAD/ASR can capture the agent's own audio (speaker bleed) or a
+ *  cut-off fragment as a USER turn — there is no server-side retraction event,
+ *  so we filter the pulled transcript here. Three conservative rules, USER turns
+ *  only (agent turns are never dropped):
+ *
+ *    1. BARGE-IN PHANTOM (primary, validated on conv_7401): a SHORT user turn
+ *       (<=10 content-ish words) whose immediately-preceding agent turn is
+ *       `interrupted: true`. On the failing session this cleanly separated both
+ *       phantoms ("What do you mean by change?", "Right. So you don't...") from
+ *       all six real turns (every real turn followed a non-interrupted agent
+ *       turn). The length cap protects genuine long interruptions.
+ *    2. STOCK HALLUCINATION: a lone filler/farewell phrase ("thank you", "see
+ *       you", "bye", "okay", "thanks") — the classic silence artifact.
+ *    3. ECHO-OF-AGENT: a short user turn with >=60% word-overlap with the prior
+ *       agent turn (the agent's question transcribed back), as a backstop when
+ *       the `interrupted` flag is absent (older callers).
+ *
+ *  We log every drop so silent over-filtering is visible in the server log. */
+const STOCK_HALLUCINATIONS = new Set([
+	'thank you', 'thanks', 'thank you.', 'thanks.', 'see you', 'see you.',
+	'bye', 'bye.', 'goodbye', 'goodbye.', 'okay', 'okay.', 'ok', 'ok.', 'yeah', 'mhm',
+]);
+
+function wordCount(s: string): number {
+	return s.trim().split(/\s+/).filter(Boolean).length;
+}
+
+function wordSet(s: string): Set<string> {
+	return new Set(
+		s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 2),
+	);
+}
+
+/** Fraction of a's content words also present in b. */
+function overlapFraction(a: string, b: string): number {
+	const wa = wordSet(a);
+	if (wa.size === 0) return 0;
+	const wb = wordSet(b);
+	let hit = 0;
+	for (const w of wa) if (wb.has(w)) hit++;
+	return hit / wa.size;
+}
+
+export interface PhantomFilterResult {
+	clean: PersistedTurn[];
+	dropped: Array<{ index: number; message: string; reason: string }>;
+}
+
+export function filterPhantomTurns(turns: PersistedTurn[]): PhantomFilterResult {
+	const clean: PersistedTurn[] = [];
+	const dropped: PhantomFilterResult['dropped'] = [];
+	let lastAgent: PersistedTurn | null = null;
+	for (let i = 0; i < turns.length; i++) {
+		const t = turns[i];
+		if (t.role !== 'user') {
+			clean.push(t);
+			if (t.role === 'agent') lastAgent = t;
+			continue;
+		}
+		const msg = (t.message ?? '').trim();
+		const norm = msg.toLowerCase();
+		// 1. barge-in phantom: short user turn right after an interrupted agent turn.
+		if (lastAgent?.interrupted === true && wordCount(msg) <= 10) {
+			dropped.push({ index: i, message: msg, reason: 'barge-in-after-interrupt' });
+			continue;
+		}
+		// 2. stock silence-hallucination phrase, standing alone.
+		if (STOCK_HALLUCINATIONS.has(norm)) {
+			dropped.push({ index: i, message: msg, reason: 'stock-hallucination' });
+			continue;
+		}
+		// 3. echo-of-agent backstop (when interrupted flag is unavailable).
+		if (lastAgent && wordSet(msg).size <= 12 && overlapFraction(msg, lastAgent.message) >= 0.6) {
+			dropped.push({ index: i, message: msg, reason: 'echo-of-agent' });
+			continue;
+		}
+		clean.push(t);
+	}
+	return { clean, dropped };
+}
+
 export function transcriptToMarkdown(
 	turns: PersistedTurn[],
 	conversationId: string,
@@ -119,13 +202,23 @@ export async function ingestTranscript(params: {
 	project?: string;
 	source?: string;
 }): Promise<IngestResult> {
-	const { conversationId, transcript } = params;
+	const { conversationId, transcript: rawTranscript } = params;
 	const source = params.source ?? 'pull';
 	const engine = getVaultEngine();
 	const project = resolveProjectSlug(engine, params.project);
 
-	if (!Array.isArray(transcript) || transcript.length === 0) {
+	if (!Array.isArray(rawTranscript) || rawTranscript.length === 0) {
 		return { ok: false, project, error: 'Empty transcript' };
+	}
+
+	// ADR-012 — strip phantom/echo user turns before anything downstream sees
+	// them (transcript note, analyst, gates, preview). See filterPhantomTurns.
+	const { clean: transcript, dropped } = filterPhantomTurns(rawTranscript);
+	if (dropped.length > 0) {
+		console.warn(
+			`[evaluate-session/ingest] conv:${conversationId} dropped ${dropped.length} phantom turn(s): ` +
+				dropped.map((d) => `[${d.reason}] ${JSON.stringify(d.message.slice(0, 40))}`).join(' '),
+		);
 	}
 
 	const now = new Date();

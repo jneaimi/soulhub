@@ -23,6 +23,7 @@ interface ElevenLabsTurn {
 	role: 'agent' | 'user';
 	message: string;
 	time_in_call_secs?: number;
+	interrupted?: boolean;
 }
 
 interface ElevenLabsWebhook {
@@ -104,7 +105,11 @@ export const POST: RequestHandler = async ({ request }) => {
 	const project = typeof rawProject === 'string' ? rawProject : undefined;
 	const turns: PersistedTurn[] = (transcript ?? [])
 		.filter((t) => (t.role === 'agent' || t.role === 'user') && typeof t.message === 'string')
-		.map((t) => ({ role: t.role, message: t.message }));
+		.map((t) => ({
+			role: t.role,
+			message: t.message,
+			...(typeof t.interrupted === 'boolean' ? { interrupted: t.interrupted } : {}),
+		}));
 
 	// Fire-and-forget so the webhook ACK returns within ElevenLabs' timeout.
 	// Shares the single pipeline with the app-pull /ingest route (ADR-012).

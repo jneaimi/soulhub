@@ -29,6 +29,7 @@
 	import { goto } from '$app/navigation';
 	import { onMount, onDestroy } from 'svelte';
 	import AgentTerminal from '$lib/components/AgentTerminal.svelte';
+	import { voicePrefs, initVoicePrefs, cycleVoiceLang, voiceLangLabel, voiceLangCode } from '$lib/voice/prefs.svelte';
 
 	// ── Session-persistence keys ────────────────────────────────────────────────
 	const OPEN_KEY       = 'chat-drawer-open';
@@ -303,12 +304,10 @@
 		// ── Try realtime streaming (primary) ──────────────────────────────────
 		try {
 			const { startRealtimeStt } = await import('$lib/voice/realtime-stt');
-			const htmlLang =
-				(typeof document !== 'undefined' && document.documentElement.lang) || '';
 			let _heard = 0; // partial-transcript count — drives the live readout
 			micHint = 'connecting…';
 			_voiceHandle = await startRealtimeStt({
-				languageCode: htmlLang ? htmlLang.split('-')[0] : undefined,
+				languageCode: voiceLangCode(),
 				onOpen: () => { micHint = 'connected…'; },
 				onSessionStarted: () => { micHint = 'listening — speak now'; },
 				onPartial: (t) => {
@@ -511,6 +510,7 @@
 		// ADR-020 — pre-warm the realtime-STT SDK so the first mic tap has no
 		// dynamic-import latency (keeps iOS Safari's user-activation intact).
 		void import('$lib/voice/realtime-stt').then((m) => m.warmupRealtimeStt());
+		initVoicePrefs(); // ADR-020 P3 — hydrate the stored dictation language
 
 		return () => window.removeEventListener('resize', computeMaxH);
 	});
@@ -1783,6 +1783,14 @@
 							disabled={sending}
 							aria-label="Chat message input"
 						></textarea>
+
+						<!-- Voice language toggle (ADR-020 P3) — auto → en → ar -->
+						<button
+							class="flex-shrink-0 flex items-center justify-center h-7 px-1.5 rounded-md bg-hub-card border border-hub-border text-[10px] font-medium text-hub-dim hover:text-hub-text hover:border-hub-cta/50 transition-colors cursor-pointer"
+							onclick={cycleVoiceLang}
+							title="Voice dictation language — {voicePrefs.lang === 'auto' ? 'auto-detect' : voicePrefs.lang === 'ar' ? 'Arabic' : 'English'} (tap to cycle)"
+							aria-label="Voice language: {voiceLangLabel()}"
+						>{voiceLangLabel()}</button>
 
 						<!-- 🎤 Mic button (ADR-019) — S2/S3 dual-tier voice input -->
 						<button

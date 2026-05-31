@@ -45,7 +45,15 @@ export const pendingPreview = new Map<string, Brief>();
  *  the persisted transcript file (which can be absent or shape-shifted by
  *  zone governance). Keyed by the same stem; cleared on accept / back-to-
  *  draft alongside pendingPreview. */
-export interface PersistedTurn { role: 'agent' | 'user'; message: string; }
+export interface PersistedTurn {
+	role: 'agent' | 'user';
+	message: string;
+	/** ADR-012 — ElevenLabs marks an agent turn `interrupted` when the user (or
+	 *  bleed/noise) barged in. A short USER turn right after an interrupted agent
+	 *  turn is the barge-in/echo phantom signature; carried through so the phantom
+	 *  filter can use it. Optional for back-compat with callers that don't set it. */
+	interrupted?: boolean;
+}
 export const pendingTranscript = new Map<string, PersistedTurn[]>();
 
 /** Companion map remembering the on-disk path of the brief note that the
